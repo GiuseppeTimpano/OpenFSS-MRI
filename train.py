@@ -18,6 +18,8 @@ class FewShotDataModule(pl.LightningDataModule):
         n_val_episodes: int = 200,
         batch_size: int = 2,
         num_workers: int = 4,
+        # label names for GT classmap decoding (required when use_gt=True)
+        label_names: list[str] | None = None,
         # domain-shift options (val only: train always same-domain)
         domain_map: dict[str, str] | None = None,
         source_domain: str | None = None,
@@ -32,6 +34,7 @@ class FewShotDataModule(pl.LightningDataModule):
         self.n_val_episodes   = n_val_episodes
         self.batch_size       = batch_size
         self.num_workers      = num_workers
+        self.label_names      = label_names
         self.domain_map       = domain_map
         self.source_domain    = source_domain
         self.target_domain    = target_domain
@@ -58,6 +61,7 @@ class FewShotDataModule(pl.LightningDataModule):
             n_episodes    = self.n_val_episodes,
             use_gt        = True,
             augment       = False,
+            label_names   = self.label_names,
             cross_domain  = self.cross_domain,
             source_domain = self.source_domain,
             target_domain = self.target_domain,
@@ -156,11 +160,17 @@ if __name__ == '__main__':
     parser.add_argument('--max_epochs',     type=int,   default=10)
     parser.add_argument('--num_workers',    type=int,   default=4)
     # domain-shift (optional): pass a JSON file mapping scan_id -> domain_label
+    parser.add_argument('--label_names',     type=str,   default=None,
+                        help='comma-separated GT label names, e.g. BG,LIVER,RK,LK,SPLEEN')
+    # domain-shift (optional): pass a JSON file mapping scan_id -> domain_label
     parser.add_argument('--domain_map',     type=str,   default=None,
                         help='path to JSON file: {"scan_id": "domain_label", ...}')
     parser.add_argument('--source_domain',  type=str,   default=None)
     parser.add_argument('--target_domain',  type=str,   default=None)
     args = parser.parse_args()
+
+    # parse label names if provided
+    label_names = args.label_names.split(',') if args.label_names else None
 
     # load domain map if provided
     domain_map = None
@@ -185,6 +195,7 @@ if __name__ == '__main__':
         n_shot        = args.n_shot,
         batch_size    = args.batch_size,
         num_workers   = args.num_workers,
+        label_names   = label_names,
         domain_map    = domain_map,
         source_domain = args.source_domain,
         target_domain = args.target_domain,
