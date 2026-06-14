@@ -1,0 +1,10 @@
+numpy
+pillow
+SimpleITK
+dcm2niix
+torch
+torchvision
+scipy
+scikit-image
+monai
+pytorch-lightning

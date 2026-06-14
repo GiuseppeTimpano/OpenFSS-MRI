@@ -1,0 +1,20 @@
+# env / IDE
+.venv/
+.vscode/
+.DS_Store
+
+# Claude Code
+.claude/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# data (large files, not tracked)
+data/datasets/CHAOS/
+
+# generated / local docs
+handoff/
+CLAUDE.md
+HANDOFF.md
