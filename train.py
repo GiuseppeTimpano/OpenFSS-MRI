@@ -18,6 +18,10 @@ class FewShotDataModule(pl.LightningDataModule):
         n_val_episodes: int = 200,
         batch_size: int = 2,
         num_workers: int = 4,
+        # domain-shift options (val only: train always same-domain)
+        domain_map: dict[str, str] | None = None,
+        source_domain: str | None = None,
+        target_domain: str | None = None,
     ):
         super().__init__()
         self.data_dir         = data_dir
@@ -28,6 +32,13 @@ class FewShotDataModule(pl.LightningDataModule):
         self.n_val_episodes   = n_val_episodes
         self.batch_size       = batch_size
         self.num_workers      = num_workers
+        self.domain_map       = domain_map
+        self.source_domain    = source_domain
+        self.target_domain    = target_domain
+
+    @property
+    def cross_domain(self) -> bool:
+        return self.domain_map is not None
 
     def setup(self, stage=None):
         train_ids, val_ids = get_fold_ids(self.data_dir, self.fold, self.n_folds)
@@ -41,12 +52,16 @@ class FewShotDataModule(pl.LightningDataModule):
             augment    = True,
         )
         self.val_ds = EpisodeDataset(
-            data_dir   = self.data_dir,
-            scan_ids   = val_ids,
-            n_shot     = self.n_shot,
-            n_episodes = self.n_val_episodes,
-            use_gt     = True,
-            augment    = False,
+            data_dir      = self.data_dir,
+            scan_ids      = val_ids,
+            n_shot        = self.n_shot,
+            n_episodes    = self.n_val_episodes,
+            use_gt        = True,
+            augment       = False,
+            cross_domain  = self.cross_domain,
+            source_domain = self.source_domain,
+            target_domain = self.target_domain,
+            domain_map    = self.domain_map,
         )
 
     def train_dataloader(self):
@@ -105,14 +120,25 @@ class FewShotModule(pl.LightningModule):
 
         pred = self(s_imgs, s_masks, q_img)
 
-        loss = compute_celoss(pred, q_mask)
-
+        loss     = compute_celoss(pred, q_mask)
         pred_bin = pred.argmax(dim=1).float()
         q_mask_f = q_mask.float()
-        inter = (pred_bin * q_mask_f).sum()
-        dice  = 2 * inter / (pred_bin.sum() + q_mask_f.sum() + 1e-8)
+        inter    = (pred_bin * q_mask_f).sum()
+        dice     = 2 * inter / (pred_bin.sum() + q_mask_f.sum() + 1e-8)
 
+        # always log aggregate metrics
         self.log_dict({'val/loss': loss, 'val/dice': dice}, on_epoch=True)
+
+        # if cross-domain episode, also log per domain-pair metrics
+        # DataLoader collates strings into lists and bools into tensors
+        if batch['cross_domain'][0].item():
+            src = batch['source_domain'][0]
+            tgt = batch['target_domain'][0]
+            pair = f'{src}→{tgt}'
+            self.log_dict(
+                {f'val/loss_{pair}': loss, f'val/dice_{pair}': dice},
+                on_epoch=True,
+            )
 
 
 if __name__ == '__main__':
@@ -120,16 +146,28 @@ if __name__ == '__main__':
     from models.fewshot import FewShotConfig
 
     parser = argparse.ArgumentParser()
-    parser.add_argument('--data_dir',     type=str,   required=True)
-    parser.add_argument('--model',        type=str,   default='qnet', choices=['qnet', 'alpnet'])
-    parser.add_argument('--fold',         type=int,   default=0)
-    parser.add_argument('--n_shot',       type=int,   default=1)
-    parser.add_argument('--lr',           type=float, default=1e-3)
-    parser.add_argument('--align_weight', type=float, default=1.0)
-    parser.add_argument('--batch_size',   type=int,   default=2)
-    parser.add_argument('--max_epochs',   type=int,   default=10)
-    parser.add_argument('--num_workers',  type=int,   default=4)
+    parser.add_argument('--data_dir',       type=str,   required=True)
+    parser.add_argument('--model',          type=str,   default='qnet', choices=['qnet', 'alpnet'])
+    parser.add_argument('--fold',           type=int,   default=0)
+    parser.add_argument('--n_shot',         type=int,   default=1)
+    parser.add_argument('--lr',             type=float, default=1e-3)
+    parser.add_argument('--align_weight',   type=float, default=1.0)
+    parser.add_argument('--batch_size',     type=int,   default=2)
+    parser.add_argument('--max_epochs',     type=int,   default=10)
+    parser.add_argument('--num_workers',    type=int,   default=4)
+    # domain-shift (optional): pass a JSON file mapping scan_id -> domain_label
+    parser.add_argument('--domain_map',     type=str,   default=None,
+                        help='path to JSON file: {"scan_id": "domain_label", ...}')
+    parser.add_argument('--source_domain',  type=str,   default=None)
+    parser.add_argument('--target_domain',  type=str,   default=None)
     args = parser.parse_args()
+
+    # load domain map if provided
+    domain_map = None
+    if args.domain_map is not None:
+        import json
+        with open(args.domain_map) as f:
+            domain_map = json.load(f)
 
     cfg = FewShotConfig(encoder_type=args.model, n_shot=args.n_shot)
     if args.model == 'qnet':
@@ -142,11 +180,14 @@ if __name__ == '__main__':
     module = FewShotModule(model=model, lr=args.lr, align_weight=align_weight)
 
     datamodule = FewShotDataModule(
-        data_dir    = args.data_dir,
-        fold        = args.fold,
-        n_shot      = args.n_shot,
-        batch_size  = args.batch_size,
-        num_workers = args.num_workers,
+        data_dir      = args.data_dir,
+        fold          = args.fold,
+        n_shot        = args.n_shot,
+        batch_size    = args.batch_size,
+        num_workers   = args.num_workers,
+        domain_map    = domain_map,
+        source_domain = args.source_domain,
+        target_domain = args.target_domain,
     )
 
     trainer = pl.Trainer(max_epochs=args.max_epochs)

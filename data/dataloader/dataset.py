@@ -115,6 +115,9 @@ class EpisodeDataset(Dataset):
         query_img:     [H, W]     float32
         query_mask:    [H, W]     float32 binary
         class_key:     str
+        cross_domain:  bool
+        source_domain: str
+        target_domain: str
 
     Support and query always come from different scans to prevent leakage.
     When n_shot > (available scans - 1), support is sampled with replacement.
@@ -131,11 +134,19 @@ class EpisodeDataset(Dataset):
         label_names: Optional[list[str]] = None,
         sv_prefix: str = 'MIDDLE',
         min_px_key: str = '1',
+        # domain-shift options
+        cross_domain: bool = False,
+        source_domain: Optional[str] = None,
+        target_domain: Optional[str] = None,
+        domain_map: Optional[dict[str, str]] = None,   # {scan_id: domain_label}
     ):
-        self.n_shot     = n_shot
-        self.n_episodes = n_episodes
-        self.use_gt     = use_gt
-        self.transform  = get_train_transform() if augment else None
+        self.n_shot        = n_shot
+        self.n_episodes    = n_episodes
+        self.use_gt        = use_gt
+        self.transform     = get_train_transform() if augment else None
+        self.cross_domain  = cross_domain
+        self.source_domain = source_domain
+        self.target_domain = target_domain
 
         self.slices = SliceDataset(data_dir, scan_ids, sv_prefix)
 
@@ -145,12 +156,11 @@ class EpisodeDataset(Dataset):
             if label_names else {}
         )
 
-        # load classmap and filter to this split's scan IDs
+        # --- classmap loading ---
         cm_name = f'gt_classmap_{min_px_key}.json' if use_gt else f'classmap_{min_px_key}.json'
         with open(os.path.join(data_dir, cm_name)) as f:
             raw = json.load(f)
 
-        # here filter classmap to selected id
         sid_set = set(scan_ids)
         self.classmap: dict[str, dict[str, list[int]]] = {}
         for cls_key, scan_dict in raw.items():
@@ -158,9 +168,23 @@ class EpisodeDataset(Dataset):
             if len(filtered) >= 2:  # need >= 2 scans so support ≠ query
                 self.classmap[cls_key] = filtered
 
-        self.class_keys = list(self.classmap.keys())
-        if not self.class_keys:
-            raise ValueError(f'No valid classes in {cm_name} for the given scan_ids')
+        # --- cross-domain split ---
+        if cross_domain:
+            if domain_map is None or source_domain is None or target_domain is None:
+                raise ValueError(
+                    'cross_domain=True requires domain_map, source_domain, and target_domain'
+                )
+            self.source_classmap, self.target_classmap = \
+                self._split_classmap_by_domain(domain_map, source_domain, target_domain)
+            self.class_keys = list(self.source_classmap.keys())
+            if not self.class_keys:
+                raise ValueError(
+                    f'No class has scans in both domains: {source_domain} → {target_domain}'
+                )
+        else:
+            self.class_keys = list(self.classmap.keys())
+            if not self.class_keys:
+                raise ValueError(f'No valid classes in {cm_name} for the given scan_ids')
 
     def __len__(self) -> int:
         return self.n_episodes
@@ -168,25 +192,62 @@ class EpisodeDataset(Dataset):
     def __getitem__(self, _) -> dict:
         return self._sample_episode()
 
-    def _sample_episode(self) -> dict:
-        cls_key   = random.choice(self.class_keys) # select random sp class
-        scan_dict = self.classmap[cls_key] # found dicts {scan: z slice} related to sp id
-        all_scans = list(scan_dict.keys()) # all scans related to sp id as list
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
 
-        query_scan   = random.choice(all_scans) # choice random query scan
-        support_pool = [s for s in all_scans if s != query_scan]
-        support_scans = random.choices(support_pool, k=self.n_shot)
+    def _split_classmap_by_domain(
+        self,
+        domain_map: dict[str, str],
+        source_domain: str,
+        target_domain: str,
+    ) -> tuple[dict, dict]:
+        """Split self.classmap into source and target sub-classmaps.
+        Only keeps classes that have at least one scan in each domain.
+        """
+        src_sids = {sid for sid, dom in domain_map.items() if dom == source_domain}
+        tgt_sids = {sid for sid, dom in domain_map.items() if dom == target_domain}
+
+        source_cm, target_cm = {}, {}
+        for cls_key, scan_dict in self.classmap.items():
+            src = {sid: zs for sid, zs in scan_dict.items() if sid in src_sids}
+            tgt = {sid: zs for sid, zs in scan_dict.items() if sid in tgt_sids}
+            if src and tgt:
+                source_cm[cls_key] = src
+                target_cm[cls_key] = tgt
+
+        return source_cm, target_cm
+
+    def _sample_episode(self) -> dict:
+        cls_key = random.choice(self.class_keys)
+
+        if self.cross_domain:
+            # support from source domain, query from target domain
+            src_dict = self.source_classmap[cls_key]
+            tgt_dict = self.target_classmap[cls_key]
+            query_scan    = random.choice(list(tgt_dict.keys()))
+            support_scans = random.choices(list(src_dict.keys()), k=self.n_shot)
+            support_scan_dict = src_dict
+            query_scan_dict   = tgt_dict
+        else:
+            scan_dict     = self.classmap[cls_key]
+            all_scans     = list(scan_dict.keys())
+            query_scan    = random.choice(all_scans)
+            support_pool  = [s for s in all_scans if s != query_scan]
+            support_scans = random.choices(support_pool, k=self.n_shot)
+            support_scan_dict = scan_dict
+            query_scan_dict   = scan_dict
 
         support_imgs, support_masks = [], []
         for sid in support_scans:
-            z = random.choice(scan_dict[sid])
+            z = random.choice(support_scan_dict[sid])
             img, lbl, sv = self.slices[sid][z]
             mask = self._make_mask(lbl, sv, cls_key).float()
             img, mask = self._apply_transform(img, mask)
             support_imgs.append(img)
             support_masks.append(mask)
 
-        q_z = random.choice(scan_dict[query_scan])
+        q_z = random.choice(query_scan_dict[query_scan])
         q_img, q_lbl, q_sv = self.slices[query_scan][q_z]
         q_mask = self._make_mask(q_lbl, q_sv, cls_key).float()
         q_img, q_mask = self._apply_transform(q_img, q_mask)
@@ -197,6 +258,9 @@ class EpisodeDataset(Dataset):
             'query_img':     q_img,
             'query_mask':    q_mask,
             'class_key':     cls_key,
+            'cross_domain':  self.cross_domain,
+            'source_domain': self.source_domain or '',
+            'target_domain': self.target_domain or '',
         }
 
     def _apply_transform(
