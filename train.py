@@ -109,7 +109,10 @@ class FewShotModule(pl.LightningModule):
         pred = self(s_imgs, s_masks, q_img)
         loss = compute_celoss(pred, q_mask)
 
-        pred_align = self(q_img.unsqueeze(1), q_mask.unsqueeze(1), s_imgs[:, 0])
+        # use predicted mask (not GT) as query-as-support — matches original ALPNet alignment
+        with torch.no_grad():
+            pred_bin = pred.argmax(dim=1, keepdim=True).float()  # [B, 1, H, W]
+        pred_align = self(q_img.unsqueeze(1), pred_bin, s_imgs[:, 0])
         loss_align = compute_celoss(pred_align, s_masks[:, 0].long())
 
         total = loss + self.align_weight * loss_align
