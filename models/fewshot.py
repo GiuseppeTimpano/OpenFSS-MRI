@@ -11,7 +11,7 @@ from .loss import prototype_refinement
 @dataclass
 class FewShotConfig():
     fg_thresh:        float = 0.95
-    bg_thresh:        float = 0.05
+    bg_thresh:        float = 0.95
     pretrained:       bool  = True
     encoder_type:     str   = 'qnet'
     n_shot:           int   = 1
@@ -19,6 +19,7 @@ class FewShotConfig():
     feature_hw:       list  = field(default_factory=lambda: [32, 32])
     temperature:      float = 20.0
     refinement_iters: int   = 3    # QNet test-time proto refinement steps (0 = disabled)
+    val_wsize:        int   = 4    # ALPNet inference pooling window (None = same as training)
 
 class BaseFewShot(nn.Module):
     def __init__(self, cfg: FewShotConfig):
@@ -47,11 +48,13 @@ class ALPNetFewShot(BaseFewShot):
         super().__init__(cfg)
         # fg: gridconv+ (local+global), fallback to global when coverage too low
         self.fg_prototype = GridPlusPrototype(
-            cfg.proto_grid, cfg.feature_hw, cfg.fg_thresh, 1e-4, cfg.temperature)
+            cfg.proto_grid, cfg.feature_hw, cfg.fg_thresh, 1e-4, cfg.temperature,
+            val_pool_size=cfg.val_wsize)
         self.fg_fallback  = GlobalPrototype(temperature=cfg.temperature)
-        # bg: gridconv (local only), uses lower bg_thresh
+        # bg: gridconv (local only)
         self.bg_prototype = GridPrototype(
-            cfg.proto_grid, cfg.feature_hw, cfg.bg_thresh, 1e-4, cfg.temperature)
+            cfg.proto_grid, cfg.feature_hw, cfg.bg_thresh, 1e-4, cfg.temperature,
+            val_pool_size=cfg.val_wsize)
 
     def forward(self, support_imgs, support_masks, query_img):
         # support_imgs:  [B, K, H, W]
