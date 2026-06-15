@@ -160,33 +160,43 @@ class EpisodeDataset(Dataset):
         cm_name = f'gt_classmap_{min_px_key}.json' if use_gt else f'classmap_{min_px_key}.json'
         with open(os.path.join(data_dir, cm_name)) as f:
             raw = json.load(f)
+        raw = {k: v for k, v in raw.items() if k != 'BG'}  # BG mask is most of the image
 
         sid_set = set(scan_ids)
-        self.classmap: dict[str, dict[str, list[int]]] = {}
-        for cls_key, scan_dict in raw.items():
-            if cls_key == 'BG':  # never an evaluation class — its mask is most of the image
-                continue
-            filtered = {sid: zs for sid, zs in scan_dict.items() if sid in sid_set and zs}
-            if len(filtered) >= 2:  # need >= 2 scans so support ≠ query
-                self.classmap[cls_key] = filtered
 
-        # --- cross-domain split ---
-        if cross_domain:
-            if domain_map is None or source_domain is None or target_domain is None:
-                raise ValueError(
-                    'cross_domain=True requires domain_map, source_domain, and target_domain'
-                )
-            self.source_classmap, self.target_classmap = \
-                self._split_classmap_by_domain(domain_map, source_domain, target_domain)
-            self.class_keys = list(self.source_classmap.keys())
-            if not self.class_keys:
-                raise ValueError(
-                    f'No class has scans in both domains: {source_domain} → {target_domain}'
-                )
+        if use_gt:
+            # --- validation: organ episodes, support and query from different scans ---
+            # organ ids are globally consistent, so cross-scan matching is well-posed
+            self.classmap: dict[str, dict[str, list[int]]] = {}
+            for cls_key, scan_dict in raw.items():
+                filtered = {sid: zs for sid, zs in scan_dict.items() if sid in sid_set and zs}
+                if len(filtered) >= 2:  # need >= 2 scans so support ≠ query
+                    self.classmap[cls_key] = filtered
+
+            if cross_domain:
+                if domain_map is None or source_domain is None or target_domain is None:
+                    raise ValueError(
+                        'cross_domain=True requires domain_map, source_domain, and target_domain'
+                    )
+                self.source_classmap, self.target_classmap = \
+                    self._split_classmap_by_domain(domain_map, source_domain, target_domain)
+                self.class_keys = list(self.source_classmap.keys())
+                if not self.class_keys:
+                    raise ValueError(
+                        f'No class has scans in both domains: {source_domain} → {target_domain}'
+                    )
+            else:
+                self.class_keys = list(self.classmap.keys())
+                if not self.class_keys:
+                    raise ValueError(f'No valid classes in {cm_name} for the given scan_ids')
         else:
-            self.class_keys = list(self.classmap.keys())
-            if not self.class_keys:
-                raise ValueError(f'No valid classes in {cm_name} for the given scan_ids')
+            # --- training: supervoxel episodes within a single scan (adjacent slices) ---
+            # supervoxel ids are per-volume, so support and query must come from the
+            # SAME scan — matching the same id across scans would be meaningless.
+            # This is the "neighbours" sampling of SSL-ALPNet / Q-Net.
+            if cross_domain:
+                raise ValueError('cross_domain is only supported for validation (use_gt=True)')
+            self._build_train_index(raw, sid_set)
 
     def __len__(self) -> int:
         return self.n_episodes
@@ -221,6 +231,84 @@ class EpisodeDataset(Dataset):
         return source_cm, target_cm
 
     def _sample_episode(self) -> dict:
+        # validation uses ground-truth organs (cross-scan); training uses
+        # supervoxels (within a single scan, adjacent slices)
+        if self.use_gt:
+            return self._sample_organ_episode()
+        return self._sample_supervoxel_episode()
+
+    @staticmethod
+    def _consecutive_runs(zs: list[int]) -> list[list[int]]:
+        """Group a sorted list of slice indices into runs of consecutive z."""
+        runs: list[list[int]] = []
+        for z in zs:
+            if runs and runs[-1][-1] + 1 == z:
+                runs[-1].append(z)
+            else:
+                runs.append([z])
+        return runs
+
+    def _build_train_index(self, raw: dict, sid_set: set) -> None:
+        """
+        Build a per-scan supervoxel index for "neighbours" sampling.
+
+        self.scan_index: {scan_id: {sv_id: [run, ...]}} where each run is a list
+        of consecutive slice indices of length >= n_shot + 1 (n_shot support
+        slices + 1 query slice, all adjacent and from the same scan).
+        """
+        block = self.n_shot + 1
+        self.scan_index: dict[str, dict[str, list[list[int]]]] = {}
+        for sv_id, scan_dict in raw.items():
+            for sid, zs in scan_dict.items():
+                if sid not in sid_set or not zs:
+                    continue
+                runs = [r for r in self._consecutive_runs(sorted(zs)) if len(r) >= block]
+                if runs:
+                    self.scan_index.setdefault(sid, {})[sv_id] = runs
+
+        self.train_scans = list(self.scan_index.keys())
+        if not self.train_scans:
+            raise ValueError(
+                f'No scan has a supervoxel spanning >= {block} adjacent slices'
+            )
+
+    def _sample_supervoxel_episode(self) -> dict:
+        # pick scan, then supervoxel, then a block of adjacent slices in one run
+        scan  = random.choice(self.train_scans)
+        sv_id = random.choice(list(self.scan_index[scan].keys()))
+        run   = random.choice(self.scan_index[scan][sv_id])
+
+        block = self.n_shot + 1
+        start = random.randrange(0, len(run) - block + 1)
+        zblock = run[start:start + block]
+        if random.random() > 0.5:           # adjacent slices in reverse order
+            zblock = zblock[::-1]
+        support_z, query_z = zblock[:self.n_shot], zblock[self.n_shot]
+
+        support_imgs, support_masks = [], []
+        for z in support_z:
+            img, lbl, sv = self.slices[scan][z]
+            mask = self._make_mask(lbl, sv, sv_id).float()
+            img, mask = self._apply_transform(img, mask)
+            support_imgs.append(img)
+            support_masks.append(mask)
+
+        q_img, q_lbl, q_sv = self.slices[scan][query_z]
+        q_mask = self._make_mask(q_lbl, q_sv, sv_id).float()
+        q_img, q_mask = self._apply_transform(q_img, q_mask)
+
+        return {
+            'support_imgs':  torch.stack(support_imgs),
+            'support_masks': torch.stack(support_masks),
+            'query_img':     q_img,
+            'query_mask':    q_mask,
+            'class_key':     sv_id,
+            'cross_domain':  False,
+            'source_domain': '',
+            'target_domain': '',
+        }
+
+    def _sample_organ_episode(self) -> dict:
         cls_key = random.choice(self.class_keys)
 
         if self.cross_domain:

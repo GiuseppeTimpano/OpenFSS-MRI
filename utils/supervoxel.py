@@ -1,31 +1,35 @@
 """
 Supervoxel generation for MRI/CT volumes (preprocessing step).
 
-Ports the approach from ALPNet (data/pseudolabel_gen.ipynb):
-  Felzenszwalb graph-based segmentation applied slice-by-slice (2D).
+Faithful port of the original Q-Net / SSL-ALPNet pipeline
+(data/supervoxels/generate_supervoxels.py from the Q-Net repo):
+
+  * 3D Felzenszwalb graph-based segmentation over the whole volume
+    (NOT slice-by-slice) — so a supervoxel id is a coherent 3D blob,
+    consistent across adjacent slices. This is what makes the
+    "neighbours" episode sampling (support/query = adjacent slices of the
+    same scan) a well-posed self-supervised task.
+  * intensity rescaled to 0..255, sigma=0, min_size=n_sv, anisotropic
+    edge weighting from voxel spacing.
+  * per-slice foreground body mask, then background supervoxels zeroed.
+
+Build the 3D kernel once before running this (see utils/felzenszwalb_3d):
+    cd utils/felzenszwalb_3d && pip install cython && python setup.py build_ext --inplace
 
 Usage:
-    # with a known dataset preset (sets fg_thresh automatically)
     python -m utils.supervoxel --data_dir /path/to/data --preset CHAOST2
-
-    # fully manual (any dataset)
-    python -m utils.supervoxel --data_dir /path/to/data --fg_thresh 50 --min_size 400 --sigma 1.0
-
-    # custom output directory and label prefix
-    python -m utils.supervoxel --data_dir /path/to/data --out_dir /path/to/out \\
-        --label_prefix SMALL --fg_thresh 1e-4 --min_size 200 --sigma 0.8
+    python -m utils.supervoxel --data_dir /path/to/data --n_sv 5000 --fg_thresh 10
 
 Expected input:
     data_dir/
-        image_<id>.nii.gz    (any integer id)
-        ...
+        image_<id>.nii.gz
 
 Output (written to out_dir, defaults to data_dir):
     out_dir/
         superpix-<label_prefix>_<id>.nii.gz
         fgmask_<id>.nii.gz
         classmap_0.json     (any foreground pixel counts)
-        classmap_1.json     (label must cover >= 1% of slice pixels)
+        classmap_1.json     (label covers >= 1% of slice pixels)
 """
 
 import argparse
@@ -33,26 +37,23 @@ import glob
 import json
 import os
 import re
-from dataclasses import dataclass, field
-from typing import Optional
+from dataclasses import dataclass
 
 import numpy as np
 import SimpleITK as sitk
-import scipy.ndimage.morphology as snm
+from scipy.ndimage import binary_fill_holes
 from skimage.measure import label as cc_label
-from skimage.segmentation import felzenszwalb
+
+from utils.felzenszwalb_3d import felzenszwalb_3d
 
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Optional presets for known datasets.
-# fg_thresh: intensity below this is treated as air/background.
-#   MR (CHAOST2): normalized images have near-zero background, but
-#                 actual body tissue starts well above zero — use 50.
-#   MR (CMR):     similar to CHAOST2 but unnormalized range differs.
-#   CT (SABS):    after normalization CT background is very close to 0.
+# fg_thresh: intensity (on the 0..255 rescaled image) below which a pixel is
+#            treated as air/background. The original uses 10 for CHAOST2/CMR.
 # ──────────────────────────────────────────────────────────────────────────────
 PRESETS: dict[str, dict] = {
-    'CHAOST2': {'fg_thresh': 1e-4 + 50},
+    'CHAOST2': {'fg_thresh': 10.0},
     'CMR':     {'fg_thresh': 10.0},
     'SABS':    {'fg_thresh': 1e-4},
 }
@@ -60,26 +61,23 @@ PRESETS: dict[str, dict] = {
 
 @dataclass
 class SupervoxelConfig:
-    fg_thresh:    float = 1e-4      # body mask intensity threshold
-    min_size:     int   = 400       # minimum supervoxel size (pixels per slice)
-    sigma:        float = 1.0       # Gaussian smoothing before Felzenszwalb
-    label_prefix: str   = 'MIDDLE'  # used in output filename: superpix-<prefix>_<id>.nii.gz
+    n_sv:         int   = 5000      # Felzenszwalb min_size (original: n_sv=5000)
+    sigma:        float = 0.0       # Gaussian smoothing before Felzenszwalb (original: 0)
+    fg_thresh:    float = 10.0      # body mask intensity threshold on 0..255 image
+    label_prefix: str   = 'MIDDLE'  # output filename: superpix-<prefix>_<id>.nii.gz
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Core functions
+# Core functions (ported from generate_supervoxels.py)
 # ──────────────────────────────────────────────────────────────────────────────
 
 def fg_mask2d(img_2d: np.ndarray, thresh: float) -> np.ndarray:
     """
-    Binary foreground mask for one axial slice.
+    Binary foreground (body) mask for one axial slice.
 
     1. Threshold: pixels above thresh = foreground candidate.
     2. Keep only the largest connected component — removes scattered noise.
-    3. Fill internal holes — dark organs (e.g. gallbladder) inside the body
-       boundary should be included in the mask even if below threshold.
-
-    Returns float32 binary mask, same spatial shape as img_2d.
+    3. Fill internal holes — dark organs inside the body boundary are kept.
     """
     mask = np.float32(img_2d > thresh)
 
@@ -88,66 +86,48 @@ def fg_mask2d(img_2d: np.ndarray, thresh: float) -> np.ndarray:
 
     labeled = cc_label(mask)
     largest = labeled == (np.argmax(np.bincount(labeled.flat)[1:]) + 1)
-    filled  = snm.binary_fill_holes(largest)
+    filled  = binary_fill_holes(largest)
     return np.float32(filled)
 
 
-def _mask_and_reindex(raw_seg2d: np.ndarray, mask2d: np.ndarray) -> np.ndarray:
+def supervox_masking(seg: np.ndarray, mask: np.ndarray) -> np.ndarray:
     """
-    Zero out supervoxels that fall in the background, then re-index 1..K.
+    Remove supervoxels in the background region (ported verbatim).
 
-    Felzenszwalb may assign label 0 to some pixels; we shift it before masking
-    to avoid confusing it with the background label we enforce (also 0).
-
-    raw_seg2d: felzenszwalb segmentation
-    mask_2d: foreground segmentation
+    Shift Felzenszwalb's 0-label up so it is not confused with the enforced
+    background label (also 0), then zero out everything outside the body mask.
+    Supervoxel ids stay consistent across slices (3D-coherent).
     """
-    raw = np.int32(raw_seg2d)
-    lbvs   = list(np.unique(raw))
-    max_lb = max(lbvs)
-
-    raw[raw == 0] = max_lb + 1   # shift Felzenszwalb's 0 away from bg
-    lbvs.append(max_lb)
-
-    raw = raw * np.int32(mask2d)  # pixels outside body → 0
-
-    out   = np.zeros(raw.shape, dtype=np.int32)
-    lb_new = 1
-    for lbv in lbvs:
-        if lbv == 0:
-            continue
-        out[raw == lbv] = lb_new
-        lb_new += 1
-
-    return out
+    seg = np.int32(seg)
+    seg[seg == 0] = seg.max() + 1
+    seg[mask == 0] = 0
+    return seg
 
 
 def supervoxel_volume(
-    img:       np.ndarray,
-    cfg:       SupervoxelConfig,
+    img255: np.ndarray,
+    spacing_zxy: tuple,
+    cfg: SupervoxelConfig,
 ) -> tuple[np.ndarray, np.ndarray]:
     """
-    Generate supervoxel labels for a 3D volume by processing each axial slice.
+    Generate 3D-coherent supervoxel labels for one volume.
 
     Args:
-        img:  float32 array [D, H, W], first axis = axial (slice) direction
-        cfg:  SupervoxelConfig
+        img255:      float32 [D, H, W], intensity rescaled to 0..255
+        spacing_zxy: (z, x, y) voxel spacing for anisotropic edge weighting
+        cfg:         SupervoxelConfig
 
     Returns:
-        fg_mask_vol:  [D, H, W] float32, binary body mask per slice
-        seg_vol:      [D, H, W] int32,   supervoxel labels (0 = background)
+        fg_mask_vol: [D, H, W] float32, per-slice body mask
+        seg_vol:     [D, H, W] int32,   supervoxel labels (0 = background)
     """
-    fg_mask_vol = np.zeros(img.shape, dtype=np.float32)
-    seg_vol     = np.zeros(img.shape, dtype=np.int32)
+    seg = felzenszwalb_3d(img255, min_size=cfg.n_sv, sigma=cfg.sigma, spacing=spacing_zxy)
 
-    for z in range(img.shape[0]):
-        slc     = img[z]
-        raw_seg = felzenszwalb(slc, min_size=cfg.min_size, sigma=cfg.sigma)
-        fg_mask = fg_mask2d(slc, cfg.fg_thresh)
+    fg_mask_vol = np.zeros(seg.shape, dtype=np.float32)
+    for z in range(seg.shape[0]):
+        fg_mask_vol[z] = fg_mask2d(img255[z], cfg.fg_thresh)
 
-        seg_vol[z]     = _mask_and_reindex(raw_seg, fg_mask)
-        fg_mask_vol[z] = fg_mask
-
+    seg_vol = supervox_masking(seg, fg_mask_vol)
     return fg_mask_vol, seg_vol
 
 
@@ -158,17 +138,13 @@ def build_classmap(
     """
     Build a lookup index: supervoxel label → {scan_id → [slice indices]}.
 
-    Pre-computed at preprocessing time so the dataloader can instantly find
-    valid episodes without scanning every volume at runtime.
-
-    Args:
-        scan_labels:   {scan_id: seg_vol [D, H, W]}
-        min_fg_ratio:  skip (label, slice) pairs where the label covers less
-                       than this fraction of the slice pixels.
-                       0.0 = any pixel counts.  0.01 = at least 1% coverage.
+    Ids are per-volume (Felzenszwalb relabels each volume independently), so the
+    same integer in two scans is NOT the same region. Training therefore samples
+    support and query from the SAME scan; this index just lists, per scan, which
+    slices contain each supervoxel.
 
     Returns dict shaped as:
-        { "1": {"003": [5, 6, 7], "007": [22]}, "2": {...}, ... }
+        { "5": {"1": [5, 6, 7], "2": [22]}, "8": {...}, ... }
     """
     classmap: dict[str, dict[str, list[int]]] = {}
 
@@ -209,7 +185,14 @@ def process_scan(
     im_obj = sitk.ReadImage(img_path)
     img    = sitk.GetArrayFromImage(im_obj).astype(np.float32)  # [D, H, W]
 
-    fg_mask_vol, seg_vol = supervoxel_volume(img, cfg)
+    # rescale to 0..255 (matches original generate_supervoxels.py)
+    img255 = 255.0 * (img - img.min()) / (np.ptp(img) + 1e-8)
+
+    # sitk spacing is (x, y, z); the kernel wants (z, x, y)
+    sx, sy, sz = im_obj.GetSpacing()
+    spacing_zxy = (sz, sx, sy)
+
+    fg_mask_vol, seg_vol = supervoxel_volume(img255, spacing_zxy, cfg)
 
     sitk.WriteImage(
         _copy_sitk_meta(im_obj, seg_vol),
@@ -220,7 +203,8 @@ def process_scan(
         os.path.join(out_dir, f'fgmask_{scan_id}.nii.gz'),
     )
 
-    print(f'  scan {scan_id}: {int(seg_vol.max())} supervoxels '
+    n_sv = len(np.unique(seg_vol[seg_vol > 0]))
+    print(f'  scan {scan_id}: {n_sv} supervoxels '
           f'→ superpix-{cfg.label_prefix}_{scan_id}.nii.gz')
     return scan_id, seg_vol
 
@@ -239,8 +223,8 @@ def run(data_dir: str, out_dir: str, cfg: SupervoxelConfig):
     if not img_paths:
         raise FileNotFoundError(f'No image_*.nii.gz found in {data_dir}')
 
-    print(f'{len(img_paths)} scans | fg_thresh={cfg.fg_thresh} '
-          f'min_size={cfg.min_size} sigma={cfg.sigma} prefix={cfg.label_prefix}')
+    print(f'{len(img_paths)} scans | n_sv={cfg.n_sv} sigma={cfg.sigma} '
+          f'fg_thresh={cfg.fg_thresh} prefix={cfg.label_prefix}')
 
     scan_labels: dict[str, np.ndarray] = {}
     for img_path in img_paths:
@@ -257,7 +241,7 @@ def run(data_dir: str, out_dir: str, cfg: SupervoxelConfig):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(
-        description='Generate Felzenszwalb supervoxel pseudo-labels for MRI/CT volumes.'
+        description='Generate 3D Felzenszwalb supervoxel pseudo-labels for MRI/CT volumes.'
     )
     parser.add_argument('--data_dir',     required=True,
                         help='Directory containing image_*.nii.gz files')
@@ -265,28 +249,28 @@ if __name__ == '__main__':
                         help='Output directory (default: same as data_dir)')
     parser.add_argument('--preset',       default=None, choices=list(PRESETS.keys()),
                         help='Dataset preset — sets fg_thresh automatically')
+    parser.add_argument('--n_sv',         type=int,   default=5000,
+                        help='Felzenszwalb min_size / target supervoxel size (default: 5000)')
+    parser.add_argument('--sigma',        type=float, default=0.0,
+                        help='Gaussian smoothing sigma (default: 0)')
     parser.add_argument('--fg_thresh',    type=float, default=None,
-                        help='Intensity threshold for body mask (overrides preset)')
-    parser.add_argument('--min_size',     type=int,   default=400,
-                        help='Minimum supervoxel size in pixels (default: 400)')
-    parser.add_argument('--sigma',        type=float, default=1.0,
-                        help='Gaussian smoothing sigma (default: 1.0)')
+                        help='Body-mask intensity threshold on 0..255 image (overrides preset)')
     parser.add_argument('--label_prefix', type=str,   default='MIDDLE',
-                        help='Output filename prefix, e.g. SMALL/MIDDLE/LARGE (default: MIDDLE)')
+                        help='Output filename prefix (default: MIDDLE)')
     args = parser.parse_args()
 
-    # resolve fg_thresh: explicit arg > preset > error
+    # resolve fg_thresh: explicit arg > preset > default 10
     if args.fg_thresh is not None:
         fg_thresh = args.fg_thresh
     elif args.preset is not None:
         fg_thresh = PRESETS[args.preset]['fg_thresh']
     else:
-        parser.error('Provide --preset or --fg_thresh')
+        fg_thresh = 10.0
 
     cfg = SupervoxelConfig(
-        fg_thresh    = fg_thresh,
-        min_size     = args.min_size,
+        n_sv         = args.n_sv,
         sigma        = args.sigma,
+        fg_thresh    = fg_thresh,
         label_prefix = args.label_prefix,
     )
     run(

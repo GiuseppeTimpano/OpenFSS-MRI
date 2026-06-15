@@ -11,6 +11,12 @@ __pycache__/
 *.pyc
 *.pyo
 
+# Cython build artifacts (platform-specific; rebuild on target machine)
+utils/felzenszwalb_3d/_felz3d.c
+utils/felzenszwalb_3d/*.so
+utils/felzenszwalb_3d/build/
+*.egg-info/
+
 # data (large files, not tracked)
 data/datasets/CHAOS/
 
