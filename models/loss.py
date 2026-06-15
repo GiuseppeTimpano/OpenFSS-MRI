@@ -3,12 +3,13 @@ import torch.nn as nn
 from torch.nn import functional as F
 
 
-def compute_celoss(pred, query_mask):
+def compute_celoss(pred, query_mask, weight=None):
     '''
         pred: [B, 2, H, W] float - logits
         query_mask: [B, H, W] int - binary mask
+        weight: optional [2] tensor — class weights (bg, fg)
     '''
-    return F.cross_entropy(input=pred, target=query_mask.long())
+    return F.cross_entropy(input=pred, target=query_mask.long(), weight=weight)
 
 
 def prototype_refinement(

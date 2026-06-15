@@ -18,7 +18,8 @@ model:
 train:
   lr: 0.001
   align_weight: 1.0      # ignored for alpnet (fixed to 0.5)
-  max_epochs: 10
+  bg_loss_weight: 0.1    # qnet original: 0.1 | alpnet original: 0.05
+  max_epochs: 30
 
 # Cross-domain validation (optional). Leave domain_map null to disable.
 domain:
