@@ -94,8 +94,8 @@ class FewShotModule(pl.LightningModule):
         self.lr = lr
         self.align_weight = align_weight
 
-    def forward(self, support_imgs, support_masks, query_img):
-        return self._model(support_imgs, support_masks, query_img)
+    def forward(self, support_imgs, support_masks, query_img, train=False):
+        return self._model(support_imgs, support_masks, query_img, train=train)
 
     def configure_optimizers(self):
         return torch.optim.Adam(self.parameters(), lr=self.lr)
@@ -106,14 +106,9 @@ class FewShotModule(pl.LightningModule):
         q_img   = batch['query_img']      # [B, H, W]
         q_mask  = batch['query_mask']     # [B, H, W]
 
-        pred = self(s_imgs, s_masks, q_img)
+        # alignment loss reuses encoder features (computed inside forward), no re-encoding
+        pred, loss_align = self(s_imgs, s_masks, q_img, train=True)
         loss = compute_celoss(pred, q_mask)
-
-        # use predicted mask (not GT) as query-as-support — matches original ALPNet alignment
-        with torch.no_grad():
-            pred_bin = pred.argmax(dim=1, keepdim=True).float()  # [B, 1, H, W]
-        pred_align = self(q_img.unsqueeze(1), pred_bin, s_imgs[:, 0])
-        loss_align = compute_celoss(pred_align, s_masks[:, 0].long())
 
         total = loss + self.align_weight * loss_align
         self.log_dict({'train/loss': loss, 'train/loss_align': loss_align, 'train/total': total})
@@ -203,7 +198,6 @@ if __name__ == '__main__':
 
     trainer = pl.Trainer(
         max_epochs=train_cfg['max_epochs'],
-        precision=train_cfg.get('precision', '32'),
         callbacks=[
             ModelCheckpoint(monitor='val/dice', mode='max', save_top_k=1, filename='best'),
             RichProgressBar(),

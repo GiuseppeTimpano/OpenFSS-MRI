@@ -5,7 +5,7 @@ from .encoder import ALPNetEncoder, QNetEncoder
 from .prototype import GlobalPrototype, GridPlusPrototype, GridPrototype
 from dataclasses import dataclass, field
 from abc import abstractmethod
-from .loss import prototype_refinement
+from .loss import prototype_refinement, compute_celoss
 
 
 @dataclass
@@ -56,30 +56,23 @@ class ALPNetFewShot(BaseFewShot):
             cfg.proto_grid, cfg.feature_hw, cfg.bg_thresh, 1e-4, cfg.temperature,
             val_pool_size=cfg.val_wsize)
 
-    def forward(self, support_imgs, support_masks, query_img):
-        # support_imgs:  [B, K, H, W]
-        # support_masks: [B, K, H, W]  (fg=1, bg=0)
-        # query_img:     [B, H, W]
-        # output:        [B, 2, H, W]  (ch0=bg logit, ch1=fg logit)
-        B, K, H, W = support_imgs.shape
-
-        sup_feat  = self.encoder(self._to_3ch(support_imgs.view(B * K, H, W)))  # [B*K, 256, h, w]
-        h, w      = sup_feat.shape[-2:]
-
-        sup_masks = support_masks.view(B * K, 1, H, W).float()
-        sup_masks = F.interpolate(sup_masks, size=(h, w), mode='nearest')        # [B*K, 1, h, w]
-
-        qry_feat  = self.encoder(self._to_3ch(query_img))                        # [B, 256, h, w]
-
-        sup_feat  = sup_feat.view(B, K, -1, h, w)   # [B, K, 256, h, w]
-        sup_masks = sup_masks.view(B, K, 1, h, w)   # [B, K, 1, h, w]
+    def _predict(self, qry_feat, sup_feat, sup_masks, out_hw):
+        # qry_feat:  [B, 256, h, w]      target features to segment
+        # sup_feat:  [B, K, 256, h, w]   support features
+        # sup_masks: [B, K, H, W]        support fg masks (full res, binary)
+        # out_hw:    (H, W)
+        # output:    [B, 2, H, W]
+        B, K, H, W = sup_masks.shape
+        h, w = qry_feat.shape[-2:]
+        sup_m = F.interpolate(sup_masks.view(B * K, 1, H, W).float(),
+                              size=(h, w), mode='nearest').view(B, K, 1, h, w)
 
         preds = []
         for b in range(B):
             qf = qry_feat[b:b+1]   # [1, 256, h, w]
             shot_preds = []
             for k in range(K):
-                fg_msk = sup_masks[b, k:k+1]   # [1, 1, h, w]
+                fg_msk = sup_m[b, k:k+1]   # [1, 1, h, w]
                 bg_msk = 1.0 - fg_msk
 
                 # if fg coverage too low, gridconv+ yields no valid cells → fallback to global
@@ -97,6 +90,31 @@ class ALPNetFewShot(BaseFewShot):
         pred = torch.cat(preds, dim=0)                                     # [B, 2, h, w]
         return F.interpolate(pred, size=(H, W), mode='bilinear', align_corners=True)
 
+    def forward(self, support_imgs, support_masks, query_img, train=False):
+        # support_imgs:  [B, K, H, W]
+        # support_masks: [B, K, H, W]  (fg=1, bg=0)
+        # query_img:     [B, H, W]
+        # output:        [B, 2, H, W]  (ch0=bg logit, ch1=fg logit)
+        #                or (pred, align_loss) when train=True
+        B, K, H, W = support_imgs.shape
+
+        sup_feat = self.encoder(self._to_3ch(support_imgs.view(B * K, H, W)))  # [B*K, 256, h, w]
+        qry_feat = self.encoder(self._to_3ch(query_img))                       # [B, 256, h, w]
+        h, w = sup_feat.shape[-2:]
+        sup_feat = sup_feat.view(B, K, -1, h, w)                               # [B, K, 256, h, w]
+
+        pred = self._predict(qry_feat, sup_feat, support_masks, (H, W))
+        if not train:
+            return pred
+
+        # alignment: query-derived prototype predicts on support — reuses encoder
+        # features (no second forward pass), matching the original Q-Net alignLoss
+        with torch.no_grad():
+            pred_bin = pred.argmax(dim=1, keepdim=True).float()   # [B, 1, H, W]
+        align_pred = self._predict(sup_feat[:, 0], qry_feat.unsqueeze(1), pred_bin, (H, W))
+        align_loss = compute_celoss(align_pred, support_masks[:, 0].long())
+        return pred, align_loss
+
 
 class QNetFewShot(BaseFewShot):
 
@@ -108,35 +126,24 @@ class QNetFewShot(BaseFewShot):
         # learnable weights to combine the two scale predictions
         self.alpha = nn.Parameter(torch.ones(2))
 
-    def forward(self, support_imgs, support_masks, query_img):
-        # support_imgs:  [B, K, H, W]
-        # support_masks: [B, K, H, W]  (fg=1, bg=0)
-        # query_img:     [B, H, W]
-        # output:        [B, 2, H, W]  (ch0=bg logit, ch1=fg logit)
-        B, K, H, W = support_imgs.shape
-
-        # encoder returns (feature_dict, tao)
-        sup_feats, _   = self.encoder(self._to_3ch(support_imgs.view(B * K, H, W)))
-        qry_feats, tao = self.encoder(self._to_3ch(query_img))   # tao: [B, 1], adaptive per image
-
-        sup_f32 = sup_feats['down2']   # [B*K, 512, H/4, W/4]
-        sup_f64 = sup_feats['down3']   # [B*K, 512, H/8, W/8]
-        qry_f32 = qry_feats['down2']   # [B,   512, H/4, W/4]
-        qry_f64 = qry_feats['down3']   # [B,   512, H/8, W/8]
-
-        h32, w32 = sup_f32.shape[-2:]
-        h64, w64 = sup_f64.shape[-2:]
+    def _predict(self, qry_f32, qry_f64, tao, sup_f32, sup_f64, sup_masks, out_hw):
+        # qry_f32:  [B, 512, h32, w32]    target features (finer scale)
+        # qry_f64:  [B, 512, h64, w64]    target features (coarser scale)
+        # tao:      [B, 1]                adaptive threshold per target image
+        # sup_f32:  [B, K, 512, h32, w32] support features (finer scale)
+        # sup_f64:  [B, K, 512, h64, w64] support features (coarser scale)
+        # sup_masks:[B, K, H, W]          support fg masks (full res, binary)
+        # out_hw:   (H, W)
+        # output:   [B, 2, H, W]
+        B, K, H, W = sup_masks.shape
+        h32, w32 = qry_f32.shape[-2:]
+        h64, w64 = qry_f64.shape[-2:]
 
         # resize masks to match each feature scale
-        sup_m32 = F.interpolate(support_masks.view(B * K, 1, H, W).float(),
-                                size=(h32, w32), mode='nearest')          # [B*K, 1, h32, w32]
-        sup_m64 = F.interpolate(support_masks.view(B * K, 1, H, W).float(),
-                                size=(h64, w64), mode='nearest')          # [B*K, 1, h64, w64]
-
-        sup_f32 = sup_f32.view(B, K, -1, h32, w32)
-        sup_f64 = sup_f64.view(B, K, -1, h64, w64)
-        sup_m32 = sup_m32.view(B, K, 1, h32, w32)
-        sup_m64 = sup_m64.view(B, K, 1, h64, w64)
+        sup_m32 = F.interpolate(sup_masks.view(B * K, 1, H, W).float(),
+                                size=(h32, w32), mode='nearest').view(B, K, 1, h32, w32)
+        sup_m64 = F.interpolate(sup_masks.view(B * K, 1, H, W).float(),
+                                size=(h64, w64), mode='nearest').view(B, K, 1, h64, w64)
 
         alpha = F.softmax(self.alpha, dim=0)   # normalized combination weights
 
@@ -144,7 +151,7 @@ class QNetFewShot(BaseFewShot):
         for b in range(B):
             qf32 = qry_f32[b:b+1]   # [1, 512, h32, w32]
             qf64 = qry_f64[b:b+1]   # [1, 512, h64, w64]
-            t    = tao[b]            # [1] — adaptive threshold for this query image
+            t    = tao[b]            # [1] — adaptive threshold for this target image
 
             shot_preds = []
             for k in range(K):
@@ -190,3 +197,37 @@ class QNetFewShot(BaseFewShot):
 
         pred = torch.cat(preds, dim=0)                           # [B, 2, h32, w32]
         return F.interpolate(pred, size=(H, W), mode='bilinear', align_corners=True)
+
+    def forward(self, support_imgs, support_masks, query_img, train=False):
+        # support_imgs:  [B, K, H, W]
+        # support_masks: [B, K, H, W]  (fg=1, bg=0)
+        # query_img:     [B, H, W]
+        # output:        [B, 2, H, W]  (ch0=bg logit, ch1=fg logit)
+        #                or (pred, align_loss) when train=True
+        B, K, H, W = support_imgs.shape
+
+        # encoder returns (feature_dict, tao); keep tao for both sides for alignment
+        sup_feats, sup_tao = self.encoder(self._to_3ch(support_imgs.view(B * K, H, W)))
+        qry_feats, qry_tao = self.encoder(self._to_3ch(query_img))   # tao: [B, 1], adaptive per image
+
+        hs32, ws32 = sup_feats['down2'].shape[-2:]
+        hs64, ws64 = sup_feats['down3'].shape[-2:]
+        sup_f32 = sup_feats['down2'].view(B, K, -1, hs32, ws32)   # [B, K, 512, h32, w32]
+        sup_f64 = sup_feats['down3'].view(B, K, -1, hs64, ws64)   # [B, K, 512, h64, w64]
+        qry_f32 = qry_feats['down2']   # [B, 512, h32, w32]
+        qry_f64 = qry_feats['down3']   # [B, 512, h64, w64]
+
+        pred = self._predict(qry_f32, qry_f64, qry_tao, sup_f32, sup_f64, support_masks, (H, W))
+        if not train:
+            return pred
+
+        # alignment: query-derived prototype predicts on support — reuses encoder
+        # features (no second forward pass), matching the original Q-Net alignLoss
+        with torch.no_grad():
+            pred_bin = pred.argmax(dim=1, keepdim=True).float()   # [B, 1, H, W]
+        tgt_tao = sup_tao.view(B, K, 1)[:, 0]   # [B, 1] — threshold of support shot 0
+        align_pred = self._predict(
+            sup_f32[:, 0], sup_f64[:, 0], tgt_tao,
+            qry_f32.unsqueeze(1), qry_f64.unsqueeze(1), pred_bin, (H, W))
+        align_loss = compute_celoss(align_pred, support_masks[:, 0].long())
+        return pred, align_loss

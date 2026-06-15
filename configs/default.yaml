@@ -19,7 +19,6 @@ train:
   lr: 0.001
   align_weight: 1.0      # ignored for alpnet (fixed to 0.5)
   max_epochs: 10
-  precision: bf16-mixed  # 32 | 16-mixed | bf16-mixed
 
 # Cross-domain validation (optional). Leave domain_map null to disable.
 domain:
