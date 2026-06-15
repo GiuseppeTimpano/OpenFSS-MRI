@@ -131,7 +131,7 @@ class FewShotModule(pl.LightningModule):
         cls = batch['class_key'][0]  # val batch_size=1
 
         # aggregate metrics
-        self.log_dict({'val/loss': loss, 'val/dice': dice}, on_epoch=True)
+        self.log_dict({'val/loss': loss, 'val/dice': dice, 'val/pred_fg_rate': pred_bin.mean()}, on_epoch=True)
         # per-class dice
         self.log(f'val/dice_{cls}', dice, on_step=False, on_epoch=True)
 
@@ -152,6 +152,7 @@ if __name__ == '__main__':
     import json
     import yaml
     from pytorch_lightning.callbacks import ModelCheckpoint, RichProgressBar
+    from pytorch_lightning.loggers import CSVLogger
     from models.fewshot import FewShotConfig
 
     parser = argparse.ArgumentParser()
@@ -202,5 +203,6 @@ if __name__ == '__main__':
             ModelCheckpoint(monitor='val/dice', mode='max', save_top_k=1, filename='best'),
             RichProgressBar(),
         ],
+        logger=CSVLogger('.', name='lightning_logs'),
     )
     trainer.fit(module, datamodule)
