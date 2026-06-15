@@ -111,7 +111,7 @@ class FewShotModule(pl.LightningModule):
         loss = compute_celoss(pred, q_mask)
 
         total = loss + self.align_weight * loss_align
-        self.log_dict({'train/loss': loss, 'train/loss_align': loss_align, 'train/total': total})
+        self.log_dict({'train/loss': loss, 'train/loss_align': loss_align, 'train/total': total}, prog_bar=True)
         return total
 
     def validation_step(self, batch, batch_idx):
