@@ -203,6 +203,7 @@ if __name__ == '__main__':
 
     trainer = pl.Trainer(
         max_epochs=train_cfg['max_epochs'],
+        precision=train_cfg.get('precision', '32'),
         callbacks=[
             ModelCheckpoint(monitor='val/dice', mode='max', save_top_k=1, filename='best'),
             RichProgressBar(),
