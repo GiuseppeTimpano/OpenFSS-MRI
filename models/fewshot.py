@@ -28,9 +28,22 @@ class BaseFewShot(nn.Module):
         self.bg_loss_weight = bg_loss_weight
         self.encoder = self.build_encoder()
 
-    def _celoss(self, pred, mask):
+    def query_loss(self, pred, mask):
+        # default (ALPNet): raw-similarity logits → weighted CE, faithful to SSL-ALPNet
+        # (CrossEntropyLoss(weight=[bg, 1.0])).
         weight = torch.tensor([self.bg_loss_weight, 1.0], device=pred.device)
-        return compute_celoss(pred, mask, weight=weight)
+        return compute_celoss(pred, mask.long(), weight=weight)
+
+    def align_loss_fn(self, pred, mask):
+        # original align loss is UNWEIGHTED (both ALPNet CrossEntropy and Q-Net NLLLoss).
+        return compute_celoss(pred, mask.long(), weight=None)
+
+    @staticmethod
+    def _nll(prob, mask, weight=None):
+        # NLLLoss on log-probabilities (Q-Net: pred is a probability, not a logit).
+        eps  = torch.finfo(torch.float32).eps
+        logp = torch.log(torch.clamp(prob, eps, 1 - eps))
+        return F.nll_loss(logp, mask.long(), weight=weight)
 
     def build_encoder(self):
         if self.cfg.encoder_type == 'qnet':
@@ -117,19 +130,42 @@ class ALPNetFewShot(BaseFewShot):
         with torch.no_grad():
             pred_bin = pred.argmax(dim=1, keepdim=True).float()   # [B, 1, H, W]
         align_pred = self._predict(sup_feat[:, 0], qry_feat.unsqueeze(1), pred_bin, (H, W))
-        align_loss = self._celoss(align_pred, support_masks[:, 0].long())
+        align_loss = self.align_loss_fn(align_pred, support_masks[:, 0].long())
         return pred, align_loss
 
 
 class QNetFewShot(BaseFewShot):
 
+    # fixed scale-combination weights (original Q-Net: alpha=[0.9, 0.1], NOT learnable)
+    ALPHA = (0.9, 0.1)
+
     def __init__(self, cfg, bg_loss_weight: float = 0.1):
         super().__init__(cfg, bg_loss_weight=bg_loss_weight)
-        # one GlobalPrototype per scale (independent temperature params if needed)
+        # one GlobalPrototype per scale (masked-average-pool prototype builder)
         self.proto_32 = GlobalPrototype(temperature=cfg.temperature)
         self.proto_64 = GlobalPrototype(temperature=cfg.temperature)
-        # learnable weights to combine the two scale predictions
-        self.alpha = nn.Parameter(torch.ones(2))
+
+    def query_loss(self, pred, mask):
+        # pred is a probability map [B,2,H,W]; original Q-Net query loss = NLLLoss(weight=[0.1,1.0]).
+        weight = torch.tensor([self.bg_loss_weight, 1.0], device=pred.device)
+        return self._nll(pred, mask, weight=weight)
+
+    def align_loss_fn(self, pred, mask):
+        # original Q-Net alignLoss = nn.NLLLoss() (unweighted) on log-probabilities.
+        return self._nll(pred, mask, weight=None)
+
+    def _get_pred(self, qry_feat, proto, tao):
+        # original getPred: sim = -cos * scaler ;  p_fg = 1 - sigmoid(0.5 * (sim - tao))
+        # qry_feat: [1, C, h, w]   proto: [1, C]   tao: [1]   →   [1, 1, h, w] (fg probability)
+        sim = -F.cosine_similarity(qry_feat, proto[..., None, None], dim=1, eps=1e-4) * self.cfg.temperature  # [1,h,w]
+        p   = 1.0 - torch.sigmoid(0.5 * (sim - tao.view(1, 1, 1)))   # [1, h, w]
+        return p.unsqueeze(1)   # [1, 1, h, w]
+
+    def _build_proto(self, proto_mod, sup_feat, sup_mask):
+        # masked-avg prototype averaged over shots (original getPrototype: sum_shots / n_shots)
+        K = sup_feat.shape[0]
+        protos = [proto_mod.build_prototype(sup_feat[k:k+1], sup_mask[k:k+1]) for k in range(K)]
+        return torch.stack(protos, dim=0).mean(dim=0)   # [1, C]
 
     def _predict(self, qry_f32, qry_f64, tao, sup_f32, sup_f64, sup_masks, out_hw):
         # qry_f32:  [B, 512, h32, w32]    target features (finer scale)
@@ -139,7 +175,7 @@ class QNetFewShot(BaseFewShot):
         # sup_f64:  [B, K, 512, h64, w64] support features (coarser scale)
         # sup_masks:[B, K, H, W]          support fg masks (full res, binary)
         # out_hw:   (H, W)
-        # output:   [B, 2, H, W]
+        # output:   [B, 2, H, W]          PROBABILITIES (ch0=bg, ch1=fg)
         B, K, H, W = sup_masks.shape
         h32, w32 = qry_f32.shape[-2:]
         h64, w64 = qry_f64.shape[-2:]
@@ -150,7 +186,7 @@ class QNetFewShot(BaseFewShot):
         sup_m64 = F.interpolate(sup_masks.view(B * K, 1, H, W).float(),
                                 size=(h64, w64), mode='nearest').view(B, K, 1, h64, w64)
 
-        alpha = F.softmax(self.alpha, dim=0)   # normalized combination weights
+        a0, a1 = self.ALPHA   # fixed weights (sum = 1.0)
 
         preds = []
         for b in range(B):
@@ -158,50 +194,27 @@ class QNetFewShot(BaseFewShot):
             qf64 = qry_f64[b:b+1]   # [1, 512, h64, w64]
             t    = tao[b]            # [1] — adaptive threshold for this target image
 
-            shot_preds = []
-            for k in range(K):
-                sf32 = sup_f32[b, k:k+1]   # [1, 512, h32, w32]
-                sf64 = sup_f64[b, k:k+1]   # [1, 512, h64, w64]
-                sm32 = sup_m32[b, k:k+1]   # [1, 1, h32, w32]
-                sm64 = sup_m64[b, k:k+1]   # [1, 1, h64, w64]
+            # one prototype per scale, averaged over shots
+            proto32 = self._build_proto(self.proto_32, sup_f32[b], sup_m32[b])   # [1, C]
+            proto64 = self._build_proto(self.proto_64, sup_f64[b], sup_m64[b])   # [1, C]
 
-                sim32 = self.proto_32(qf32, sf32, sm32)   # [1, 1, h32, w32]
-                sim64 = self.proto_64(qf64, sf64, sm64)   # [1, 1, h64, w64]
+            # test-time prototype refinement (inference only) — original updatePrototype, both scales
+            n_iters = self.cfg.refinement_iters
+            if not self.training and n_iters > 0:
+                proto32 = prototype_refinement(
+                    qf32, proto32, self._get_pred(qf32, proto32, t), t,
+                    n_iters=n_iters, temperature=self.cfg.temperature)
+                proto64 = prototype_refinement(
+                    qf64, proto64, self._get_pred(qf64, proto64, t), t,
+                    n_iters=n_iters, temperature=self.cfg.temperature)
 
-                # upsample coarser scale to match finer scale, then combine
-                sim64_up = F.interpolate(sim64, size=(h32, w32), mode='bilinear', align_corners=True)
-                fg_sim   = alpha[0] * sim32 + alpha[1] * sim64_up   # [1, 1, h32, w32]
+            # per-scale fg probability (original getPred), interpolate to out size, fixed-alpha combine
+            p32 = F.interpolate(self._get_pred(qf32, proto32, t), size=(H, W), mode='bilinear', align_corners=True)
+            p64 = F.interpolate(self._get_pred(qf64, proto64, t), size=(H, W), mode='bilinear', align_corners=True)
+            p   = a0 * p32 + a1 * p64   # [1, 1, H, W] — probability, sum(alpha)=1
+            preds.append(torch.cat([1.0 - p, p], dim=1))   # [1, 2, H, W]
 
-                # test-time prototype refinement (inference only)
-                n_iters = self.cfg.refinement_iters
-                if not self.training and n_iters > 0:
-                    # extract initial prototype [1, C] and initial fg probability [1, 1, h32, w32]
-                    proto32 = self.proto_32.build_prototype(sf32, sm32)          # [1, 512]
-                    pred_prob = torch.softmax(
-                        torch.cat([t.view(1, 1, 1, 1).expand_as(fg_sim), fg_sim], dim=1), dim=1
-                    )[:, 1:2]                                                    # [1, 1, h32, w32]
-
-                    proto32_r = prototype_refinement(
-                        qf32, proto32, pred_prob, t,
-                        n_iters=n_iters,
-                        temperature=self.cfg.temperature,
-                    )   # [1, 512]
-
-                    # recompute sim32 with refined prototype
-                    proto_n = self.proto_32.safe_norm(proto32_r)    # [1, 512]
-                    qf32_n  = self.proto_32.safe_norm(qf32)         # [1, 512, h32, w32]
-                    sim32_r = self.proto_32.compute_similarity(qf32_n, proto_n)  # [1, 1, h32, w32]
-                    sim32_r = self.proto_32.aggregate(sim32_r)                   # [1, 1, h32, w32]
-                    fg_sim  = alpha[0] * sim32_r + alpha[1] * sim64_up
-
-                # tao as adaptive bg logit: fg wins where sim > tao, bg wins where sim < tao
-                tao_map = t.view(1, 1, 1, 1).expand_as(fg_sim)
-                shot_preds.append(torch.cat([tao_map, fg_sim], dim=1))  # [1, 2, h32, w32]
-
-            preds.append(torch.stack(shot_preds).mean(dim=0))   # [1, 2, h32, w32]
-
-        pred = torch.cat(preds, dim=0)                           # [B, 2, h32, w32]
-        return F.interpolate(pred, size=(H, W), mode='bilinear', align_corners=True)
+        return torch.cat(preds, dim=0)   # [B, 2, H, W] probabilities
 
     def forward(self, support_imgs, support_masks, query_img, train=False):
         # support_imgs:  [B, K, H, W]
@@ -211,9 +224,10 @@ class QNetFewShot(BaseFewShot):
         #                or (pred, align_loss) when train=True
         B, K, H, W = support_imgs.shape
 
-        # encoder returns (feature_dict, tao); keep tao for both sides for alignment
-        sup_feats, sup_tao = self.encoder(self._to_3ch(support_imgs.view(B * K, H, W)))
-        qry_feats, qry_tao = self.encoder(self._to_3ch(query_img))   # tao: [B, 1], adaptive per image
+        # encoder returns (feature_dict, tao); original Q-Net uses the QUERY threshold (self.t)
+        # for both query and alignment predictions, so the support tao is unused.
+        sup_feats, _sup_tao = self.encoder(self._to_3ch(support_imgs.view(B * K, H, W)))
+        qry_feats, qry_tao  = self.encoder(self._to_3ch(query_img))   # tao: [B, 1], adaptive per image
 
         hs32, ws32 = sup_feats['down2'].shape[-2:]
         hs64, ws64 = sup_feats['down3'].shape[-2:]
@@ -230,9 +244,9 @@ class QNetFewShot(BaseFewShot):
         # features (no second forward pass), matching the original Q-Net alignLoss
         with torch.no_grad():
             pred_bin = pred.argmax(dim=1, keepdim=True).float()   # [B, 1, H, W]
-        tgt_tao = sup_tao.view(B, K, 1)[:, 0]   # [B, 1] — threshold of support shot 0
+        # original alignLoss: query-derived prototype predicts on support, using the QUERY tao
         align_pred = self._predict(
-            sup_f32[:, 0], sup_f64[:, 0], tgt_tao,
+            sup_f32[:, 0], sup_f64[:, 0], qry_tao,
             qry_f32.unsqueeze(1), qry_f64.unsqueeze(1), pred_bin, (H, W))
-        align_loss = self._celoss(align_pred, support_masks[:, 0].long())
+        align_loss = self.align_loss_fn(align_pred, support_masks[:, 0].long())
         return pred, align_loss
