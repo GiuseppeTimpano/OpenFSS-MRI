@@ -98,7 +98,22 @@ class FewShotModule(pl.LightningModule):
         return self._model(support_imgs, support_masks, query_img, train=train)
 
     def configure_optimizers(self):
-        return torch.optim.Adam(self.parameters(), lr=self.lr)
+        # Faithful to original Q-Net / SSL-ALPNet: SGD + MultiStepLR.
+        #   optim = {lr: 1e-3, momentum: 0.9, weight_decay: 5e-4}
+        #   lr_milestones = [(ii+1)*1000 for ii in range(n_steps//1000 - 1)]
+        #   lr_step_gamma = 0.95   (scheduler.step() every optimizer step)
+        optimizer = torch.optim.SGD(
+            self.parameters(), lr=self.lr, momentum=0.9, weight_decay=5e-4,
+        )
+        total_steps = int(self.trainer.estimated_stepping_batches)
+        milestones  = [(ii + 1) * 1000 for ii in range(total_steps // 1000)]
+        scheduler   = torch.optim.lr_scheduler.MultiStepLR(
+            optimizer, milestones=milestones, gamma=0.95,
+        )
+        return {
+            'optimizer': optimizer,
+            'lr_scheduler': {'scheduler': scheduler, 'interval': 'step'},
+        }
 
     def training_step(self, batch, batch_idx):
         s_imgs  = batch['support_imgs']   # [B, K, H, W]
@@ -108,8 +123,8 @@ class FewShotModule(pl.LightningModule):
 
         # alignment loss reuses encoder features (computed inside forward), no re-encoding
         pred, loss_align = self(s_imgs, s_masks, q_img, train=True)
-        weight = torch.tensor([self._model.bg_loss_weight, 1.0], device=pred.device)
-        loss = compute_celoss(pred, q_mask, weight=weight)
+        # query loss is model-specific (QNet: NLL on probabilities; ALPNet: weighted CE on logits)
+        loss = self._model.query_loss(pred, q_mask)
 
         total = loss + self.align_weight * loss_align
         self.log_dict({'train/loss': loss, 'train/loss_align': loss_align, 'train/total': total}, prog_bar=True)
@@ -123,7 +138,7 @@ class FewShotModule(pl.LightningModule):
 
         pred = self(s_imgs, s_masks, q_img)
 
-        loss     = compute_celoss(pred, q_mask)
+        loss     = self._model.query_loss(pred, q_mask)
         pred_bin = pred.argmax(dim=1).float()
         q_mask_f = q_mask.float()
         inter    = (pred_bin * q_mask_f).sum()
