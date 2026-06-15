@@ -163,8 +163,8 @@ if __name__ == '__main__':
     parser.add_argument('--max_epochs',     type=int,   default=10)
     parser.add_argument('--num_workers',    type=int,   default=4)
     # domain-shift (optional): pass a JSON file mapping scan_id -> domain_label
-    parser.add_argument('--label_names',     type=str,   default=None,
-                        help='comma-separated GT label names, e.g. BG,LIVER,RK,LK,SPLEEN')
+    parser.add_argument('--label_names',     type=str,   default='BG,LIVER,RK,LK,SPLEEN',
+                        help='comma-separated GT label names (index order must match label volumes)')
     # domain-shift (optional): pass a JSON file mapping scan_id -> domain_label
     parser.add_argument('--domain_map',     type=str,   default=None,
                         help='path to JSON file: {"scan_id": "domain_label", ...}')

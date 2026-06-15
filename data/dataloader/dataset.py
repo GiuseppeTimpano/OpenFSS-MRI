@@ -164,6 +164,8 @@ class EpisodeDataset(Dataset):
         sid_set = set(scan_ids)
         self.classmap: dict[str, dict[str, list[int]]] = {}
         for cls_key, scan_dict in raw.items():
+            if cls_key == 'BG':  # never an evaluation class — its mask is most of the image
+                continue
             filtered = {sid: zs for sid, zs in scan_dict.items() if sid in sid_set and zs}
             if len(filtered) >= 2:  # need >= 2 scans so support ≠ query
                 self.classmap[cls_key] = filtered
