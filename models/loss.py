@@ -54,8 +54,11 @@ def prototype_refinement(
         optimizer.step()
 
         with torch.no_grad():
-            sim  = -F.cosine_similarity(qry_feat, proto_.unsqueeze(-1).unsqueeze(-1),
-                                        dim=1, eps=1e-8) * temperature
-            pred = (1.0 - torch.sigmoid(0.5 * (sim - tao))).unsqueeze(1)
+            # same convention as QNetFewShot._predict: fg_sim = +cos*temp, and
+            # fg prob = softmax([tao, fg_sim])[1] = sigmoid(fg_sim - tao). Using the
+            # opposite sign here (−cos) made refinement chase the wrong region.
+            sim  = F.cosine_similarity(qry_feat, proto_.unsqueeze(-1).unsqueeze(-1),
+                                       dim=1, eps=1e-8) * temperature
+            pred = torch.sigmoid(sim - tao).unsqueeze(1)
 
     return proto_.detach()
