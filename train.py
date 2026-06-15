@@ -88,12 +88,11 @@ class FewShotDataModule(pl.LightningDataModule):
 
 
 class FewShotModule(pl.LightningModule):
-    def __init__(self, model, lr: float, align_weight: float = 1.0, bg_loss_weight: float = 0.1):
+    def __init__(self, model, lr: float, align_weight: float = 1.0):
         super().__init__()
         self._model = model
         self.lr = lr
         self.align_weight = align_weight
-        self.bg_loss_weight = bg_loss_weight
 
     def forward(self, support_imgs, support_masks, query_img, train=False):
         return self._model(support_imgs, support_masks, query_img, train=train)
@@ -109,7 +108,7 @@ class FewShotModule(pl.LightningModule):
 
         # alignment loss reuses encoder features (computed inside forward), no re-encoding
         pred, loss_align = self(s_imgs, s_masks, q_img, train=True)
-        weight = torch.tensor([self.bg_loss_weight, 1.0], device=pred.device)
+        weight = torch.tensor([self._model.bg_loss_weight, 1.0], device=pred.device)
         loss = compute_celoss(pred, q_mask, weight=weight)
 
         total = loss + self.align_weight * loss_align
@@ -177,19 +176,15 @@ if __name__ == '__main__':
             domain_map = json.load(f)
 
     cfg = FewShotConfig(encoder_type=model_name, n_shot=data_cfg['n_shot'])
+    bg_loss_weight = train_cfg.get('bg_loss_weight', 0.1)
     if model_name == 'qnet':
-        model = QNetFewShot(cfg)
+        model = QNetFewShot(cfg, bg_loss_weight=bg_loss_weight)
         align_weight = train_cfg['align_weight']
     else:
-        model = ALPNetFewShot(cfg)
+        model = ALPNetFewShot(cfg, bg_loss_weight=bg_loss_weight)
         align_weight = 0.5
 
-    module = FewShotModule(
-        model=model,
-        lr=train_cfg['lr'],
-        align_weight=align_weight,
-        bg_loss_weight=train_cfg.get('bg_loss_weight', 0.1),
-    )
+    module = FewShotModule(model=model, lr=train_cfg['lr'], align_weight=align_weight)
 
     datamodule = FewShotDataModule(
         data_dir      = data_cfg['data_dir'],

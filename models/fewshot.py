@@ -22,10 +22,15 @@ class FewShotConfig():
     val_wsize:        int   = 4    # ALPNet inference pooling window (None = same as training)
 
 class BaseFewShot(nn.Module):
-    def __init__(self, cfg: FewShotConfig):
+    def __init__(self, cfg: FewShotConfig, bg_loss_weight: float = 0.1):
         super().__init__()
         self.cfg = cfg
+        self.bg_loss_weight = bg_loss_weight
         self.encoder = self.build_encoder()
+
+    def _celoss(self, pred, mask):
+        weight = torch.tensor([self.bg_loss_weight, 1.0], device=pred.device)
+        return compute_celoss(pred, mask, weight=weight)
 
     def build_encoder(self):
         if self.cfg.encoder_type == 'qnet':
@@ -44,8 +49,8 @@ class BaseFewShot(nn.Module):
 
 class ALPNetFewShot(BaseFewShot):
 
-    def __init__(self, cfg: FewShotConfig):
-        super().__init__(cfg)
+    def __init__(self, cfg: FewShotConfig, bg_loss_weight: float = 0.05):
+        super().__init__(cfg, bg_loss_weight=bg_loss_weight)
         # fg: gridconv+ (local+global), fallback to global when coverage too low
         self.fg_prototype = GridPlusPrototype(
             cfg.proto_grid, cfg.feature_hw, cfg.fg_thresh, 1e-4, cfg.temperature,
@@ -112,14 +117,14 @@ class ALPNetFewShot(BaseFewShot):
         with torch.no_grad():
             pred_bin = pred.argmax(dim=1, keepdim=True).float()   # [B, 1, H, W]
         align_pred = self._predict(sup_feat[:, 0], qry_feat.unsqueeze(1), pred_bin, (H, W))
-        align_loss = compute_celoss(align_pred, support_masks[:, 0].long())
+        align_loss = self._celoss(align_pred, support_masks[:, 0].long())
         return pred, align_loss
 
 
 class QNetFewShot(BaseFewShot):
 
-    def __init__(self, cfg):
-        super().__init__(cfg)
+    def __init__(self, cfg, bg_loss_weight: float = 0.1):
+        super().__init__(cfg, bg_loss_weight=bg_loss_weight)
         # one GlobalPrototype per scale (independent temperature params if needed)
         self.proto_32 = GlobalPrototype(temperature=cfg.temperature)
         self.proto_64 = GlobalPrototype(temperature=cfg.temperature)
@@ -229,5 +234,5 @@ class QNetFewShot(BaseFewShot):
         align_pred = self._predict(
             sup_f32[:, 0], sup_f64[:, 0], tgt_tao,
             qry_f32.unsqueeze(1), qry_f64.unsqueeze(1), pred_bin, (H, W))
-        align_loss = compute_celoss(align_pred, support_masks[:, 0].long())
+        align_loss = self._celoss(align_pred, support_masks[:, 0].long())
         return pred, align_loss
