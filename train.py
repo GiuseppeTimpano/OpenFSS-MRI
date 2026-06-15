@@ -133,8 +133,12 @@ class FewShotModule(pl.LightningModule):
         inter    = (pred_bin * q_mask_f).sum()
         dice     = 2 * inter / (pred_bin.sum() + q_mask_f.sum() + 1e-8)
 
-        # always log aggregate metrics
+        cls = batch['class_key'][0]  # val batch_size=1
+
+        # aggregate metrics
         self.log_dict({'val/loss': loss, 'val/dice': dice}, on_epoch=True)
+        # per-class dice
+        self.log(f'val/dice_{cls}', dice, on_step=False, on_epoch=True)
 
         # if cross-domain episode, also log per domain-pair metrics
         # DataLoader collates strings into lists and bools into tensors
@@ -152,6 +156,7 @@ if __name__ == '__main__':
     import argparse
     import json
     import yaml
+    from pytorch_lightning.callbacks import ModelCheckpoint, RichProgressBar
     from models.fewshot import FewShotConfig
 
     parser = argparse.ArgumentParser()
@@ -196,5 +201,11 @@ if __name__ == '__main__':
         target_domain = domain_cfg.get('target_domain'),
     )
 
-    trainer = pl.Trainer(max_epochs=train_cfg['max_epochs'])
+    trainer = pl.Trainer(
+        max_epochs=train_cfg['max_epochs'],
+        callbacks=[
+            ModelCheckpoint(monitor='val/dice', mode='max', save_top_k=1, filename='best'),
+            RichProgressBar(),
+        ],
+    )
     trainer.fit(module, datamodule)

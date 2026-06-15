@@ -9,3 +9,4 @@ scikit-image
 monai
 pytorch-lightning
 pyyaml
+rich
