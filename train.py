@@ -150,59 +150,51 @@ class FewShotModule(pl.LightningModule):
 
 if __name__ == '__main__':
     import argparse
+    import json
+    import yaml
     from models.fewshot import FewShotConfig
 
     parser = argparse.ArgumentParser()
-    parser.add_argument('--data_dir',       type=str,   required=True)
-    parser.add_argument('--model',          type=str,   default='qnet', choices=['qnet', 'alpnet'])
-    parser.add_argument('--fold',           type=int,   default=0)
-    parser.add_argument('--n_shot',         type=int,   default=1)
-    parser.add_argument('--lr',             type=float, default=1e-3)
-    parser.add_argument('--align_weight',   type=float, default=1.0)
-    parser.add_argument('--batch_size',     type=int,   default=2)
-    parser.add_argument('--max_epochs',     type=int,   default=10)
-    parser.add_argument('--num_workers',    type=int,   default=4)
-    # domain-shift (optional): pass a JSON file mapping scan_id -> domain_label
-    parser.add_argument('--label_names',     type=str,   default='BG,LIVER,RK,LK,SPLEEN',
-                        help='comma-separated GT label names (index order must match label volumes)')
-    # domain-shift (optional): pass a JSON file mapping scan_id -> domain_label
-    parser.add_argument('--domain_map',     type=str,   default=None,
-                        help='path to JSON file: {"scan_id": "domain_label", ...}')
-    parser.add_argument('--source_domain',  type=str,   default=None)
-    parser.add_argument('--target_domain',  type=str,   default=None)
+    parser.add_argument('--config', type=str, default='configs/default.yaml',
+                        help='path to the YAML config file')
     args = parser.parse_args()
 
-    # parse label names if provided
-    label_names = args.label_names.split(',') if args.label_names else None
+    with open(args.config) as f:
+        cfg_file = yaml.safe_load(f)
 
-    # load domain map if provided
+    data_cfg   = cfg_file['data']
+    model_name = cfg_file['model']['name']
+    train_cfg  = cfg_file['train']
+    domain_cfg = cfg_file.get('domain', {})
+
+    # load domain map if a path is given
     domain_map = None
-    if args.domain_map is not None:
-        import json
-        with open(args.domain_map) as f:
+    if domain_cfg.get('domain_map'):
+        with open(domain_cfg['domain_map']) as f:
             domain_map = json.load(f)
 
-    cfg = FewShotConfig(encoder_type=args.model, n_shot=args.n_shot)
-    if args.model == 'qnet':
+    cfg = FewShotConfig(encoder_type=model_name, n_shot=data_cfg['n_shot'])
+    if model_name == 'qnet':
         model = QNetFewShot(cfg)
-        align_weight = args.align_weight
+        align_weight = train_cfg['align_weight']
     else:
         model = ALPNetFewShot(cfg)
         align_weight = 0.5
 
-    module = FewShotModule(model=model, lr=args.lr, align_weight=align_weight)
+    module = FewShotModule(model=model, lr=train_cfg['lr'], align_weight=align_weight)
 
     datamodule = FewShotDataModule(
-        data_dir      = args.data_dir,
-        fold          = args.fold,
-        n_shot        = args.n_shot,
-        batch_size    = args.batch_size,
-        num_workers   = args.num_workers,
-        label_names   = label_names,
+        data_dir      = data_cfg['data_dir'],
+        fold          = data_cfg['fold'],
+        n_folds       = data_cfg['n_folds'],
+        n_shot        = data_cfg['n_shot'],
+        batch_size    = data_cfg['batch_size'],
+        num_workers   = data_cfg['num_workers'],
+        label_names   = data_cfg['label_names'],
         domain_map    = domain_map,
-        source_domain = args.source_domain,
-        target_domain = args.target_domain,
+        source_domain = domain_cfg.get('source_domain'),
+        target_domain = domain_cfg.get('target_domain'),
     )
 
-    trainer = pl.Trainer(max_epochs=args.max_epochs)
+    trainer = pl.Trainer(max_epochs=train_cfg['max_epochs'])
     trainer.fit(module, datamodule)
