@@ -99,8 +99,10 @@ class GridPrototype(BasePrototype):
         sup_y_g = self._pool(sup_y)            # [1, 1, G, G]
         sup_y_g = sup_y_g.view(-1)             # [G*G]
 
-        # step 3: keep only cells with enough foreground
+        # step 3: keep only cells with enough foreground; fall back to global if none qualify
         protos = n_sup_x[sup_y_g > self.thresh]  # [N_valid, C]
+        if protos.shape[0] == 0:
+            protos = torch.sum(sup_x * sup_y, dim=(-1, -2)) / (sup_y.sum(dim=(-1, -2)) + self.eps)
 
         return protos
 

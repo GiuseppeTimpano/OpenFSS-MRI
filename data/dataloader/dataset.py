@@ -281,6 +281,6 @@ class EpisodeDataset(Dataset):
         cls_key: str,
     ) -> torch.Tensor:
         if self.use_gt:
-            idx = self._label_idx.get(cls_key, int(cls_key))
+            idx = self._label_idx[cls_key] if cls_key in self._label_idx else int(cls_key)
             return (lbl == idx).long()
         return (sv == int(cls_key)).long()
