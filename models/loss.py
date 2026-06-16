@@ -48,7 +48,8 @@ def prototype_refinement(
             fg_fts  = proto_.unsqueeze(-1).unsqueeze(-1).expand_as(qry_feat) * pred_mask
             bg_fts  = qry_feat * (1 - pred_mask)
             new_fts = bg_fts + fg_fts
-            loss = bce(_norm(new_fts), _norm(qry_feat.detach()))
+            #loss = bce(_norm(new_fts), _norm(qry_feat.detach()))
+            loss = bce(_norm(qry_feat.detach()), _norm(new_fts))
 
         optimizer.zero_grad()
         loss.backward()

@@ -19,7 +19,7 @@ class FewShotConfig():
     feature_hw:       list  = field(default_factory=lambda: [32, 32])
     temperature:      float = 20.0
     refinement_iters: int   = 7    # QNet test-time proto refinement steps (0 = disabled)
-    val_wsize:        int   = 4    # ALPNet inference pooling window (None = same as training)
+    val_wsize:        int   = 2    # ALPNet inference pooling window (original SSL-ALPNet test: 2; None = same as training)
 
 class BaseFewShot(nn.Module):
     def __init__(self, cfg: FewShotConfig, bg_loss_weight: float = 0.1):
@@ -82,8 +82,11 @@ class ALPNetFewShot(BaseFewShot):
         # output:    [B, 2, H, W]
         B, K, H, W = sup_masks.shape
         h, w = qry_feat.shape[-2:]
+        # original SSL-ALPNet downsamples the support mask to feature res with BILINEAR
+        # (grid_proto_fewshot.py: F.interpolate(fore_mask, fts_size, mode='bilinear')),
+        # giving soft mask values used for grid-cell thresholding + global prototype.
         sup_m = F.interpolate(sup_masks.view(B * K, 1, H, W).float(),
-                              size=(h, w), mode='nearest').view(B, K, 1, h, w)
+                              size=(h, w), mode='bilinear', align_corners=False).view(B, K, 1, h, w)
 
         preds = []
         for b in range(B):

@@ -61,7 +61,7 @@ class FewShotDataModule(pl.LightningDataModule):
 
 
 class FewShotModule(pl.LightningModule):
-    def __init__(self, model, lr: float, align_weight: float = 1.0, lr_gamma: float = 0.98):
+    def __init__(self, model, lr: float, align_weight: float = 1.0, lr_gamma: float = 0.95):
         super().__init__()
         self._model = model
         self.lr = lr
@@ -75,7 +75,7 @@ class FewShotModule(pl.LightningModule):
         # Faithful to original Q-Net / SSL-ALPNet: SGD + MultiStepLR.
         #   optim = {lr: 1e-3, momentum: 0.9, weight_decay: 5e-4}
         #   lr_milestones = [(ii+1)*1000 for ii in range(n_steps//1000 - 1)]
-        #   lr_step_gamma = 0.98   (scheduler.step() every optimizer step)
+        #   lr_step_gamma = 0.95   (scheduler.step() every optimizer step)
         optimizer = torch.optim.SGD(
             self.parameters(), lr=self.lr, momentum=0.9, weight_decay=5e-4,
         )
@@ -128,13 +128,13 @@ if __name__ == '__main__':
     bg_loss_weight = train_cfg.get('bg_loss_weight', 0.1)
     if model_name == 'qnet':
         model = QNetFewShot(cfg, bg_loss_weight=bg_loss_weight)
-        align_weight = train_cfg['align_weight']
     else:
         model = ALPNetFewShot(cfg, bg_loss_weight=bg_loss_weight)
-        align_weight = 0.5
+    # original (Q-Net train.py & SSL-ALPNet training.py): loss = query_loss + align_loss (weight 1.0)
+    align_weight = train_cfg['align_weight']
 
     module = FewShotModule(model=model, lr=train_cfg['lr'], align_weight=align_weight,
-                           lr_gamma=train_cfg.get('lr_gamma', 0.98))
+                           lr_gamma=train_cfg.get('lr_gamma', 0.95))
 
     datamodule = FewShotDataModule(
         data_dir      = data_cfg['data_dir'],
