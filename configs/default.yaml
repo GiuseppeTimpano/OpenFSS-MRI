@@ -10,6 +10,9 @@ data:
   num_workers: 4
   # min foreground pixels required per training episode (original min_size filter)
   min_size: 200
+  # GT labels to drop from the SSL training pool (original exclude_label; null = off).
+  # Set to the fold's held-out test organ(s) for setting-1 experiments, e.g. [1, 4].
+  exclude_label: null
   # GT label names; index order must match the label volume values (BG=0, ...).
   label_names: [BG, LIVER, RK, LK, SPLEEN]
 

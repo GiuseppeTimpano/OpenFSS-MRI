@@ -20,6 +20,8 @@ class FewShotDataModule(pl.LightningDataModule):
         num_workers: int = 4,
         # min foreground pixels per training episode (original min_size filter)
         min_size: int = 200,
+        # GT labels to exclude from the SSL training pool (original exclude_label; None = off)
+        exclude_label: list[int] | None = None,
         # label names for GT classmap decoding (required when use_gt=True)
         label_names: list[str] | None = None,
         # domain-shift options (val only: train always same-domain)
@@ -37,6 +39,7 @@ class FewShotDataModule(pl.LightningDataModule):
         self.batch_size       = batch_size
         self.num_workers      = num_workers
         self.min_size         = min_size
+        self.exclude_label    = exclude_label
         self.label_names      = label_names
         self.domain_map       = domain_map
         self.source_domain    = source_domain
@@ -54,9 +57,10 @@ class FewShotDataModule(pl.LightningDataModule):
             scan_ids   = train_ids,
             n_shot     = self.n_shot,
             n_episodes = self.n_train_episodes,
-            use_gt     = False,
-            augment    = True,
-            min_size   = self.min_size,
+            use_gt        = False,
+            augment       = True,
+            min_size      = self.min_size,
+            exclude_label = self.exclude_label,
         )
         self.val_ds = EpisodeDataset(
             data_dir      = self.data_dir,
@@ -213,6 +217,7 @@ if __name__ == '__main__':
         batch_size    = data_cfg['batch_size'],
         num_workers   = data_cfg['num_workers'],
         min_size      = data_cfg.get('min_size', 200),
+        exclude_label = data_cfg.get('exclude_label'),
         label_names   = data_cfg['label_names'],
         domain_map    = domain_map,
         source_domain = domain_cfg.get('source_domain'),

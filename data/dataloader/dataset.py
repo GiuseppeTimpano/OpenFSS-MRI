@@ -59,6 +59,11 @@ class _ScanView:
     def n_slices(self) -> int:
         return self._img.shape[0]
 
+    @property
+    def gt_volume(self) -> np.ndarray:
+        # full GT label volume [D, H, W] (used for exclude_label filtering)
+        return self._lbl
+
 
 class SliceDataset:
     """
@@ -135,6 +140,7 @@ class EpisodeDataset(Dataset):
         sv_prefix: str = 'MIDDLE',
         min_px_key: str = '1',
         min_size: int = 200,
+        exclude_label: Optional[list[int]] = None,
         # domain-shift options
         cross_domain: bool = False,
         source_domain: Optional[str] = None,
@@ -145,6 +151,7 @@ class EpisodeDataset(Dataset):
         self.n_episodes    = n_episodes
         self.use_gt        = use_gt
         self.min_size      = min_size
+        self.exclude_label = exclude_label
         # two separate transforms: geom (affine+elastic, img+mask) and gamma (img only).
         # each is applied to either the support set or the query, 50/50 (original protocol).
         self.geom_transform = get_geom_transform() if augment else None
@@ -253,6 +260,28 @@ class EpisodeDataset(Dataset):
                 runs.append([z])
         return runs
 
+    def _compute_excluded_slices(self, sid_set: set) -> dict[str, set]:
+        """
+        For each scan, the set of slice indices whose GT must be excluded from the
+        SSL training pool (original exclude_label, Q-Net semantics).
+
+        Q-Net uses AND: a slice is excluded only if its GT contains ALL labels in
+        exclude_label simultaneously (in practice exclude_label is a single test
+        organ, where AND == "organ present"). Returns {} when exclude_label is None.
+        """
+        if not self.exclude_label:
+            return {}
+        excluded: dict[str, set] = {}
+        for sid in sid_set:
+            if sid not in self.slices:
+                continue
+            gt = self.slices[sid].gt_volume            # [D, H, W]
+            keep = np.ones(gt.shape[0], dtype=bool)    # start all True, AND each label
+            for lab in self.exclude_label:
+                keep &= (gt == lab).any(axis=(1, 2))
+            excluded[sid] = set(np.nonzero(keep)[0].tolist())
+        return excluded
+
     def _build_train_index(self, raw: dict, sid_set: set) -> None:
         """
         Build a per-scan supervoxel index for "neighbours" sampling.
@@ -262,11 +291,16 @@ class EpisodeDataset(Dataset):
         slices + 1 query slice, all adjacent and from the same scan).
         """
         block = self.n_shot + 1
+        # exclude_label (original, optional): slices whose GT contains the held-out test
+        # labels are dropped from the SSL pool so training never sees the test organ.
+        # Removing a z also breaks consecutive runs, so an episode never spans it.
+        excluded = self._compute_excluded_slices(sid_set)
         self.scan_index: dict[str, dict[str, list[list[int]]]] = {}
         for sv_id, scan_dict in raw.items():
             for sid, zs in scan_dict.items():
                 if sid not in sid_set or not zs:
                     continue
+                zs = [z for z in zs if z not in excluded.get(sid, set())]
                 runs = [r for r in self._consecutive_runs(sorted(zs)) if len(r) >= block]
                 if runs:
                     self.scan_index.setdefault(sid, {})[sv_id] = runs
