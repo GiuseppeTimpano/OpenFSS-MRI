@@ -57,10 +57,16 @@ class GlobalPrototype(BasePrototype):
         super().__init__(eps=eps, temperature=temperature)
 
     def build_prototype(self, sup_x: torch.Tensor, sup_y: torch.Tensor) -> torch.Tensor:
-        # sup_x: [1, C, H, W]
-        # sup_y: [1, 1, H, W]
-        # masked average pooling → single global prototype
-        # output: [1, C]
+        # sup_x: [1, C, h, w]   feature map (may be at lower resolution)
+        # sup_y: [1, 1, H, W]   mask (may be at full resolution)
+        # output: [1, C]        global prototype (masked average pooling)
+
+        # Upsample the FEATURES to the mask resolution, then do masked average pooling.
+        # Same as the original: do not shrink the mask (that would destroy small organs
+        # like kidneys/spleen), instead grow the features.
+        if sup_x.shape[-2:] != sup_y.shape[-2:]:
+            sup_x = F.interpolate(sup_x, size=sup_y.shape[-2:], mode='bilinear', align_corners=False)
+
         proto = torch.sum(sup_x * sup_y, dim=(-1, -2)) / (sup_y.sum(dim=(-1, -2)) + self.eps)
         return proto  # [1, C]
 

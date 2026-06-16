@@ -177,14 +177,11 @@ class QNetFewShot(BaseFewShot):
         # out_hw:   (H, W)
         # output:   [B, 2, H, W]          PROBABILITIES (ch0=bg, ch1=fg)
         B, K, H, W = sup_masks.shape
-        h32, w32 = qry_f32.shape[-2:]
-        h64, w64 = qry_f64.shape[-2:]
 
-        # resize masks to match each feature scale
-        sup_m32 = F.interpolate(sup_masks.view(B * K, 1, H, W).float(),
-                                size=(h32, w32), mode='nearest').view(B, K, 1, h32, w32)
-        sup_m64 = F.interpolate(sup_masks.view(B * K, 1, H, W).float(),
-                                size=(h64, w64), mode='nearest').view(B, K, 1, h64, w64)
+        # Keep masks at FULL resolution [B, K, 1, H, W]. The prototype builder
+        # upsamples the features to this resolution before pooling (original Q-Net
+        # getFeatures), instead of shrinking the masks down to the feature grid.
+        sup_m = sup_masks.unsqueeze(2).float()   # [B, K, 1, H, W]
 
         a0, a1 = self.ALPHA   # fixed weights (sum = 1.0)
 
@@ -194,9 +191,9 @@ class QNetFewShot(BaseFewShot):
             qf64 = qry_f64[b:b+1]   # [1, 512, h64, w64]
             t    = tao[b]            # [1] — adaptive threshold for this target image
 
-            # one prototype per scale, averaged over shots
-            proto32 = self._build_proto(self.proto_32, sup_f32[b], sup_m32[b])   # [1, C]
-            proto64 = self._build_proto(self.proto_64, sup_f64[b], sup_m64[b])   # [1, C]
+            # one prototype per scale, averaged over shots (full-res masks)
+            proto32 = self._build_proto(self.proto_32, sup_f32[b], sup_m[b])   # [1, C]
+            proto64 = self._build_proto(self.proto_64, sup_f64[b], sup_m[b])   # [1, C]
 
             # test-time prototype refinement (inference only) — original updatePrototype, both scales
             n_iters = self.cfg.refinement_iters
