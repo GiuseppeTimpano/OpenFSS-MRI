@@ -10,3 +10,4 @@ monai
 pytorch-lightning
 pyyaml
 rich
+matplotlib

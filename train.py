@@ -61,11 +61,12 @@ class FewShotDataModule(pl.LightningDataModule):
 
 
 class FewShotModule(pl.LightningModule):
-    def __init__(self, model, lr: float, align_weight: float = 1.0):
+    def __init__(self, model, lr: float, align_weight: float = 1.0, lr_gamma: float = 0.98):
         super().__init__()
         self._model = model
         self.lr = lr
         self.align_weight = align_weight
+        self.lr_gamma = lr_gamma
 
     def forward(self, support_imgs, support_masks, query_img, train=False):
         return self._model(support_imgs, support_masks, query_img, train=train)
@@ -74,14 +75,14 @@ class FewShotModule(pl.LightningModule):
         # Faithful to original Q-Net / SSL-ALPNet: SGD + MultiStepLR.
         #   optim = {lr: 1e-3, momentum: 0.9, weight_decay: 5e-4}
         #   lr_milestones = [(ii+1)*1000 for ii in range(n_steps//1000 - 1)]
-        #   lr_step_gamma = 0.95   (scheduler.step() every optimizer step)
+        #   lr_step_gamma = 0.98   (scheduler.step() every optimizer step)
         optimizer = torch.optim.SGD(
             self.parameters(), lr=self.lr, momentum=0.9, weight_decay=5e-4,
         )
         total_steps = int(self.trainer.estimated_stepping_batches)
         milestones  = [(ii + 1) * 1000 for ii in range(total_steps // 1000)]
         scheduler   = torch.optim.lr_scheduler.MultiStepLR(
-            optimizer, milestones=milestones, gamma=0.95,
+            optimizer, milestones=milestones, gamma=self.lr_gamma,
         )
         return {
             'optimizer': optimizer,
@@ -132,7 +133,8 @@ if __name__ == '__main__':
         model = ALPNetFewShot(cfg, bg_loss_weight=bg_loss_weight)
         align_weight = 0.5
 
-    module = FewShotModule(model=model, lr=train_cfg['lr'], align_weight=align_weight)
+    module = FewShotModule(model=model, lr=train_cfg['lr'], align_weight=align_weight,
+                           lr_gamma=train_cfg.get('lr_gamma', 0.98))
 
     datamodule = FewShotDataModule(
         data_dir      = data_cfg['data_dir'],
@@ -147,8 +149,6 @@ if __name__ == '__main__':
 
     trainer = pl.Trainer(
         max_epochs=train_cfg['max_epochs'],
-        # original protocol: no validation, just save a snapshot every epoch and keep all.
-        # the best snapshot is chosen later by the volumetric test script.
         num_sanity_val_steps=0,
         callbacks=[
             ModelCheckpoint(save_top_k=-1, every_n_epochs=1, save_last=True,
