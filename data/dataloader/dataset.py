@@ -10,7 +10,7 @@ import SimpleITK as sitk
 import torch
 
 from monai.data.dataset import Dataset
-from data.augmentation import get_train_transform
+from data.augmentation import get_geom_transform, get_intensity_transform
 
 
 def _read_nii(path: str) -> np.ndarray:
@@ -134,6 +134,7 @@ class EpisodeDataset(Dataset):
         label_names: Optional[list[str]] = None,
         sv_prefix: str = 'MIDDLE',
         min_px_key: str = '1',
+        min_size: int = 200,
         # domain-shift options
         cross_domain: bool = False,
         source_domain: Optional[str] = None,
@@ -143,7 +144,11 @@ class EpisodeDataset(Dataset):
         self.n_shot        = n_shot
         self.n_episodes    = n_episodes
         self.use_gt        = use_gt
-        self.transform     = get_train_transform() if augment else None
+        self.min_size      = min_size
+        # two separate transforms: geom (affine+elastic, img+mask) and gamma (img only).
+        # each is applied to either the support set or the query, 50/50 (original protocol).
+        self.geom_transform = get_geom_transform() if augment else None
+        self.gamma_transform = get_intensity_transform() if augment else None
         self.cross_domain  = cross_domain
         self.source_domain = source_domain
         self.target_domain = target_domain
@@ -272,7 +277,10 @@ class EpisodeDataset(Dataset):
                 f'No scan has a supervoxel spanning >= {block} adjacent slices'
             )
 
-    def _sample_supervoxel_episode(self) -> dict:
+    # max episode resamples before falling back to the best candidate (min_size filter)
+    _MAX_RESAMPLE = 100
+
+    def _draw_supervoxel_block(self) -> tuple[str, str, list[int], int]:
         # pick scan, then supervoxel, then a block of adjacent slices in one run
         scan  = random.choice(self.train_scans)
         sv_id = random.choice(list(self.scan_index[scan].keys()))
@@ -284,18 +292,41 @@ class EpisodeDataset(Dataset):
         if random.random() > 0.5:           # adjacent slices in reverse order
             zblock = zblock[::-1]
         support_z, query_z = zblock[:self.n_shot], zblock[self.n_shot]
+        return scan, sv_id, support_z, query_z
 
-        support_imgs, support_masks = [], []
-        for z in support_z:
-            img, lbl, sv = self.slices[scan][z]
-            mask = self._make_mask(lbl, sv, sv_id).float()
-            img, mask = self._apply_transform(img, mask)
-            support_imgs.append(img)
-            support_masks.append(mask)
+    def _sample_supervoxel_episode(self) -> dict:
+        # min_size filter (original): resample the whole episode until at least one of
+        # the support/query slices has >= min_size foreground pixels. Avoids degenerate
+        # episodes with a near-empty supervoxel. Keep the best candidate as a fallback so
+        # we never loop forever on a scan whose supervoxels are all tiny.
+        best = None        # (fg, episode_data) with the largest fg seen so far
+        for _ in range(self._MAX_RESAMPLE):
+            scan, sv_id, support_z, query_z = self._draw_supervoxel_block()
 
-        q_img, q_lbl, q_sv = self.slices[scan][query_z]
-        q_mask = self._make_mask(q_lbl, q_sv, sv_id).float()
-        q_img, q_mask = self._apply_transform(q_img, q_mask)
+            support_imgs, support_masks = [], []
+            for z in support_z:
+                img, lbl, sv = self.slices[scan][z]
+                mask = self._make_mask(lbl, sv, sv_id).float()
+                support_imgs.append(img)
+                support_masks.append(mask)
+
+            q_img, q_lbl, q_sv = self.slices[scan][query_z]
+            q_mask = self._make_mask(q_lbl, q_sv, sv_id).float()
+
+            # check on RAW masks, before augmentation (same as original)
+            fg = max([m.sum().item() for m in support_masks] + [q_mask.sum().item()])
+            episode = (scan, sv_id, support_imgs, support_masks, q_img, q_mask)
+            if fg >= self.min_size:
+                break
+            if best is None or fg > best[0]:
+                best = (fg, episode)
+        else:
+            # no episode passed min_size within the budget -> use the best one seen
+            scan, sv_id, support_imgs, support_masks, q_img, q_mask = best[1]
+
+        support_imgs, support_masks, q_img, q_mask = self._augment_episode(
+            support_imgs, support_masks, q_img, q_mask
+        )
 
         return {
             'support_imgs':  torch.stack(support_imgs),
@@ -333,14 +364,16 @@ class EpisodeDataset(Dataset):
             z = random.choice(support_scan_dict[sid])
             img, lbl, sv = self.slices[sid][z]
             mask = self._make_mask(lbl, sv, cls_key).float()
-            img, mask = self._apply_transform(img, mask)
             support_imgs.append(img)
             support_masks.append(mask)
 
         q_z = random.choice(query_scan_dict[query_scan])
         q_img, q_lbl, q_sv = self.slices[query_scan][q_z]
         q_mask = self._make_mask(q_lbl, q_sv, cls_key).float()
-        q_img, q_mask = self._apply_transform(q_img, q_mask)
+
+        support_imgs, support_masks, q_img, q_mask = self._augment_episode(
+            support_imgs, support_masks, q_img, q_mask
+        )
 
         return {
             'support_imgs':  torch.stack(support_imgs),
@@ -353,15 +386,45 @@ class EpisodeDataset(Dataset):
             'target_domain': self.target_domain or '',
         }
 
-    def _apply_transform(
+    def _augment_episode(
+        self,
+        support_imgs: list[torch.Tensor],
+        support_masks: list[torch.Tensor],
+        q_img: torch.Tensor,
+        q_mask: torch.Tensor,
+    ) -> tuple[list[torch.Tensor], list[torch.Tensor], torch.Tensor, torch.Tensor]:
+        # original protocol: gamma to support OR query (50/50), geom to support OR query (50/50)
+        if self.geom_transform is None:
+            return support_imgs, support_masks, q_img, q_mask
+
+        # gamma (intensity, img only)
+        if random.random() > 0.5:
+            support_imgs = [self._gamma(i) for i in support_imgs]
+        else:
+            q_img = self._gamma(q_img)
+
+        # geom (affine + elastic, img + mask together)
+        if random.random() > 0.5:
+            support_imgs, support_masks = zip(
+                *(self._geom(i, m) for i, m in zip(support_imgs, support_masks))
+            )
+            support_imgs, support_masks = list(support_imgs), list(support_masks)
+        else:
+            q_img, q_mask = self._geom(q_img, q_mask)
+
+        return support_imgs, support_masks, q_img, q_mask
+
+    def _gamma(self, img: torch.Tensor) -> torch.Tensor:
+        out = self.gamma_transform({'img': img})
+        # EnsureChannelFirstd adds dim → squeeze back to [H, W]
+        return out['img'].squeeze(0)
+
+    def _geom(
         self,
         img: torch.Tensor,
         mask: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        if self.transform is None:
-            return img, mask
-        out = self.transform({'img': img, 'mask': mask})
-        # EnsureChannelFirstd adds dim → squeeze back to [H, W]
+        out = self.geom_transform({'img': img, 'mask': mask})
         return out['img'].squeeze(0), out['mask'].squeeze(0)
 
     def _make_mask(

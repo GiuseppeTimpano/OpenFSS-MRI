@@ -18,6 +18,8 @@ class FewShotDataModule(pl.LightningDataModule):
         n_val_episodes: int = 200,
         batch_size: int = 2,
         num_workers: int = 4,
+        # min foreground pixels per training episode (original min_size filter)
+        min_size: int = 200,
         # label names for GT classmap decoding (required when use_gt=True)
         label_names: list[str] | None = None,
         # domain-shift options (val only: train always same-domain)
@@ -34,6 +36,7 @@ class FewShotDataModule(pl.LightningDataModule):
         self.n_val_episodes   = n_val_episodes
         self.batch_size       = batch_size
         self.num_workers      = num_workers
+        self.min_size         = min_size
         self.label_names      = label_names
         self.domain_map       = domain_map
         self.source_domain    = source_domain
@@ -53,6 +56,7 @@ class FewShotDataModule(pl.LightningDataModule):
             n_episodes = self.n_train_episodes,
             use_gt     = False,
             augment    = True,
+            min_size   = self.min_size,
         )
         self.val_ds = EpisodeDataset(
             data_dir      = self.data_dir,
@@ -208,6 +212,7 @@ if __name__ == '__main__':
         n_shot        = data_cfg['n_shot'],
         batch_size    = data_cfg['batch_size'],
         num_workers   = data_cfg['num_workers'],
+        min_size      = data_cfg.get('min_size', 200),
         label_names   = data_cfg['label_names'],
         domain_map    = domain_map,
         source_domain = domain_cfg.get('source_domain'),
