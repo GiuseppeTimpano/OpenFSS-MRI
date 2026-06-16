@@ -24,3 +24,5 @@ data/datasets/CHAOS/
 handoff/
 CLAUDE.md
 HANDOFF.md
+
+metrics.csv
