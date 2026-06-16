@@ -26,7 +26,9 @@ train:
   bg_loss_weight: 0.1    # qnet original: 0.1 | alpnet original: 0.05
   max_epochs: 30
 
-# Cross-domain validation (optional). Leave domain_map null to disable.
+# Cross-domain TEST (optional): train on source domain, test on target domain
+# (like Q-Net trained on MRI T1 then tested on T2). Used by the volumetric test
+# script, NOT during training. Leave domain_map null to disable.
 domain:
   domain_map: null       # path to JSON: {"scan_id": "domain_label", ...}
   source_domain: null

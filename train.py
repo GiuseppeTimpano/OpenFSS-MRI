@@ -15,19 +15,12 @@ class FewShotDataModule(pl.LightningDataModule):
         n_folds: int = 4,
         n_shot: int = 1,
         n_train_episodes: int = 1000,
-        n_val_episodes: int = 200,
         batch_size: int = 2,
         num_workers: int = 4,
         # min foreground pixels per training episode (original min_size filter)
         min_size: int = 200,
         # GT labels to exclude from the SSL training pool (original exclude_label; None = off)
         exclude_label: list[int] | None = None,
-        # label names for GT classmap decoding (required when use_gt=True)
-        label_names: list[str] | None = None,
-        # domain-shift options (val only: train always same-domain)
-        domain_map: dict[str, str] | None = None,
-        source_domain: str | None = None,
-        target_domain: str | None = None,
     ):
         super().__init__()
         self.data_dir         = data_dir
@@ -35,22 +28,16 @@ class FewShotDataModule(pl.LightningDataModule):
         self.n_folds          = n_folds
         self.n_shot           = n_shot
         self.n_train_episodes = n_train_episodes
-        self.n_val_episodes   = n_val_episodes
         self.batch_size       = batch_size
         self.num_workers      = num_workers
         self.min_size         = min_size
         self.exclude_label    = exclude_label
-        self.label_names      = label_names
-        self.domain_map       = domain_map
-        self.source_domain    = source_domain
-        self.target_domain    = target_domain
-
-    @property
-    def cross_domain(self) -> bool:
-        return self.domain_map is not None
 
     def setup(self, stage=None):
-        train_ids, val_ids = get_fold_ids(self.data_dir, self.fold, self.n_folds)
+        # Original Q-Net / SSL-ALPNet protocol: NO validation during training.
+        # fold split only separates train scans from the held-out test scans;
+        # test scans are evaluated volumetrically by a separate test script.
+        train_ids, _ = get_fold_ids(self.data_dir, self.fold, self.n_folds)
 
         self.train_ds = EpisodeDataset(
             data_dir   = self.data_dir,
@@ -62,33 +49,11 @@ class FewShotDataModule(pl.LightningDataModule):
             min_size      = self.min_size,
             exclude_label = self.exclude_label,
         )
-        self.val_ds = EpisodeDataset(
-            data_dir      = self.data_dir,
-            scan_ids      = val_ids,
-            n_shot        = self.n_shot,
-            n_episodes    = self.n_val_episodes,
-            use_gt        = True,
-            augment       = False,
-            label_names   = self.label_names,
-            cross_domain  = self.cross_domain,
-            source_domain = self.source_domain,
-            target_domain = self.target_domain,
-            domain_map    = self.domain_map,
-        )
 
     def train_dataloader(self):
         return DataLoader(
             self.train_ds,
             batch_size  = self.batch_size,
-            shuffle     = False,
-            num_workers = self.num_workers,
-            pin_memory  = True,
-        )
-
-    def val_dataloader(self):
-        return DataLoader(
-            self.val_ds,
-            batch_size  = 1,
             shuffle     = False,
             num_workers = self.num_workers,
             pin_memory  = True,
@@ -138,42 +103,9 @@ class FewShotModule(pl.LightningModule):
         self.log_dict({'train/loss': loss, 'train/loss_align': loss_align, 'train/total': total}, prog_bar=True)
         return total
 
-    def validation_step(self, batch, batch_idx):
-        s_imgs  = batch['support_imgs']
-        s_masks = batch['support_masks']
-        q_img   = batch['query_img']
-        q_mask  = batch['query_mask']
-
-        pred = self(s_imgs, s_masks, q_img)
-
-        loss     = self._model.query_loss(pred, q_mask)
-        pred_bin = pred.argmax(dim=1).float()
-        q_mask_f = q_mask.float()
-        inter    = (pred_bin * q_mask_f).sum()
-        dice     = 2 * inter / (pred_bin.sum() + q_mask_f.sum() + 1e-8)
-
-        cls = batch['class_key'][0]  # val batch_size=1
-
-        # aggregate metrics
-        self.log_dict({'val/loss': loss, 'val/dice': dice, 'val/pred_fg_rate': pred_bin.mean()}, on_epoch=True)
-        # per-class dice
-        self.log(f'val/dice_{cls}', dice, on_step=False, on_epoch=True)
-
-        # if cross-domain episode, also log per domain-pair metrics
-        # DataLoader collates strings into lists and bools into tensors
-        if batch['cross_domain'][0].item():
-            src = batch['source_domain'][0]
-            tgt = batch['target_domain'][0]
-            pair = f'{src}→{tgt}'
-            self.log_dict(
-                {f'val/loss_{pair}': loss, f'val/dice_{pair}': dice},
-                on_epoch=True,
-            )
-
 
 if __name__ == '__main__':
     import argparse
-    import json
     import yaml
     from pytorch_lightning.callbacks import ModelCheckpoint, RichProgressBar
     from pytorch_lightning.loggers import CSVLogger
@@ -190,13 +122,6 @@ if __name__ == '__main__':
     data_cfg   = cfg_file['data']
     model_name = cfg_file['model']['name']
     train_cfg  = cfg_file['train']
-    domain_cfg = cfg_file.get('domain', {})
-
-    # load domain map if a path is given
-    domain_map = None
-    if domain_cfg.get('domain_map'):
-        with open(domain_cfg['domain_map']) as f:
-            domain_map = json.load(f)
 
     cfg = FewShotConfig(encoder_type=model_name, n_shot=data_cfg['n_shot'])
     bg_loss_weight = train_cfg.get('bg_loss_weight', 0.1)
@@ -218,16 +143,16 @@ if __name__ == '__main__':
         num_workers   = data_cfg['num_workers'],
         min_size      = data_cfg.get('min_size', 200),
         exclude_label = data_cfg.get('exclude_label'),
-        label_names   = data_cfg['label_names'],
-        domain_map    = domain_map,
-        source_domain = domain_cfg.get('source_domain'),
-        target_domain = domain_cfg.get('target_domain'),
     )
 
     trainer = pl.Trainer(
         max_epochs=train_cfg['max_epochs'],
+        # original protocol: no validation, just save a snapshot every epoch and keep all.
+        # the best snapshot is chosen later by the volumetric test script.
+        num_sanity_val_steps=0,
         callbacks=[
-            ModelCheckpoint(monitor='val/dice', mode='max', save_top_k=1, filename='best'),
+            ModelCheckpoint(save_top_k=-1, every_n_epochs=1, save_last=True,
+                            filename='{epoch}-{step}'),
             RichProgressBar(),
         ],
         logger=CSVLogger('.', name='lightning_logs'),
