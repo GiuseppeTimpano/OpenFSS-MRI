@@ -66,10 +66,13 @@ class QNetEncoder(_BaseEncoder):
 
     def __init__(self, pretrained=True):
         super().__init__()
+        self._build_backbone_from_deeplab(pretrained)
+        '''
         self._build_backbone_from_resnet(
             pretrained,
             replace_stride_with_dilation=[True, True, False]
         )
+        '''
         self.reduce1 = nn.Conv2d(1024, 512, kernel_size=1, bias=False)  # layer3
         self.reduce2 = nn.Conv2d(2048, 512, kernel_size=1, bias=False)  # layer4
         self.reduce1d = nn.Linear(1000, 1, bias=True)                   # tao
