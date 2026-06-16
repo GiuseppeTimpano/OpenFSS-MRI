@@ -1,7 +1,6 @@
 import torch
 import torch.nn as nn
 import torchvision.models as models
-from torchvision.models import ResNet101_Weights
 from torchvision.models.segmentation import DeepLabV3_ResNet101_Weights
 
 
@@ -9,14 +8,20 @@ class _BaseEncoder(nn.Module):
     """Shared backbone loading logic for ResNet101-based encoders."""
 
     def _build_backbone_from_resnet(self, pretrained, replace_stride_with_dilation):
-        weights = ResNet101_Weights.IMAGENET1K_V1 if pretrained else None
         _model = models.resnet101(
-            weights=weights,
+            weights=None,
             replace_stride_with_dilation=replace_stride_with_dilation
         )
         self.backbone = nn.ModuleDict()
         for name, module in _model.named_children():
             self.backbone[name] = module
+        if pretrained:
+            ckpt = DeepLabV3_ResNet101_Weights.COCO_WITH_VOC_LABELS_V1.get_state_dict(progress=True)
+            own = self.state_dict()
+            for k, v in ckpt.items():
+                if k in own and own[k].shape == v.shape:
+                    own[k] = v
+            self.load_state_dict(own)
 
     def _build_backbone_from_deeplab(self, pretrained):
         weights = DeepLabV3_ResNet101_Weights.COCO_WITH_VOC_LABELS_V1 if pretrained else None
@@ -66,15 +71,9 @@ class QNetEncoder(_BaseEncoder):
 
     def __init__(self, pretrained=True):
         super().__init__()
-        self._build_backbone_from_deeplab(pretrained)
-        '''
-        self._build_backbone_from_resnet(
-            pretrained,
-            replace_stride_with_dilation=[True, True, False]
-        )
-        '''
-        self.reduce1 = nn.Conv2d(1024, 512, kernel_size=1, bias=False)  # layer3
-        self.reduce2 = nn.Conv2d(2048, 512, kernel_size=1, bias=False)  # layer4
+        self._build_backbone_from_resnet(pretrained, replace_stride_with_dilation=[True, True, False])
+        self.reduce1 = nn.Conv2d(1024, 512, kernel_size=1, bias=False)  # layer3 → down2 /4
+        self.reduce2 = nn.Conv2d(2048, 512, kernel_size=1, bias=False)  # layer4 → down3 /8
         self.reduce1d = nn.Linear(1000, 1, bias=True)                   # tao
         self._init_new_layers()
 

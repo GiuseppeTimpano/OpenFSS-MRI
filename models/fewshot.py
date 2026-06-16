@@ -18,7 +18,7 @@ class FewShotConfig():
     proto_grid:       list  = field(default_factory=lambda: [8, 8])
     feature_hw:       list  = field(default_factory=lambda: [32, 32])
     temperature:      float = 20.0
-    refinement_iters: int   = 3    # QNet test-time proto refinement steps (0 = disabled)
+    refinement_iters: int   = 7    # QNet test-time proto refinement steps (0 = disabled)
     val_wsize:        int   = 4    # ALPNet inference pooling window (None = same as training)
 
 class BaseFewShot(nn.Module):
