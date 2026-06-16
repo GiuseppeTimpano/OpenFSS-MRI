@@ -6,7 +6,7 @@ data:
   fold: 0
   n_folds: 4
   n_shot: 1
-  batch_size: 2
+  batch_size: 1
   num_workers: 4
   # GT label names; index order must match the label volume values (BG=0, ...).
   label_names: [BG, LIVER, RK, LK, SPLEEN]
