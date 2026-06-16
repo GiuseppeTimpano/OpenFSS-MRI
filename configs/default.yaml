@@ -26,6 +26,12 @@ train:
   bg_loss_weight: 0.1    # qnet original: 0.1 | alpnet original: 0.05
   max_epochs: 30
 
+test:
+  supp_idx: 0        # which test scan is the support (0 = first in sorted list)
+  n_part: 3          # support slices selected + query chunks (original Q-Net default)
+  test_label: null   # null = evaluate all non-BG classes; or e.g. [1, 4]
+  save_preds: false  # if true, also write binary pred nii.gz (pass --save_dir on CLI)
+
 # Cross-domain TEST (optional): train on source domain, test on target domain
 # (like Q-Net trained on MRI T1 then tested on T2). Used by the volumetric test
 # script, NOT during training. Leave domain_map null to disable.
