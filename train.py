@@ -106,37 +106,29 @@ class FewShotModule(pl.LightningModule):
         return total
 
 
-if __name__ == '__main__':
-    import argparse
+def train_from_cfg(cfg: dict) -> str:
+    """Train model from cfg dict. Returns path to last.ckpt."""
     import shutil
-    import yaml
     from pytorch_lightning.callbacks import ModelCheckpoint, RichProgressBar
     from pytorch_lightning.loggers import CSVLogger
     from models.fewshot import FewShotConfig
 
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--config', type=str, default='configs/default.yaml',
-                        help='path to the YAML config file')
-    args = parser.parse_args()
+    data_cfg   = cfg['data']
+    model_name = cfg['model']['name']
+    train_cfg  = cfg['train']
 
-    with open(args.config) as f:
-        cfg_file = yaml.safe_load(f)
-
-    data_cfg   = cfg_file['data']
-    model_name = cfg_file['model']['name']
-    train_cfg  = cfg_file['train']
-
-    cfg = FewShotConfig(encoder_type=model_name, n_shot=data_cfg['n_shot'])
+    fcfg           = FewShotConfig(encoder_type=model_name, n_shot=data_cfg['n_shot'])
     bg_loss_weight = train_cfg.get('bg_loss_weight', 0.1)
-    if model_name == 'qnet':
-        model = QNetFewShot(cfg, bg_loss_weight=bg_loss_weight)
-    else:
-        model = ALPNetFewShot(cfg, bg_loss_weight=bg_loss_weight)
-    # original (Q-Net train.py & SSL-ALPNet training.py): loss = query_loss + align_loss (weight 1.0)
-    align_weight = train_cfg['align_weight']
+    model          = QNetFewShot(fcfg, bg_loss_weight=bg_loss_weight) \
+                     if model_name == 'qnet' \
+                     else ALPNetFewShot(fcfg, bg_loss_weight=bg_loss_weight)
 
-    module = FewShotModule(model=model, lr=train_cfg['lr'], align_weight=align_weight,
-                           lr_gamma=train_cfg.get('lr_gamma', 0.95))
+    module = FewShotModule(
+        model        = model,
+        lr           = train_cfg['lr'],
+        align_weight = train_cfg['align_weight'],
+        lr_gamma     = train_cfg.get('lr_gamma', 0.95),
+    )
 
     datamodule = FewShotDataModule(
         data_dir      = data_cfg['data_dir'],
@@ -149,16 +141,17 @@ if __name__ == '__main__':
         exclude_label = data_cfg.get('exclude_label'),
     )
 
-    # build a human-readable run name: {model}_{modality}_fold{n}_s{1|2}
     modality = next((m for m in ('T1', 'T2') if m in data_cfg['data_dir']), 'MRI')
     setting  = 's2' if data_cfg.get('exclude_label') else 's1'
     run_name = f"{model_name}_{modality}_fold{data_cfg['fold']}_{setting}"
 
     logger = CSVLogger('.', name='lightning_logs', version=run_name)
+    os.makedirs(logger.log_dir, exist_ok=True)
 
     trainer = pl.Trainer(
-        max_epochs=train_cfg['max_epochs'],
-        num_sanity_val_steps=0,
+        max_epochs          = train_cfg['max_epochs'],
+        precision           = '16-mixed',
+        num_sanity_val_steps= 0,
         callbacks=[
             ModelCheckpoint(save_top_k=-1, every_n_epochs=1, save_last=True,
                             filename='{epoch}-{step}'),
@@ -167,8 +160,20 @@ if __name__ == '__main__':
         logger=logger,
     )
 
-    # copy config into the log dir for full reproducibility
-    os.makedirs(logger.log_dir, exist_ok=True)
-    shutil.copy(args.config, os.path.join(logger.log_dir, 'config.yaml'))
-
     trainer.fit(module, datamodule)
+    return os.path.join(logger.log_dir, 'checkpoints', 'last.ckpt')
+
+
+if __name__ == '__main__':
+    import argparse
+    import yaml
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--config', type=str, default='configs/default.yaml')
+    args = parser.parse_args()
+
+    with open(args.config) as f:
+        cfg_file = yaml.safe_load(f)
+
+    ckpt = train_from_cfg(cfg_file)
+    print(f'checkpoint saved → {ckpt}')
