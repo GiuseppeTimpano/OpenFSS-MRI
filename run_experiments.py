@@ -4,6 +4,10 @@ Run all Setting-1 experiments.
 Train on T1 or T2, then test on both T1 and T2 for each trained model.
 Final table: rows = (model, train_domain, fold), cols = test T1 / test T2.
 
+Results are written as individual JSON files under RESULTS_DIR so that
+parallel runs never race on the same file.  Use --merge to collect all
+JSON files into a single CSV.
+
 Usage:
   python run_experiments.py                              # all experiments
   python run_experiments.py --model qnet                 # only qnet
@@ -11,11 +15,14 @@ Usage:
   python run_experiments.py --fold 0                     # only fold 0
   python run_experiments.py --skip_train                 # test only
   python run_experiments.py --dry_run                    # print without executing
+  python run_experiments.py --merge                      # merge JSONs → CSV
 """
 
 import argparse
 import copy
 import csv
+import glob
+import json
 import os
 
 import torch
@@ -57,6 +64,9 @@ BASE_CFG = {
 
 BG_LOSS = {'alpnet': 0.05, 'qnet': 0.1}
 
+RESULTS_DIR = 'results'
+RESULTS_CSV = os.path.join(RESULTS_DIR, 'results_s1.csv')
+
 EXPERIMENTS = [
     {'model': model, 'train_domain': td, 'fold': fold}
     for model  in ('alpnet', 'qnet')
@@ -93,6 +103,21 @@ def _build_cfg(model: str, train_domain: str, fold: int) -> dict:
     return cfg
 
 
+def _result_path(run: str, test_domain: str) -> str:
+    return os.path.join(RESULTS_DIR, f'{run}_{test_domain}.json')
+
+
+def _save_result(run: str, test_domain: str, results: dict):
+    os.makedirs(RESULTS_DIR, exist_ok=True)
+    payload = {'run': run, 'test_domain': test_domain, 'results': results}
+    with open(_result_path(run, test_domain), 'w') as f:
+        json.dump(payload, f, indent=2)
+
+
+def _already_done(run: str, test_domain: str) -> bool:
+    return os.path.isfile(_result_path(run, test_domain))
+
+
 def _row_from_results(run: str, test_domain: str, results: dict) -> dict:
     row = {'run': run, 'test_domain': test_domain}
     for organ in ('LIVER', 'RK', 'LK', 'SPLEEN', 'MEAN'):
@@ -102,23 +127,24 @@ def _row_from_results(run: str, test_domain: str, results: dict) -> dict:
     return row
 
 
-def _append_csv(row: dict):
-    exists = os.path.isfile(RESULTS_CSV)
-    with open(RESULTS_CSV, 'a', newline='') as f:
+def merge_results():
+    """Collect all per-run JSONs in RESULTS_DIR into a single CSV."""
+    rows = []
+    for path in sorted(glob.glob(os.path.join(RESULTS_DIR, '*.json'))):
+        with open(path) as f:
+            payload = json.load(f)
+        rows.append(_row_from_results(payload['run'], payload['test_domain'], payload['results']))
+
+    if not rows:
+        print('No result JSONs found — nothing to merge.')
+        return
+
+    os.makedirs(RESULTS_DIR, exist_ok=True)
+    with open(RESULTS_CSV, 'w', newline='') as f:
         writer = csv.DictWriter(f, fieldnames=CSV_FIELDS)
-        if not exists:
-            writer.writeheader()
-        writer.writerow(row)
-
-
-def _already_in_csv(run: str, test_domain: str) -> bool:
-    if not os.path.isfile(RESULTS_CSV):
-        return False
-    with open(RESULTS_CSV) as f:
-        for r in csv.DictReader(f):
-            if r.get('run') == run and r.get('test_domain') == test_domain:
-                return True
-    return False
+        writer.writeheader()
+        writer.writerows(rows)
+    print(f'Merged {len(rows)} results → {RESULTS_CSV}')
 
 
 def main():
@@ -128,9 +154,15 @@ def main():
     parser.add_argument('--fold',         type=int, default=None)
     parser.add_argument('--skip_train',   action='store_true')
     parser.add_argument('--dry_run',      action='store_true')
+    parser.add_argument('--merge',        action='store_true',
+                        help='Merge all per-run JSONs in results/ into results_s1.csv')
     parser.add_argument('--device',       type=str,
                         default='cuda' if torch.cuda.is_available() else 'cpu')
     args = parser.parse_args()
+
+    if args.merge:
+        merge_results()
+        return
 
     exps = [
         e for e in EXPERIMENTS
@@ -178,8 +210,8 @@ def main():
                 print(f'[SKIP test {test_domain}] {test_dir} not found')
                 continue
 
-            if _already_in_csv(run, test_domain):
-                print(f'[SKIP test {test_domain}] already in {RESULTS_CSV}')
+            if _already_done(run, test_domain):
+                print(f'[SKIP test {test_domain}] result exists: {_result_path(run, test_domain)}')
                 continue
 
             label = 'same-domain' if test_domain == train_domain else 'cross-domain'
@@ -194,9 +226,9 @@ def main():
             results    = test_from_cfg(cfg, ckpt,
                                        target_data_dir=target_dir,
                                        device_str=args.device)
-            _append_csv(_row_from_results(run, test_domain, results))
+            _save_result(run, test_domain, results)
             mean_d = results.get('MEAN', {}).get('dice', float('nan'))
-            print(f'[DONE test {test_domain}] MEAN Dice={mean_d:.4f}')
+            print(f'[DONE test {test_domain}] MEAN Dice={mean_d:.4f} → {_result_path(run, test_domain)}')
 
     print(f'\n{"="*52}')
     print(f'  ALL DONE  —  results in {RESULTS_CSV}')

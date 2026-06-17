@@ -149,9 +149,8 @@ def train_from_cfg(cfg: dict) -> str:
     os.makedirs(logger.log_dir, exist_ok=True)
 
     trainer = pl.Trainer(
-        max_epochs          = train_cfg['max_epochs'],
-        precision           = '16-mixed',
-        num_sanity_val_steps= 0,
+        max_epochs = train_cfg['max_epochs'],
+        num_sanity_val_steps = 0,
         callbacks=[
             ModelCheckpoint(save_top_k=-1, every_n_epochs=1, save_last=True,
                             filename='{epoch}-{step}'),

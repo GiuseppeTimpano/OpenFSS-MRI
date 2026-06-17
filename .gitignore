@@ -25,4 +25,4 @@ handoff/
 CLAUDE.md
 HANDOFF.md
 
-metrics.csv
+*.csv
