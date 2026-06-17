@@ -78,6 +78,8 @@ def main():
                         help='organ label indices to evaluate (default: all non-BG)')
     parser.add_argument('--save_dir',   type=str, default=None,
                         help='if set, save binary prediction nii.gz files here')
+    parser.add_argument('--target_data_dir', type=str, default=None,
+                        help='query scans directory for cross-domain test (e.g. T2 when trained on T1)')
     parser.add_argument('--device',     type=str, default='cuda' if torch.cuda.is_available() else 'cpu')
     args = parser.parse_args()
 
@@ -105,6 +107,8 @@ def main():
         eval_labels = test_cfg['test_label']
     else:
         eval_labels = [i for i in range(1, len(label_names))]
+
+    query_data_dir = args.target_data_dir if args.target_data_dir else data_dir
 
     domain_cfg  = cfg_file.get('domain', {})
     domain_map  = None
@@ -152,7 +156,11 @@ def main():
         query_pool = test_ids
 
     supp_sid   = supp_pool[supp_idx]
-    query_sids = [sid for sid in query_pool if sid != supp_sid]
+    # when querying a different directory, supp_sid and query scans are distinct files
+    if args.target_data_dir:
+        query_sids = list(query_pool)
+    else:
+        query_sids = [sid for sid in query_pool if sid != supp_sid]
 
     print(f'Fold {fold}  |  support scan: {supp_sid}  |  query scans: {query_sids}')
     print(f'n_part={n_part}, eval_labels={eval_labels}')
@@ -194,7 +202,7 @@ def main():
         scores = Scores()
 
         for qsid in query_sids:
-            q_img, q_lbl = _load_scan(data_dir, qsid)
+            q_img, q_lbl = _load_scan(query_data_dir, qsid)
             q_fg_mask    = (q_lbl == label_val).astype(np.float32)
 
             # only evaluate on FG slices (original protocol)
