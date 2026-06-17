@@ -1,3 +1,4 @@
+import os
 import torch
 import pytorch_lightning as pl
 from torch.utils.data import DataLoader
@@ -107,6 +108,7 @@ class FewShotModule(pl.LightningModule):
 
 if __name__ == '__main__':
     import argparse
+    import shutil
     import yaml
     from pytorch_lightning.callbacks import ModelCheckpoint, RichProgressBar
     from pytorch_lightning.loggers import CSVLogger
@@ -147,6 +149,13 @@ if __name__ == '__main__':
         exclude_label = data_cfg.get('exclude_label'),
     )
 
+    # build a human-readable run name: {model}_{modality}_fold{n}_s{1|2}
+    modality = next((m for m in ('T1', 'T2') if m in data_cfg['data_dir']), 'MRI')
+    setting  = 's2' if data_cfg.get('exclude_label') else 's1'
+    run_name = f"{model_name}_{modality}_fold{data_cfg['fold']}_{setting}"
+
+    logger = CSVLogger('.', name='lightning_logs', version=run_name)
+
     trainer = pl.Trainer(
         max_epochs=train_cfg['max_epochs'],
         num_sanity_val_steps=0,
@@ -155,6 +164,11 @@ if __name__ == '__main__':
                             filename='{epoch}-{step}'),
             RichProgressBar(),
         ],
-        logger=CSVLogger('.', name='lightning_logs'),
+        logger=logger,
     )
+
+    # copy config into the log dir for full reproducibility
+    os.makedirs(logger.log_dir, exist_ok=True)
+    shutil.copy(args.config, os.path.join(logger.log_dir, 'config.yaml'))
+
     trainer.fit(module, datamodule)
