@@ -152,6 +152,8 @@ def main():
     parser.add_argument('--model',        type=str, default=None, choices=['alpnet', 'qnet'])
     parser.add_argument('--train_domain', type=str, default=None, choices=['T1', 'T2'])
     parser.add_argument('--fold',         type=int, default=None)
+    parser.add_argument('--max_epochs',   type=int, default=None,
+                        help='Override max_epochs (default: 30 for qnet, 100 for alpnet)')
     parser.add_argument('--skip_train',   action='store_true')
     parser.add_argument('--dry_run',      action='store_true')
     parser.add_argument('--merge',        action='store_true',
@@ -183,6 +185,8 @@ def main():
         run          = _run_name(model, train_domain, fold)
         ckpt         = _ckpt_path(model, train_domain, fold)
         cfg          = _build_cfg(model, train_domain, fold)
+        if args.max_epochs is not None:
+            cfg['train']['max_epochs'] = args.max_epochs
 
         print(f'\n{"="*52}')
         print(f'  {run}')
