@@ -182,13 +182,12 @@ def main():
 
     fig, axes = plt.subplots(N_ROWS, N_COLS,
                              figsize=(N_COLS * COL_W, N_ROWS * ROW_H),
-                             facecolor='white')
+                             facecolor='white',
+                             constrained_layout=True)
 
     # ensure 2D even for n_slices=1
     if N_ROWS == 1:
         axes = axes[np.newaxis, :]
-
-    col_headers = ['Support', 'Query', 'Prediction', 'Ground Truth']
 
     for row_i, qi in enumerate(display_idx):
         z_abs   = q_fg_idx[qi]
@@ -201,21 +200,26 @@ def main():
         chunk   = min(chunk, args.n_part - 1)
         s_z     = sel_z[chunk]
 
-        row_label = f'z={z_abs}'
-
+        # column headers only on row 0; z-labels as ylabel on every row
         _show(axes[row_i, 0], supp_img[s_z], supp_fg[s_z], _GT_COLOR,
-              title=f'Support z={s_z}' if row_i == 0 else f'z={s_z}')
+              title='Support' if row_i == 0 else '')
         _show(axes[row_i, 1], q_sl,
-              title=f'Query {row_label}' if row_i == 0 else row_label)
+              title='Query' if row_i == 0 else '')
         _show(axes[row_i, 2], q_sl, pred_sl, _PRED_COLOR,
               title='Prediction' if row_i == 0 else '')
         _show(axes[row_i, 3], q_sl, gt_sl, _GT_COLOR,
               title='Ground Truth' if row_i == 0 else '')
 
+        # row label: support z on col 0, query z on col 1
+        axes[row_i, 0].set_ylabel(f's z={s_z}', fontsize=7,
+                                  rotation=0, labelpad=28, va='center')
+        axes[row_i, 1].set_ylabel(f'q z={z_abs}', fontsize=7,
+                                  rotation=0, labelpad=28, va='center')
+
     fig.suptitle(
         f'{model_name.upper()} · {label_name} · '
         f'supp: {supp_sid} · query: {qsid} · Dice = {dsc:.3f}',
-        fontsize=10, fontweight='bold', y=1.01
+        fontsize=10, fontweight='bold',
     )
 
     legend_patches = [
@@ -223,9 +227,7 @@ def main():
         mpatches.Patch(facecolor=_PRED_COLOR, alpha=0.7, label='Prediction'),
     ]
     fig.legend(handles=legend_patches, loc='lower center', ncol=2,
-               frameon=False, fontsize=8, bbox_to_anchor=(0.5, -0.02))
-
-    plt.tight_layout()
+               frameon=False, fontsize=8)
 
     if args.out:
         ext = os.path.splitext(args.out)[1].lower()
