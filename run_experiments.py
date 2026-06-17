@@ -168,7 +168,7 @@ def main():
                     ckpt = train_from_cfg(cfg)
                     print(f'[DONE train] ckpt → {ckpt}')
 
-        if not os.path.isfile(ckpt):
+        if not args.dry_run and not os.path.isfile(ckpt):
             print(f'[ERROR] checkpoint not found: {ckpt} — skipping tests')
             continue
 
