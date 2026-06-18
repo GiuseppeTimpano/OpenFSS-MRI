@@ -133,7 +133,9 @@ def test_from_cfg(
 
     supp_sid   = supp_pool[supp_idx]
     if target_data_dir:
-        query_sids = list(query_pool)
+        import glob as _glob
+        _paths = sorted(_glob.glob(os.path.join(target_data_dir, 'image_*.nii.gz')))
+        query_sids = [os.path.basename(p).replace('image_', '').replace('.nii.gz', '') for p in _paths]
     else:
         query_sids = [sid for sid in query_pool if sid != supp_sid]
 
