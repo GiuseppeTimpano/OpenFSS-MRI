@@ -115,9 +115,11 @@ def main():
                         help='number of query rows to show')
     parser.add_argument('--supp_idx',   type=int, default=0)
     parser.add_argument('--n_part',     type=int, default=3)
-    parser.add_argument('--out',        type=str, default=None,
+    parser.add_argument('--out',             type=str, default=None,
                         help='output file (.pdf/.png/.svg); omit for interactive')
-    parser.add_argument('--device',     type=str,
+    parser.add_argument('--target_data_dir', type=str, default=None,
+                        help='query dataset dir (e.g. AMOS); support always from config data_dir')
+    parser.add_argument('--device',          type=str,
                         default='cuda' if torch.cuda.is_available() else 'cpu')
     args = parser.parse_args()
 
@@ -145,12 +147,20 @@ def main():
 
     _, test_ids = get_fold_ids(data_dir, dcfg['fold'], dcfg['n_folds'])
     supp_sid    = test_ids[args.supp_idx]
-    query_sids  = [s for s in test_ids if s != supp_sid]
-    qsid        = args.query_scan or query_sids[0]
+
+    query_data_dir = args.target_data_dir or data_dir
+    if args.target_data_dir:
+        import glob as _glob
+        _paths     = sorted(_glob.glob(os.path.join(args.target_data_dir, 'image_*.nii.gz')))
+        query_sids = [os.path.basename(p).replace('image_', '').replace('.nii.gz', '') for p in _paths]
+    else:
+        query_sids = [s for s in test_ids if s != supp_sid]
+
+    qsid = args.query_scan or query_sids[0]
     print(f'support={supp_sid}  query={qsid}  organ={label_name}')
 
     supp_img, supp_lbl = _load_scan(data_dir, supp_sid)
-    q_img,    q_lbl    = _load_scan(data_dir, qsid)
+    q_img,    q_lbl    = _load_scan(query_data_dir, qsid)
 
     supp_fg = (supp_lbl == args.label).astype(np.float32)
     q_fg    = (q_lbl    == args.label).astype(np.float32)
