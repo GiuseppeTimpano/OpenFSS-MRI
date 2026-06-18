@@ -19,6 +19,7 @@ utils/felzenszwalb_3d/build/
 
 # data (large files, not tracked)
 data/datasets/CHAOS/
+data/datasets/AMOS/
 
 # generated / local docs
 handoff/
