@@ -111,6 +111,8 @@ def main():
     parser.add_argument('--label',      type=int, default=1,
                         help='1=LIVER 2=RK 3=LK 4=SPLEEN')
     parser.add_argument('--query_scan', type=str, default=None)
+    parser.add_argument('--query_idx',  type=int, default=0,
+                        help='index into the query subject list (default 0)')
     parser.add_argument('--n_slices',   type=int, default=5,
                         help='number of query rows to show')
     parser.add_argument('--supp_idx',   type=int, default=0)
@@ -166,7 +168,7 @@ def main():
     else:
         query_sids = [s for s in test_ids if s != supp_sid]
 
-    qsid = args.query_scan or query_sids[0]
+    qsid = args.query_scan or query_sids[args.query_idx % len(query_sids)]
     print(f'support={supp_sid}  query={qsid}  organ={label_name}')
 
     supp_img, supp_lbl = _load_scan(data_dir, supp_sid)
