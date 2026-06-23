@@ -108,16 +108,25 @@ class FewShotModule(pl.LightningModule):
 
 def train_from_cfg(cfg: dict) -> str:
     """Train model from cfg dict. Returns path to last.ckpt."""
-    import shutil
     from pytorch_lightning.callbacks import ModelCheckpoint, RichProgressBar
     from pytorch_lightning.loggers import CSVLogger
     from models.fewshot import FewShotConfig
 
     data_cfg   = cfg['data']
-    model_name = cfg['model']['name']
+    model_cfg  = cfg['model']
+    model_name = model_cfg['name']
     train_cfg  = cfg['train']
 
-    fcfg           = FewShotConfig(encoder_type=model_name, n_shot=data_cfg['n_shot'])
+    fcfg = FewShotConfig(
+        encoder_type = model_name,
+        n_shot       = data_cfg['n_shot'],
+        backbone     = model_cfg.get('backbone', 'resnet'),
+        arch         = model_cfg.get('arch', 'vit'),
+        model_name   = model_cfg.get('model_name', 'dinov3_vitb16'),
+        weights_path = model_cfg.get('weights_path'),
+        repo_dir     = model_cfg.get('repo_dir'),
+        lora_rank    = model_cfg.get('lora_rank', 0),
+    )
     bg_loss_weight = train_cfg.get('bg_loss_weight', 0.1)
     model          = QNetFewShot(fcfg, bg_loss_weight=bg_loss_weight) \
                      if model_name == 'qnet' \
@@ -141,9 +150,14 @@ def train_from_cfg(cfg: dict) -> str:
         exclude_label = data_cfg.get('exclude_label'),
     )
 
-    modality = next((m for m in ('T1', 'T2') if m in data_cfg['data_dir']), 'MRI')
-    setting  = 's2' if data_cfg.get('exclude_label') else 's1'
-    run_name = f"{model_name}_{modality}_fold{data_cfg['fold']}_{setting}"
+    modality  = next((m for m in ('T1', 'T2') if m in data_cfg['data_dir']), 'MRI')
+    setting   = 's2' if data_cfg.get('exclude_label') else 's1'
+    backbone  = model_cfg.get('backbone', 'resnet')
+    arch      = model_cfg.get('arch', 'vit')
+    lora_rank = model_cfg.get('lora_rank', 0)
+    bb        = backbone if backbone == 'resnet' else f'{backbone}_{arch}'
+    lora      = f'_lora{lora_rank}' if lora_rank > 0 else ''
+    run_name  = f"{model_name}_{bb}{lora}_{modality}_fold{data_cfg['fold']}_{setting}"
 
     logger = CSVLogger('.', name='lightning_logs', version=run_name)
     os.makedirs(logger.log_dir, exist_ok=True)
@@ -168,7 +182,7 @@ if __name__ == '__main__':
     import yaml
 
     parser = argparse.ArgumentParser()
-    parser.add_argument('--config', type=str, default='configs/default.yaml')
+    parser.add_argument('--config', type=str, default='configs/resnet.yaml')
     args = parser.parse_args()
 
     with open(args.config) as f:

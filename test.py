@@ -75,7 +75,8 @@ def test_from_cfg(
       {'LIVER': {'dice': x, 'iou': y}, ..., 'MEAN': {'dice': x, 'iou': y}}
     """
     data_cfg   = cfg['data']
-    model_name = cfg['model']['name']
+    model_cfg  = cfg['model']
+    model_name = model_cfg['name']
     test_cfg   = cfg.get('test', {})
 
     fold         = data_cfg['fold']
@@ -102,7 +103,16 @@ def test_from_cfg(
     target_domain = domain_cfg.get('target_domain')
 
     device = torch.device(device_str)
-    fcfg   = FewShotConfig(encoder_type=model_name, n_shot=n_shot)
+    fcfg = FewShotConfig(
+        encoder_type = model_name,
+        n_shot       = n_shot,
+        backbone     = model_cfg.get('backbone', 'resnet'),
+        arch         = model_cfg.get('arch', 'vit'),
+        model_name   = model_cfg.get('model_name', 'dinov3_vitb16'),
+        weights_path = model_cfg.get('weights_path'),
+        repo_dir     = model_cfg.get('repo_dir'),
+        lora_rank    = model_cfg.get('lora_rank', 0),
+    )
 
     bg_loss_weight = cfg.get('train', {}).get('bg_loss_weight', 0.1)
     model = QNetFewShot(fcfg, bg_loss_weight=bg_loss_weight) \
@@ -233,7 +243,7 @@ def test_from_cfg(
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument('--config',          type=str, default='configs/default.yaml')
+    parser.add_argument('--config',          type=str, default='configs/resnet.yaml')
     parser.add_argument('--checkpoint',      type=str, required=True)
     parser.add_argument('--fold',            type=int, default=None)
     parser.add_argument('--supp_idx',        type=int, default=None)

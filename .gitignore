@@ -21,6 +21,9 @@ utils/felzenszwalb_3d/build/
 data/datasets/CHAOS/
 data/datasets/AMOS/
 
+evaluation_util/
+weights/
+
 # generated / local docs
 handoff/
 CLAUDE.md

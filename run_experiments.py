@@ -62,7 +62,8 @@ BASE_CFG = {
     },
 }
 
-BG_LOSS = {'alpnet': 0.05, 'qnet': 0.1}
+BG_LOSS      = {'alpnet': 0.05, 'qnet': 0.1}
+DEFAULT_LR   = {'resnet': 0.001, 'dino': 0.0001, 'biomedclip': 0.0001}
 
 RESULTS_DIR = 'results'
 RESULTS_CSV = os.path.join(RESULTS_DIR, 'results_s1.csv')
@@ -84,22 +85,40 @@ CSV_FIELDS  = [
     'MEAN_dice',  'MEAN_iou',
 ]
 
-def _run_name(model: str, train_domain: str, fold: int) -> str:
-    return f'{model}_{train_domain}_fold{fold}_s1'
+def _run_name(model: str, train_domain: str, fold: int, backbone: str = 'resnet',
+              arch: str = 'vit', lora_rank: int = 0) -> str:
+    bb = backbone if backbone == 'resnet' else f'{backbone}_{arch}'
+    lora = f'_lora{lora_rank}' if lora_rank > 0 else ''
+    return f'{model}_{bb}{lora}_{train_domain}_fold{fold}_s1'
 
 
-def _ckpt_path(model: str, train_domain: str, fold: int) -> str:
+def _ckpt_path(model: str, train_domain: str, fold: int, backbone: str = 'resnet',
+               arch: str = 'vit', lora_rank: int = 0) -> str:
     return os.path.join(
-        'lightning_logs', _run_name(model, train_domain, fold), 'checkpoints', 'last.ckpt'
+        'lightning_logs',
+        _run_name(model, train_domain, fold, backbone, arch, lora_rank),
+        'checkpoints', 'last.ckpt',
     )
 
 
-def _build_cfg(model: str, train_domain: str, fold: int) -> dict:
+def _build_cfg(model: str, train_domain: str, fold: int, backbone: str = 'resnet',
+               arch: str = 'vit', model_name: str = 'dinov3_vitb16',
+               weights_path: str = None, repo_dir: str = None,
+               lora_rank: int = 0) -> dict:
     cfg = copy.deepcopy(BASE_CFG)
-    cfg['model']                    = {'name': model}
-    cfg['data']['data_dir']         = DATA_DIRS[train_domain]
-    cfg['data']['fold']             = fold
-    cfg['train']['bg_loss_weight']  = BG_LOSS[model]
+    cfg['model'] = {
+        'name':         model,
+        'backbone':     backbone,
+        'arch':         arch,
+        'model_name':   model_name,
+        'weights_path': weights_path,
+        'repo_dir':     repo_dir,
+        'lora_rank':    lora_rank,
+    }
+    cfg['data']['data_dir']        = DATA_DIRS[train_domain]
+    cfg['data']['fold']            = fold
+    cfg['train']['bg_loss_weight'] = BG_LOSS[model]
+    cfg['train']['lr']             = DEFAULT_LR.get(backbone, 0.001)
     return cfg
 
 
@@ -152,14 +171,26 @@ def main():
     parser.add_argument('--model',        type=str, default=None, choices=['alpnet', 'qnet'])
     parser.add_argument('--train_domain', type=str, default=None, choices=['T1', 'T2'])
     parser.add_argument('--fold',         type=int, default=None)
-    parser.add_argument('--max_epochs',   type=int, default=None,
-                        help='Override max_epochs (default: 30 for qnet, 100 for alpnet)')
+    parser.add_argument('--max_epochs',   type=int, default=None)
     parser.add_argument('--skip_train',   action='store_true')
     parser.add_argument('--dry_run',      action='store_true')
     parser.add_argument('--merge',        action='store_true',
                         help='Merge all per-run JSONs in results/ into results_s1.csv')
     parser.add_argument('--device',       type=str,
                         default='cuda' if torch.cuda.is_available() else 'cpu')
+    # backbone
+    parser.add_argument('--backbone',     type=str, default='resnet',
+                        choices=['resnet', 'dino', 'biomedclip'])
+    parser.add_argument('--arch',         type=str, default='vit',
+                        choices=['vit', 'convnext'], help='dino only')
+    parser.add_argument('--model_name',   type=str, default='dinov3_vitb16',
+                        help='dino torch.hub model name')
+    parser.add_argument('--weights_path', type=str, default=None,
+                        help='dino: local .pth weights path')
+    parser.add_argument('--repo_dir',     type=str, default=None,
+                        help='dino: local hub repo checkout dir')
+    parser.add_argument('--lora_rank',    type=int, default=0,
+                        help='>0 enables PEFT LoRA on the backbone')
     args = parser.parse_args()
 
     if args.merge:
@@ -182,9 +213,16 @@ def main():
         model        = exp['model']
         train_domain = exp['train_domain']
         fold         = exp['fold']
-        run          = _run_name(model, train_domain, fold)
-        ckpt         = _ckpt_path(model, train_domain, fold)
-        cfg          = _build_cfg(model, train_domain, fold)
+        run          = _run_name(model, train_domain, fold,
+                                  args.backbone, args.arch, args.lora_rank)
+        ckpt         = _ckpt_path(model, train_domain, fold,
+                                   args.backbone, args.arch, args.lora_rank)
+        cfg          = _build_cfg(model, train_domain, fold,
+                                   backbone=args.backbone, arch=args.arch,
+                                   model_name=args.model_name,
+                                   weights_path=args.weights_path,
+                                   repo_dir=args.repo_dir,
+                                   lora_rank=args.lora_rank)
         if args.max_epochs is not None:
             cfg['train']['max_epochs'] = args.max_epochs
 

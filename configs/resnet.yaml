@@ -1,0 +1,36 @@
+# ResNet backbone — original Q-Net / SSL-ALPNet protocol.
+# Reproduce original results with this config.
+
+data:
+  data_dir: data/datasets/CHAOS/processed/T1
+  fold: 0
+  n_folds: 4
+  n_shot: 1
+  batch_size: 2
+  num_workers: 4
+  min_size: 200
+  exclude_label: null
+  label_names: [BG, LIVER, RK, LK, SPLEEN]
+
+model:
+  # head: qnet | alpnet
+  name: qnet
+  backbone: resnet
+
+train:
+  lr: 0.001
+  lr_gamma: 0.95
+  align_weight: 1.0
+  bg_loss_weight: 0.1   # qnet: 0.1 | alpnet: 0.05
+  max_epochs: 30
+
+test:
+  supp_idx: 0
+  n_part: 3
+  test_label: null
+  save_preds: false
+
+domain:
+  domain_map: null
+  source_domain: null
+  target_domain: null

@@ -1,0 +1,70 @@
+# Foundation backbone — DINOv3 / BiomedCLIP + PEFT LoRA.
+#
+# backbone: dino | biomedclip
+#
+# dino arch options:
+#   vit      -> ViT-B/16, LoRA on attention qkv
+#   convnext -> ConvNeXt-base, LoRA on pointwise pwconv1/pwconv2
+#
+# biomedclip -> ViT-B/16 pretrained on PMC-15M, LoRA on qkv
+#               (weights auto-downloaded from HuggingFace)
+#
+# lora_rank: 0 = fully frozen backbone (linear probe on head convs only)
+#            4 = LoRA r4 (recommended — low param, good adaptation)
+#            8 = LoRA r8 (more capacity, more VRAM)
+#
+# weights_path / repo_dir: dino only (gated weights).
+#   weights_path: local .pth file
+#   repo_dir:     local dinov3 hub checkout
+
+data:
+  data_dir: data/datasets/CHAOS/processed/T1
+  fold: 0
+  n_folds: 4
+  n_shot: 1
+  batch_size: 1   # foundation backbones are larger; reduce if OOM
+  num_workers: 4
+  min_size: 200
+  exclude_label: null
+  label_names: [BG, LIVER, RK, LK, SPLEEN]
+
+model:
+  # head: qnet | alpnet
+  name: qnet
+  # --- backbone ---
+  backbone: dino
+  arch: vit
+  model_name: dinov3_vitb16
+  weights_path: weights/dinov3_vitb16_pretrain_lvd1689m-73cec8be.pth
+  repo_dir: /Users/giuseppetimpano/Desktop/Project_code/dinov3
+  lora_rank: 4
+
+  # --- biomedclip example (uncomment, comment out dino block above) ---
+  # backbone: biomedclip
+  # lora_rank: 4
+
+  # --- dino convnext example ---
+  # backbone: dino
+  # arch: convnext
+  # model_name: dinov3_convnext_base
+  # weights_path: weights/dinov3_convnext_base_pretrain_lvd1689m-801f2ba9.pth
+  # repo_dir: /Users/giuseppetimpano/Desktop/Project_code/dinov3
+  # lora_rank: 4
+
+train:
+  lr: 0.0001   # lower LR for pretrained foundation backbone (vs 0.001 for resnet)
+  lr_gamma: 0.95
+  align_weight: 1.0
+  bg_loss_weight: 0.1   # qnet: 0.1 | alpnet: 0.05
+  max_epochs: 30
+
+test:
+  supp_idx: 0
+  n_part: 3
+  test_label: null
+  save_preds: false
+
+domain:
+  domain_map: null
+  source_domain: null
+  target_domain: null

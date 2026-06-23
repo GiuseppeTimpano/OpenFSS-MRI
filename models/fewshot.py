@@ -2,6 +2,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from .encoder import ALPNetEncoder, QNetEncoder
+from .encoder_dino import FoundationALPNetEncoder, FoundationQNetEncoder
+from .encoder_biomedclip import biomedclip_alpnet_encoder, biomedclip_qnet_encoder
 from .prototype import GlobalPrototype, GridPlusPrototype, GridPrototype
 from dataclasses import dataclass, field
 from abc import abstractmethod
@@ -13,7 +15,13 @@ class FewShotConfig():
     fg_thresh:        float = 0.95
     bg_thresh:        float = 0.95
     pretrained:       bool  = True
-    encoder_type:     str   = 'qnet'
+    encoder_type:     str   = 'qnet'   # head shape: 'qnet' (dual-scale) | 'alpnet' (single)
+    backbone:         str   = 'resnet' # feature extractor: 'resnet' | 'dino' | 'biomedclip'
+    arch:             str   = 'vit'    # dino only: 'vit' | 'convnext'
+    model_name:       str   = 'dinov3_vitb16'  # dino torch.hub name
+    weights_path:     str   = None     # dino: local .pth (gated weights)
+    repo_dir:         str   = None     # dino: local hub checkout
+    lora_rank:        int   = 0        # >0 enables LoRA on the foundation backbone
     n_shot:           int   = 1
     proto_grid:       list  = field(default_factory=lambda: [8, 8])
     feature_hw:       list  = field(default_factory=lambda: [32, 32])
@@ -46,9 +54,29 @@ class BaseFewShot(nn.Module):
         return F.nll_loss(logp, mask.long(), weight=weight)
 
     def build_encoder(self):
-        if self.cfg.encoder_type == 'qnet':
-            return QNetEncoder(pretrained=self.cfg.pretrained)
-        return ALPNetEncoder(pretrained=self.cfg.pretrained)
+        c = self.cfg
+        is_qnet = c.encoder_type == 'qnet'
+
+        # original ResNet path (default)
+        if c.backbone == 'resnet':
+            if is_qnet:
+                return QNetEncoder(pretrained=c.pretrained)
+            return ALPNetEncoder(pretrained=c.pretrained)
+
+        # foundation backbones (DINO / BiomedCLIP) — same head interface.
+        # lora_rank > 0 enables PEFT LoRA on the backbone (frozen base + adapters).
+        if c.backbone == 'biomedclip':
+            if is_qnet:
+                return biomedclip_qnet_encoder(lora_rank=c.lora_rank)
+            return biomedclip_alpnet_encoder(lora_rank=c.lora_rank)
+
+        if c.backbone == 'dino':
+            head = FoundationQNetEncoder if is_qnet else FoundationALPNetEncoder
+            return head(arch=c.arch, model_name=c.model_name,
+                        weights=c.weights_path, repo_dir=c.repo_dir,
+                        lora_rank=c.lora_rank)
+
+        raise ValueError(f"unknown backbone '{c.backbone}'")
 
     @staticmethod
     def _to_3ch(x: torch.Tensor) -> torch.Tensor:

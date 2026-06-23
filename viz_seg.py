@@ -6,7 +6,7 @@ Columns: Support | Query | Prediction | GT
 
 Usage:
   python viz_seg.py \\
-    --config configs/default.yaml \\
+    --config configs/resnet.yaml \\
     --checkpoint lightning_logs/version_0/checkpoints/last.ckpt \\
     --label 1 \\
     --out liver.pdf
@@ -106,7 +106,7 @@ def dice3d(gt, pred):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--config',     type=str, default='configs/default.yaml')
+    parser.add_argument('--config',     type=str, default='configs/resnet.yaml')
     parser.add_argument('--checkpoint', type=str, required=True)
     parser.add_argument('--label',      type=int, default=1,
                         help='1=LIVER 2=RK 3=LK 4=SPLEEN')
@@ -126,12 +126,22 @@ def main():
     with open(args.config) as f:
         cfg = yaml.safe_load(f)
     dcfg       = cfg['data']
-    model_name = cfg['model']['name']
+    model_cfg  = cfg['model']
+    model_name = model_cfg['name']
     data_dir   = dcfg['data_dir']
     label_name = dcfg['label_names'][args.label]
 
     device = torch.device(args.device)
-    fcfg   = FewShotConfig(encoder_type=model_name, n_shot=dcfg['n_shot'])
+    fcfg = FewShotConfig(
+        encoder_type = model_name,
+        n_shot       = dcfg['n_shot'],
+        backbone     = model_cfg.get('backbone', 'resnet'),
+        arch         = model_cfg.get('arch', 'vit'),
+        model_name   = model_cfg.get('model_name', 'dinov3_vitb16'),
+        weights_path = model_cfg.get('weights_path'),
+        repo_dir     = model_cfg.get('repo_dir'),
+        lora_rank    = model_cfg.get('lora_rank', 0),
+    )
     bw     = cfg.get('train', {}).get('bg_loss_weight', 0.1)
     model  = QNetFewShot(fcfg, bg_loss_weight=bw) if model_name == 'qnet' \
              else ALPNetFewShot(fcfg, bg_loss_weight=bw)

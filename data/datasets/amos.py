@@ -67,7 +67,7 @@ def preprocess_amos(raw_dir: Path, out_dir: Path) -> None:
     print(f"Found {len(img_paths)} AMOS MRI cases")
 
     for img_path in img_paths:
-        case_id = img_path.stem.replace(".nii", "")  # e.g. amos_0507
+        case_id = img_path.stem.replace(".nii", "").replace("amos_", "")  # e.g. 0507
         lbl_path = lbl_dir / img_path.name
 
         if not lbl_path.exists():

@@ -12,3 +12,8 @@ pyyaml
 rich
 matplotlib
 datasets
+open_clip_torch
+timm
+transformers
+peft
+termcolor
