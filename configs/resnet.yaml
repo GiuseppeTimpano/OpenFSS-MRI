@@ -15,7 +15,6 @@ data:
 model:
   # head: qnet | alpnet
   name: qnet
-  backbone: resnet
 
 train:
   lr: 0.001

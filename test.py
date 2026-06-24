@@ -106,12 +106,6 @@ def test_from_cfg(
     fcfg = FewShotConfig(
         encoder_type = model_name,
         n_shot       = n_shot,
-        backbone     = model_cfg.get('backbone', 'resnet'),
-        arch         = model_cfg.get('arch', 'vit'),
-        model_name   = model_cfg.get('model_name', 'dinov3_vitb16'),
-        weights_path = model_cfg.get('weights_path'),
-        repo_dir     = model_cfg.get('repo_dir'),
-        lora_rank    = model_cfg.get('lora_rank', 0),
     )
 
     bg_loss_weight = cfg.get('train', {}).get('bg_loss_weight', 0.1)
