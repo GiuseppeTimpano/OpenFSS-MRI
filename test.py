@@ -10,6 +10,7 @@ Protocol identical to original Q-Net test.py / SSL-ALPNet eval (CHAOS dataset):
 import argparse
 import json
 import os
+from collections.abc import Callable
 
 import numpy as np
 import SimpleITK as sitk
@@ -69,6 +70,7 @@ def test_from_cfg(
     target_data_dir: str | None = None,
     device_str: str = 'cuda' if torch.cuda.is_available() else 'cpu',
     save_dir: str | None = None,
+    translator: Callable[[np.ndarray], np.ndarray] | None = None,
 ) -> dict:
     """
     Run volumetric test. Returns:
@@ -178,6 +180,8 @@ def test_from_cfg(
 
         for qsid in query_sids:
             q_img, q_lbl = _load_scan(query_data_dir, qsid)
+            if translator is not None:
+                q_img = translator(q_img)
             q_fg_mask    = (q_lbl == label_val).astype(np.float32)
 
             fg_idx = np.where(q_fg_mask.any(axis=(1, 2)))[0]
@@ -247,6 +251,10 @@ if __name__ == '__main__':
     parser.add_argument('--target_data_dir', type=str, default=None)
     parser.add_argument('--device',          type=str,
                         default='cuda' if torch.cuda.is_available() else 'cpu')
+    parser.add_argument('--cyclegan_ckpt',   type=str, default=None,
+                        help='Path to CycleGAN checkpoint for test-time normalization')
+    parser.add_argument('--cyclegan_key',    type=str, default='G_AB',
+                        help='Generator key in checkpoint (G_AB or G_BA)')
     args = parser.parse_args()
 
     with open(args.config) as f:
@@ -261,10 +269,19 @@ if __name__ == '__main__':
     if args.test_label is not None:
         cfg_file.setdefault('test', {})['test_label'] = args.test_label
 
+    translator = None
+    if args.cyclegan_ckpt:
+        from cyclegan.translate import load_generator, translate_volume
+        _dev = torch.device(args.device)
+        _G   = load_generator(args.cyclegan_ckpt, key=args.cyclegan_key, device=_dev)
+        translator = lambda vol: translate_volume(vol, _G, _dev)
+        print(f'CycleGAN translator loaded: {args.cyclegan_ckpt} [{args.cyclegan_key}]')
+
     test_from_cfg(
         cfg_file,
         checkpoint      = args.checkpoint,
         target_data_dir = args.target_data_dir,
         device_str      = args.device,
         save_dir        = args.save_dir,
+        translator      = translator,
     )
