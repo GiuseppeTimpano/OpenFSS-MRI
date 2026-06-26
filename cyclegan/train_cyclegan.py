@@ -220,3 +220,40 @@ if __name__ == '__main__':
     final_path = os.path.join(args.out_dir, 'generators_final.pth')
     torch.save({'G_AB': model.G_AB.state_dict(), 'G_BA': model.G_BA.state_dict()}, final_path)
     print(f'\nGenerators saved → {final_path}')
+
+    _plot_losses(args.out_dir)
+
+
+def _plot_losses(out_dir: str):
+    import glob
+    import pandas as pd
+    import matplotlib; matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+
+    csv_files = glob.glob(os.path.join(out_dir, 'logs', '**', 'metrics.csv'), recursive=True)
+    if not csv_files:
+        print('No metrics.csv found, skipping loss plot.')
+        return
+
+    df = pd.read_csv(csv_files[0]).dropna(subset=['epoch'])
+    df = df.groupby('epoch').mean(numeric_only=True).reset_index()
+
+    fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+
+    axes[0].plot(df['epoch'], df['loss_G'],   label='loss_G')
+    axes[0].plot(df['epoch'], df['loss_adv'], label='loss_adv', linestyle='--')
+    axes[0].plot(df['epoch'], df['loss_cyc'], label='loss_cyc', linestyle='--')
+    axes[0].plot(df['epoch'], df['loss_id'],  label='loss_id',  linestyle='--')
+    axes[0].set_title('Generator losses'); axes[0].set_xlabel('Epoch')
+    axes[0].legend(); axes[0].grid(True, alpha=0.3)
+
+    axes[1].plot(df['epoch'], df['loss_D_A'], label='loss_D_A')
+    axes[1].plot(df['epoch'], df['loss_D_B'], label='loss_D_B')
+    axes[1].set_title('Discriminator losses'); axes[1].set_xlabel('Epoch')
+    axes[1].legend(); axes[1].grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    plot_path = os.path.join(out_dir, 'loss_curves.png')
+    plt.savefig(plot_path, dpi=120)
+    plt.close()
+    print(f'Loss curves saved → {plot_path}')
