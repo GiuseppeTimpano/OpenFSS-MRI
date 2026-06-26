@@ -21,9 +21,9 @@ import random
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
-import lightning as L
-from lightning.pytorch.callbacks import RichProgressBar, ModelCheckpoint
-from lightning.pytorch.loggers import CSVLogger
+import pytorch_lightning as L
+from pytorch_lightning.callbacks import RichProgressBar, ModelCheckpoint
+from pytorch_lightning.loggers import CSVLogger
 
 from cyclegan.models import UNetGenerator2D, NLayerDiscriminator2D
 from cyclegan.dataset import UnpairedNIfTIDataset
