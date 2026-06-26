@@ -61,7 +61,7 @@ class CycleGAN(L.LightningModule):
         self.D_A  = NLayerDiscriminator2D()
         self.D_B  = NLayerDiscriminator2D()
 
-        self.crit_adv = nn.BCEWithLogitsLoss()
+        self.crit_adv = nn.MSELoss()  # LSGAN: linear D output, no sigmoid (CycleGAN default)
         self.crit_cyc = nn.L1Loss()
         self.crit_id  = nn.L1Loss()
 
@@ -165,7 +165,7 @@ class CycleGAN(L.LightningModule):
                 [real_A[0, 0], real_B[0, 0], fake_B[0, 0]],
                 ['real_A', 'real_B', 'fake_B'],
             ):
-                ax.imshow(img.detach().cpu().numpy(), cmap='gray', vmin=0, vmax=1)
+                ax.imshow(img.detach().cpu().numpy(), cmap='gray', vmin=-1, vmax=1)
                 ax.set_title(title, fontsize=8); ax.axis('off')
             plt.tight_layout()
             plt.savefig(os.path.join(out_dir, f'sample_ep{self.current_epoch + 1:03d}.png'), dpi=100)
@@ -218,20 +218,26 @@ if __name__ == '__main__':
     parser.add_argument('--batch_size', type=int,   default=32)
     parser.add_argument('--lr',         type=float, default=2e-4)
     parser.add_argument('--lambda_cyc', type=float, default=10.0)
-    parser.add_argument('--lambda_id',  type=float, default=5.0)
+    parser.add_argument('--lambda_id',  type=float, default=2.5)
     parser.add_argument('--workers',    type=int,   default=4)
     parser.add_argument('--pair_mode',  default='auto',
                         choices=['auto', 'subject', 'depth', 'random'],
                         help='B-slice pairing: auto (subject if ids overlap else depth)')
     parser.add_argument('--depth_tol',  type=float, default=0.1,
                         help='depth window half-width (fraction of volume depth)')
+    parser.add_argument('--min_body',   type=float, default=0.05,
+                        help='drop slices with body fraction below this (near-black)')
+    parser.add_argument('--no_aug',     action='store_true',
+                        help='disable train-time augmentation (hflip + small affine)')
     parser.add_argument('--save_ckpt',  action='store_true',
                         help='Save full Lightning checkpoint (default: only generators saved)')
     parser.add_argument('--device',     default='auto')
     args = parser.parse_args()
 
     dataset = UnpairedNIfTIDataset(args.src_dir, args.tgt_dir,
-                                   pair_mode=args.pair_mode, depth_tol=args.depth_tol)
+                                   min_body=args.min_body,
+                                   pair_mode=args.pair_mode, depth_tol=args.depth_tol,
+                                   augment=not args.no_aug)
     loader  = DataLoader(
         dataset, batch_size=args.batch_size, shuffle=True,
         num_workers=args.workers, pin_memory=True, drop_last=True,

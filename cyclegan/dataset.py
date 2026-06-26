@@ -1,7 +1,7 @@
 """
 2D slice dataset for CycleGAN training on NIfTI MRI volumes.
 Loads foreground slices from two domain directories.
-Normalization: per-slice percentile clip (5-99.5) + min-max → [0,1].
+Normalization: per-slice percentile clip (5-99.5) + min-max → [-1,1] (tanh range).
 
 Pairing (pair_mode):
   'subject' : A slice ↔ B slice of the SAME subject_id at nearest anatomical
@@ -16,20 +16,24 @@ retained (CycleGAN robustness) while enforcing rough anatomical correspondence.
 
 import glob
 import os
+import random
 
 import numpy as np
 import SimpleITK as sitk
 import torch
+import torchvision.transforms.functional as TF
+from torchvision.transforms import InterpolationMode
 from torch.utils.data import Dataset
 
 
 def normalize_slice(arr: np.ndarray) -> np.ndarray:
-    """Percentile clip (5-99.5th) + min-max → [0, 1] float32."""
+    """Percentile clip (5-99.5th) + min-max → [-1, 1] float32 (matches generator tanh)."""
     lo = np.percentile(arr, 5)
     hi = np.percentile(arr, 99.5)
     arr = np.clip(arr, lo, hi)
     mn, mx = arr.min(), arr.max()
-    return ((arr - mn) / (mx - mn + 1e-8)).astype(np.float32)
+    arr01 = (arr - mn) / (mx - mn + 1e-8)
+    return (arr01 * 2.0 - 1.0).astype(np.float32)
 
 
 class UnpairedNIfTIDataset(Dataset):
@@ -41,13 +45,24 @@ class UnpairedNIfTIDataset(Dataset):
                    and optionally fgmask_*.nii.gz for foreground selection.
     use_fgmask   : if True and fgmask exists, use it to select FG slices.
                    Fallback: slices with >5% nonzero pixels.
+    min_body     : drop slices whose body fraction < this even if fgmask flags
+                   them FG. Removes degenerate near-black slices (real_B black).
     pair_mode    : 'auto' | 'subject' | 'depth' | 'random'.
     depth_tol    : half-width of the depth window for candidate B slices,
                    as a fraction of volume depth (0..1).
+    augment      : per-slice train-time augmentation (hflip + small affine),
+                   applied independently to A and B. Off for deterministic use.
     """
 
     def __init__(self, dir_A: str, dir_B: str, use_fgmask: bool = True,
-                 pair_mode: str = 'auto', depth_tol: float = 0.1):
+                 min_body: float = 0.05, pair_mode: str = 'auto', depth_tol: float = 0.1,
+                 augment: bool = True, aug_degrees: float = 10.0,
+                 aug_translate: float = 0.05, aug_scale: float = 0.05):
+        self.min_body = min_body
+        self.augment = augment
+        self.aug_degrees = aug_degrees
+        self.aug_translate = aug_translate
+        self.aug_scale = aug_scale
         self.slices_A, self.subj_A, self.depth_A = self._load_slices(dir_A, use_fgmask)
         self.slices_B, self.subj_B, self.depth_B = self._load_slices(dir_B, use_fgmask)
         if not self.slices_A:
@@ -97,7 +112,11 @@ class UnpairedNIfTIDataset(Dataset):
             z0, z1 = int(idx.min()), int(idx.max())
             span = max(1, z1 - z0)
             for z in idx:
-                slices.append(vol[z].copy())
+                s = vol[z]
+                # drop degenerate near-black slices (fgmask can flag empty z)
+                if (s > s.min()).mean() < self.min_body:
+                    continue
+                slices.append(s.copy())
                 subjects.append(sid)
                 depths.append((int(z) - z0) / span)  # 0 (top FG) .. 1 (bottom FG)
         return slices, subjects, depths
@@ -120,6 +139,18 @@ class UnpairedNIfTIDataset(Dataset):
         pool = within if len(within) else np.array([int(np.argmin(diff))])
         return int(np.random.choice(pool))
 
+    def _augment(self, t: torch.Tensor) -> torch.Tensor:
+        """hflip + small affine (rotation/translation/scale). Fill = background."""
+        fill = float(t.min())
+        if random.random() < 0.5:
+            t = TF.hflip(t)
+        angle = random.uniform(-self.aug_degrees, self.aug_degrees)
+        tx = random.uniform(-self.aug_translate, self.aug_translate) * t.shape[-1]
+        ty = random.uniform(-self.aug_translate, self.aug_translate) * t.shape[-2]
+        scale = random.uniform(1.0 - self.aug_scale, 1.0 + self.aug_scale)
+        return TF.affine(t, angle=angle, translate=[tx, ty], scale=scale, shear=[0.0, 0.0],
+                         interpolation=InterpolationMode.BILINEAR, fill=fill)
+
     def __len__(self) -> int:
         return max(len(self.slices_A), len(self.slices_B))
 
@@ -128,4 +159,9 @@ class UnpairedNIfTIDataset(Dataset):
         a = normalize_slice(self.slices_A[ia])
         jb = self._sample_B(self.subj_A[ia], self.depth_A[ia])
         b = normalize_slice(self.slices_B[jb])
-        return torch.from_numpy(a).unsqueeze(0), torch.from_numpy(b).unsqueeze(0)
+        ta = torch.from_numpy(a).unsqueeze(0)
+        tb = torch.from_numpy(b).unsqueeze(0)
+        if self.augment:
+            ta = self._augment(ta)
+            tb = self._augment(tb)
+        return ta, tb
