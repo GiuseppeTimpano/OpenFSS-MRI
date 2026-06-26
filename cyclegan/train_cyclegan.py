@@ -174,56 +174,6 @@ class CycleGAN(L.LightningModule):
             print(f'[sample save skipped: {e}]')
 
 
-if __name__ == '__main__':
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--src_dir',    required=True)
-    parser.add_argument('--tgt_dir',    required=True)
-    parser.add_argument('--out_dir',    default='cyclegan/runs')
-    parser.add_argument('--epochs',     type=int,   default=200)
-    parser.add_argument('--batch_size', type=int,   default=32)
-    parser.add_argument('--lr',         type=float, default=2e-4)
-    parser.add_argument('--lambda_cyc', type=float, default=10.0)
-    parser.add_argument('--lambda_id',  type=float, default=5.0)
-    parser.add_argument('--workers',    type=int,   default=4)
-    parser.add_argument('--save_ckpt',  action='store_true',
-                        help='Save full Lightning checkpoint (default: only generators saved)')
-    parser.add_argument('--device',     default='auto')
-    args = parser.parse_args()
-
-    dataset = UnpairedNIfTIDataset(args.src_dir, args.tgt_dir)
-    loader  = DataLoader(
-        dataset, batch_size=args.batch_size, shuffle=True,
-        num_workers=args.workers, pin_memory=True, drop_last=True,
-    )
-
-    model = CycleGAN(lr=args.lr, lambda_cyc=args.lambda_cyc,
-                     lambda_id=args.lambda_id, epochs=args.epochs)
-
-    callbacks = [RichProgressBar()]
-    if args.save_ckpt:
-        callbacks.append(ModelCheckpoint(
-            dirpath=os.path.join(args.out_dir, 'checkpoints'),
-            filename='cyclegan_final', save_top_k=1, monitor=None,
-        ))
-
-    trainer = L.Trainer(
-        max_epochs=args.epochs,
-        accelerator=args.device,
-        default_root_dir=args.out_dir,
-        logger=CSVLogger(save_dir=args.out_dir, name='logs'),
-        callbacks=callbacks,
-        enable_checkpointing=args.save_ckpt,
-        log_every_n_steps=1,
-    )
-    trainer.fit(model, loader)
-
-    final_path = os.path.join(args.out_dir, 'generators_final.pth')
-    torch.save({'G_AB': model.G_AB.state_dict(), 'G_BA': model.G_BA.state_dict()}, final_path)
-    print(f'\nGenerators saved → {final_path}')
-
-    _plot_losses(args.out_dir)
-
-
 def _plot_losses(out_dir: str):
     import glob
     import pandas as pd
@@ -257,3 +207,59 @@ def _plot_losses(out_dir: str):
     plt.savefig(plot_path, dpi=120)
     plt.close()
     print(f'Loss curves saved → {plot_path}')
+
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--src_dir',    required=True)
+    parser.add_argument('--tgt_dir',    required=True)
+    parser.add_argument('--out_dir',    default='cyclegan/runs')
+    parser.add_argument('--epochs',     type=int,   default=200)
+    parser.add_argument('--batch_size', type=int,   default=32)
+    parser.add_argument('--lr',         type=float, default=2e-4)
+    parser.add_argument('--lambda_cyc', type=float, default=10.0)
+    parser.add_argument('--lambda_id',  type=float, default=5.0)
+    parser.add_argument('--workers',    type=int,   default=4)
+    parser.add_argument('--pair_mode',  default='auto',
+                        choices=['auto', 'subject', 'depth', 'random'],
+                        help='B-slice pairing: auto (subject if ids overlap else depth)')
+    parser.add_argument('--depth_tol',  type=float, default=0.1,
+                        help='depth window half-width (fraction of volume depth)')
+    parser.add_argument('--save_ckpt',  action='store_true',
+                        help='Save full Lightning checkpoint (default: only generators saved)')
+    parser.add_argument('--device',     default='auto')
+    args = parser.parse_args()
+
+    dataset = UnpairedNIfTIDataset(args.src_dir, args.tgt_dir,
+                                   pair_mode=args.pair_mode, depth_tol=args.depth_tol)
+    loader  = DataLoader(
+        dataset, batch_size=args.batch_size, shuffle=True,
+        num_workers=args.workers, pin_memory=True, drop_last=True,
+    )
+
+    model = CycleGAN(lr=args.lr, lambda_cyc=args.lambda_cyc,
+                     lambda_id=args.lambda_id, epochs=args.epochs)
+
+    callbacks = [RichProgressBar()]
+    if args.save_ckpt:
+        callbacks.append(ModelCheckpoint(
+            dirpath=os.path.join(args.out_dir, 'checkpoints'),
+            filename='cyclegan_final', save_top_k=1, monitor=None,
+        ))
+
+    trainer = L.Trainer(
+        max_epochs=args.epochs,
+        accelerator=args.device,
+        default_root_dir=args.out_dir,
+        logger=CSVLogger(save_dir=args.out_dir, name='logs'),
+        callbacks=callbacks,
+        enable_checkpointing=args.save_ckpt,
+        log_every_n_steps=1,
+    )
+    trainer.fit(model, loader)
+
+    final_path = os.path.join(args.out_dir, 'generators_final.pth')
+    torch.save({'G_AB': model.G_AB.state_dict(), 'G_BA': model.G_BA.state_dict()}, final_path)
+    print(f'\nGenerators saved → {final_path}')
+
+    _plot_losses(args.out_dir)
