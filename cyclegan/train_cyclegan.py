@@ -52,7 +52,7 @@ class _ReplayBuffer:
 
 class CycleGAN(L.LightningModule):
     def __init__(self, lr=2e-4, lambda_cyc=10.0, lambda_id=5.0, lambda_organ=0.0,
-                 epochs=200, stats_A=None, stats_B=None):
+                 organ_std=False, epochs=200, stats_A=None, stats_B=None):
         super().__init__()
         self.save_hyperparameters(ignore=['stats_A', 'stats_B'])
         self.automatic_optimization = False
@@ -160,9 +160,11 @@ class CycleGAN(L.LightningModule):
             self._save_samples(real_A, real_B, fake_B)
 
     def _organ_loss(self, fake, lab, stats):
-        """L1 match of fake intensity (mean+std) to target-domain stats, per organ
-        region defined by the source mask `lab`. Pools per class across the batch.
-        Returns 0 if no stats (e.g. domain without labels)."""
+        """L1 match of fake intensity to target-domain stats, per organ region
+        defined by the source mask `lab`. Pools per class across the batch.
+        Mean term only by default; the std term (organ_std=True) tends to push
+        pixels toward [-1,1] extremes — clashing with the adversarial texture —
+        and was the cause of the black voids/blotches. Returns 0 if no stats."""
         loss = fake.new_zeros(())
         if not stats:
             return loss
@@ -170,7 +172,9 @@ class CycleGAN(L.LightningModule):
             m = lab == k
             if m.any():
                 vals = fake[m]
-                loss = loss + (vals.mean() - mu).abs() + (vals.std(unbiased=False) - sd).abs()
+                loss = loss + (vals.mean() - mu).abs()
+                if self.hparams.organ_std:
+                    loss = loss + (vals.std(unbiased=False) - sd).abs()
         return loss
 
     @staticmethod
@@ -248,6 +252,9 @@ if __name__ == '__main__':
     parser.add_argument('--lambda_id',  type=float, default=2.5)
     parser.add_argument('--lambda_organ', type=float, default=0.0,
                         help='region-aware organ intensity loss weight (0=off). Try 5')
+    parser.add_argument('--organ_std', action='store_true',
+                        help='also match per-organ intensity std (default: mean only). '
+                             'std term causes black voids/blotches; leave off')
     parser.add_argument('--workers',    type=int,   default=4)
     parser.add_argument('--pair_mode',  default='auto',
                         choices=['auto', 'subject', 'depth', 'random'],
@@ -274,7 +281,7 @@ if __name__ == '__main__':
 
     model = CycleGAN(lr=args.lr, lambda_cyc=args.lambda_cyc,
                      lambda_id=args.lambda_id, lambda_organ=args.lambda_organ,
-                     epochs=args.epochs,
+                     organ_std=args.organ_std, epochs=args.epochs,
                      stats_A=dataset.stats_A, stats_B=dataset.stats_B)
 
     callbacks = [RichProgressBar()]
