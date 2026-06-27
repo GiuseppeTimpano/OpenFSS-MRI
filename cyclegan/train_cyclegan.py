@@ -51,10 +51,15 @@ class _ReplayBuffer:
 
 
 class CycleGAN(L.LightningModule):
-    def __init__(self, lr=2e-4, lambda_cyc=10.0, lambda_id=5.0, epochs=200):
+    def __init__(self, lr=2e-4, lambda_cyc=10.0, lambda_id=5.0, lambda_organ=0.0,
+                 epochs=200, stats_A=None, stats_B=None):
         super().__init__()
-        self.save_hyperparameters()
+        self.save_hyperparameters(ignore=['stats_A', 'stats_B'])
         self.automatic_optimization = False
+
+        # per-domain organ intensity priors (mean, std) in [-1,1]; used by region loss
+        self.stats_A = stats_A or {}
+        self.stats_B = stats_B or {}
 
         self.G_AB = UNetGenerator2D()
         self.G_BA = UNetGenerator2D()
@@ -90,7 +95,7 @@ class CycleGAN(L.LightningModule):
         return [opt_G, opt_D_A, opt_D_B], schedulers
 
     def training_step(self, batch, batch_idx):
-        real_A, real_B = batch
+        real_A, real_B, lab_A, lab_B = batch
         opt_G, opt_D_A, opt_D_B = self.optimizers()
 
         # Generator step (D frozen)
@@ -111,7 +116,13 @@ class CycleGAN(L.LightningModule):
             self.crit_id(self.G_BA(real_A), real_A) +
             self.crit_id(self.G_AB(real_B), real_B)
         ) * self.hparams.lambda_id
-        loss_G = loss_adv + loss_cyc + loss_id
+        # region-aware organ loss: push each organ in the fake toward the TARGET
+        # domain's known intensity stats (fake_B uses A's mask + B's stats, & symm.)
+        loss_organ = (
+            self._organ_loss(fake_B, lab_A, self.stats_B) +
+            self._organ_loss(fake_A, lab_B, self.stats_A)
+        ) * self.hparams.lambda_organ
+        loss_G = loss_adv + loss_cyc + loss_id + loss_organ
 
         self.manual_backward(loss_G)
         opt_G.step()
@@ -141,12 +152,26 @@ class CycleGAN(L.LightningModule):
 
         self.log_dict({
             "loss_G": loss_G, "loss_adv": loss_adv,
-            "loss_cyc": loss_cyc, "loss_id": loss_id,
+            "loss_cyc": loss_cyc, "loss_id": loss_id, "loss_organ": loss_organ,
             "loss_D_A": loss_D_A, "loss_D_B": loss_D_B,
         }, on_step=False, on_epoch=True, prog_bar=True)
 
         if (self.current_epoch + 1) % 10 == 0 and batch_idx == 0:
             self._save_samples(real_A, real_B, fake_B)
+
+    def _organ_loss(self, fake, lab, stats):
+        """L1 match of fake intensity (mean+std) to target-domain stats, per organ
+        region defined by the source mask `lab`. Pools per class across the batch.
+        Returns 0 if no stats (e.g. domain without labels)."""
+        loss = fake.new_zeros(())
+        if not stats:
+            return loss
+        for k, (mu, sd) in stats.items():
+            m = lab == k
+            if m.any():
+                vals = fake[m]
+                loss = loss + (vals.mean() - mu).abs() + (vals.std(unbiased=False) - sd).abs()
+        return loss
 
     @staticmethod
     def _set_requires_grad(nets, flag):
@@ -194,6 +219,8 @@ def _plot_losses(out_dir: str):
     axes[0].plot(df['epoch'], df['loss_adv'], label='loss_adv', linestyle='--')
     axes[0].plot(df['epoch'], df['loss_cyc'], label='loss_cyc', linestyle='--')
     axes[0].plot(df['epoch'], df['loss_id'],  label='loss_id',  linestyle='--')
+    if 'loss_organ' in df.columns:
+        axes[0].plot(df['epoch'], df['loss_organ'], label='loss_organ', linestyle=':')
     axes[0].set_title('Generator losses'); axes[0].set_xlabel('Epoch')
     axes[0].legend(); axes[0].grid(True, alpha=0.3)
 
@@ -219,6 +246,8 @@ if __name__ == '__main__':
     parser.add_argument('--lr',         type=float, default=2e-4)
     parser.add_argument('--lambda_cyc', type=float, default=10.0)
     parser.add_argument('--lambda_id',  type=float, default=2.5)
+    parser.add_argument('--lambda_organ', type=float, default=0.0,
+                        help='region-aware organ intensity loss weight (0=off). Try 5')
     parser.add_argument('--workers',    type=int,   default=4)
     parser.add_argument('--pair_mode',  default='auto',
                         choices=['auto', 'subject', 'depth', 'random'],
@@ -244,7 +273,9 @@ if __name__ == '__main__':
     )
 
     model = CycleGAN(lr=args.lr, lambda_cyc=args.lambda_cyc,
-                     lambda_id=args.lambda_id, epochs=args.epochs)
+                     lambda_id=args.lambda_id, lambda_organ=args.lambda_organ,
+                     epochs=args.epochs,
+                     stats_A=dataset.stats_A, stats_B=dataset.stats_B)
 
     callbacks = [RichProgressBar()]
     if args.save_ckpt:
