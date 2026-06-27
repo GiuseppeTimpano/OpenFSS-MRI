@@ -242,8 +242,20 @@ def _plot_losses(out_dir: str):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument('--src_dir',    required=True)
-    parser.add_argument('--tgt_dir',    required=True)
+    parser.add_argument('--src_dir',          required=True)
+    parser.add_argument('--tgt_dir',          required=True)
+    parser.add_argument('--src_manifest',     default=None,
+                        help='scanner_manifest.json for src_dir (enables scanner filtering)')
+    parser.add_argument('--src_manufacturer', default=None,
+                        help='filter src cases by manufacturer substring (e.g. SIEMENS)')
+    parser.add_argument('--src_model',        default=None,
+                        help='filter src cases by model substring (e.g. Prisma)')
+    parser.add_argument('--tgt_manifest',     default=None,
+                        help='scanner_manifest.json for tgt_dir')
+    parser.add_argument('--tgt_manufacturer', default=None,
+                        help='filter tgt cases by manufacturer substring')
+    parser.add_argument('--tgt_model',        default=None,
+                        help='filter tgt cases by model substring')
     parser.add_argument('--out_dir',    default='cyclegan/runs')
     parser.add_argument('--epochs',     type=int,   default=200)
     parser.add_argument('--batch_size', type=int,   default=32)
@@ -270,10 +282,23 @@ if __name__ == '__main__':
     parser.add_argument('--device',     default='auto')
     args = parser.parse_args()
 
+    case_ids_A = None
+    if args.src_manifest:
+        case_ids_A = UnpairedNIfTIDataset.case_ids_from_manifest(
+            args.src_manifest, args.src_manufacturer, args.src_model)
+        print(f'src filter → {len(case_ids_A)} cases: {case_ids_A}')
+
+    case_ids_B = None
+    if args.tgt_manifest:
+        case_ids_B = UnpairedNIfTIDataset.case_ids_from_manifest(
+            args.tgt_manifest, args.tgt_manufacturer, args.tgt_model)
+        print(f'tgt filter → {len(case_ids_B)} cases: {case_ids_B}')
+
     dataset = UnpairedNIfTIDataset(args.src_dir, args.tgt_dir,
                                    min_body=args.min_body,
                                    pair_mode=args.pair_mode, depth_tol=args.depth_tol,
-                                   augment=not args.no_aug)
+                                   augment=not args.no_aug,
+                                   case_ids_A=case_ids_A, case_ids_B=case_ids_B)
     loader  = DataLoader(
         dataset, batch_size=args.batch_size, shuffle=True,
         num_workers=args.workers, pin_memory=True, drop_last=True,

@@ -24,6 +24,7 @@ Organ labels (for region-aware loss):
 """
 
 import glob
+import json
 import os
 import random
 
@@ -66,14 +67,16 @@ class UnpairedNIfTIDataset(Dataset):
     def __init__(self, dir_A: str, dir_B: str, use_fgmask: bool = True,
                  min_body: float = 0.05, pair_mode: str = 'auto', depth_tol: float = 0.1,
                  augment: bool = True, aug_degrees: float = 10.0,
-                 aug_translate: float = 0.05, aug_scale: float = 0.05):
+                 aug_translate: float = 0.05, aug_scale: float = 0.05,
+                 case_ids_A: list[str] | None = None,
+                 case_ids_B: list[str] | None = None):
         self.min_body = min_body
         self.augment = augment
         self.aug_degrees = aug_degrees
         self.aug_translate = aug_translate
         self.aug_scale = aug_scale
-        self.slices_A, self.subj_A, self.depth_A, self.labels_A = self._load_slices(dir_A, use_fgmask)
-        self.slices_B, self.subj_B, self.depth_B, self.labels_B = self._load_slices(dir_B, use_fgmask)
+        self.slices_A, self.subj_A, self.depth_A, self.labels_A = self._load_slices(dir_A, use_fgmask, case_ids_A)
+        self.slices_B, self.subj_B, self.depth_B, self.labels_B = self._load_slices(dir_B, use_fgmask, case_ids_B)
         if not self.slices_A:
             raise ValueError(f'No foreground slices found in {dir_A}')
         if not self.slices_B:
@@ -109,12 +112,34 @@ class UnpairedNIfTIDataset(Dataset):
     # CHAOS organ labels + 'rest' body class (see module docstring)
     ORGAN_CLASSES = (1, 2, 3, 4, 5)
 
-    def _load_slices(self, data_dir: str, use_fgmask: bool):
+    @staticmethod
+    def case_ids_from_manifest(manifest_path: str, manufacturer: str | None = None,
+                               model: str | None = None) -> list[str]:
+        """Return case_ids from scanner_manifest.json filtered by manufacturer and/or model.
+        Matching is case-insensitive substring."""
+        with open(manifest_path) as f:
+            manifest = json.load(f)
+        ids = []
+        for cid, m in manifest.items():
+            if manufacturer and manufacturer.lower() not in m.get("manufacturer", "").lower():
+                continue
+            if model and model.lower() not in m.get("model", "").lower():
+                continue
+            ids.append(cid)
+        return sorted(ids)
+
+    def _load_slices(self, data_dir: str, use_fgmask: bool,
+                     case_ids: list[str] | None = None):
         slices: list[np.ndarray] = []
         subjects: list[str] = []
         depths: list[float] = []
         labels: list[np.ndarray] = []
         paths = sorted(glob.glob(os.path.join(data_dir, 'image_*.nii.gz')))
+        if case_ids is not None:
+            case_ids_set = set(case_ids)
+            paths = [p for p in paths
+                     if os.path.basename(p).replace('image_', '').replace('.nii.gz', '')
+                     in case_ids_set]
         for img_path in paths:
             sid = os.path.basename(img_path).replace('image_', '').replace('.nii.gz', '')
             vol = sitk.GetArrayFromImage(sitk.ReadImage(img_path)).astype(np.float32)
