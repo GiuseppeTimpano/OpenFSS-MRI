@@ -10,6 +10,8 @@ Label remapping  AMOS → CHAOS convention:
         6=liver, 7=stomach, 8=aorta, 9=postcava, 10=pancreas, ...
   CHAOS: 0=BG, 1=LIVER, 2=RK, 3=LK, 4=SPLEEN
 """
+import csv
+import json
 import os
 from pathlib import Path
 
@@ -31,6 +33,7 @@ AMOS_LABEL_NAMES = ["BG", "LIVER", "RK", "LK", "SPLEEN"]
 # same as CHAOS so supervoxel thresholds transfer
 TARGET_SPACING = [1.25, 1.25, 7.70]
 CROP_SIZE = 256
+META_CSV = "labeled_data_meta_0000_0599.csv"
 
 # AMOS label id → CHAOS label id (0 = discard)
 AMOS_TO_CHAOS = {
@@ -58,6 +61,30 @@ def reorient_to_lps(image_itk: sitk.Image) -> sitk.Image:
     return sitk.DICOMOrient(image_itk, "LPS")
 
 
+def acquisition_plane(image_itk: sitk.Image) -> str:
+    """Native acquisition plane = axis with the largest (slice-thickness) spacing.
+    Detected on the RAW image before reorient. Verified to classify all 60 AMOS
+    MRI cases correctly: axial→z thick, coronal→y thick."""
+    sp = np.array(image_itk.GetSpacing())
+    return {0: "sagittal", 1: "coronal", 2: "axial"}[int(np.argmax(sp))]
+
+
+def load_scanner_meta(csv_path: Path) -> dict:
+    """amos_id (int) → {manufacturer, model, site} from the AMOS metadata CSV."""
+    meta = {}
+    if not csv_path.exists():
+        print(f"  WARNING: scanner CSV not found at {csv_path}")
+        return meta
+    for r in csv.DictReader(open(csv_path)):
+        aid = int("".join(c for c in r["amos_id"] if c.isdigit()))
+        meta[aid] = {
+            "manufacturer": r["Manufacturer"].strip() or "UNKNOWN",
+            "model": r["Manufacturer's Model Name"].strip() or "UNKNOWN",
+            "site": r["Site"].strip() or "UNKNOWN",
+        }
+    return meta
+
+
 def preprocess_amos(raw_dir: Path, out_dir: Path) -> None:
     img_dir = raw_dir / "images"
     lbl_dir = raw_dir / "labels"
@@ -65,6 +92,9 @@ def preprocess_amos(raw_dir: Path, out_dir: Path) -> None:
 
     img_paths = sorted(img_dir.glob("amos_*.nii.gz"))
     print(f"Found {len(img_paths)} AMOS MRI cases")
+
+    scanner_meta = load_scanner_meta(raw_dir / META_CSV)
+    manifest = {}
 
     for img_path in img_paths:
         case_id = img_path.stem.replace(".nii", "").replace("amos_", "")  # e.g. 0507
@@ -76,6 +106,23 @@ def preprocess_amos(raw_dir: Path, out_dir: Path) -> None:
 
         img_itk = sitk.ReadImage(str(img_path))
         lbl_itk = sitk.ReadImage(str(lbl_path))
+
+        # keep only natively AXIAL acquisitions (to match CHAOS T2 axial).
+        # coronal/sagittal are skipped — domain-shift study is axial-only.
+        plane = acquisition_plane(img_itk)
+        if plane != "axial":
+            # remove any stale outputs from a previous run that processed all planes
+            for stale in out_dir.glob(f"*_{case_id}.nii.gz"):
+                stale.unlink()
+            print(f"  skip {case_id} — {plane} acquisition (non-axial)")
+            continue
+
+        meta = scanner_meta.get(int(case_id), {"manufacturer": "UNKNOWN",
+                                               "model": "UNKNOWN", "site": "UNKNOWN"})
+        manifest[case_id] = {
+            **meta,
+            "ap_spacing": round(float(np.max(img_itk.GetSpacing())), 3),
+        }
 
         # reorient both to LPS axial
         img_itk = reorient_to_lps(img_itk)
@@ -99,7 +146,18 @@ def preprocess_amos(raw_dir: Path, out_dir: Path) -> None:
         out_lbl = out_dir / f"label_{case_id}.nii.gz"
         sitk.WriteImage(img_itk, str(out_img))
         sitk.WriteImage(lbl_itk, str(out_lbl))
-        print(f"  {case_id} done → {out_dir}")
+        print(f"  {case_id} done [{meta['manufacturer']}/{meta['model']}] → {out_dir}")
+
+    # scanner manifest — lets test.py stratify the domain-shift study by scanner
+    manifest_path = out_dir / "scanner_manifest.json"
+    with open(manifest_path, "w") as f:
+        json.dump(manifest, f, indent=2)
+    from collections import Counter
+    dist = Counter((m["manufacturer"], m["model"]) for m in manifest.values())
+    print(f"\nKept {len(manifest)} axial cases. Scanner distribution:")
+    for (man, mod), n in dist.most_common():
+        print(f"  {n:>2}x  {man} / {mod}")
+    print(f"Manifest → {manifest_path}")
 
 
 if __name__ == "__main__":
