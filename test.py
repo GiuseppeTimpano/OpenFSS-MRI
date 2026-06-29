@@ -14,6 +14,7 @@ Support-slice selection is pluggable via --support_select:
 """
 
 import argparse
+import glob
 import json
 import os
 
@@ -51,6 +52,37 @@ def _support_indices(n_part: int, n_fg: int) -> np.ndarray:
         part_interval = (1.0 - 1.0 / n_part) / (n_part - 1)
         pcts = [half_part + part_interval * i for i in range(n_part)]
     return (np.array(pcts) * n_fg).astype(int)
+
+
+def _select_support_slices(support_select, supp_fg_idx, supp_ssbr, n_part):
+    """
+    Pick the support slices used as the few-shot candidates for one organ.
+      percentile (original): n_part FG slices evenly spaced across the support FG extent.
+      ssbr: the full FG pool, paired with per-volume z-scored body-part scores
+            (z-score removes the arbitrary offset/scale between volumes).
+    Returns (sel_z, supp_sel_score); supp_sel_score is None in percentile mode.
+    """
+    if support_select == 'ssbr':
+        mu, sd = supp_ssbr.mean(), supp_ssbr.std() + 1e-8
+        return supp_fg_idx, (supp_ssbr[supp_fg_idx] - mu) / sd
+    sel_z = supp_fg_idx[_support_indices(n_part, len(supp_fg_idx))]
+    return sel_z, None
+
+
+def _assign_support(support_select, C_q, n_part, q_fg_score=None, supp_sel_score=None):
+    """
+    Map each query FG slice -> index into the support candidate list.
+      percentile (original): split the query FG slices into n_part contiguous depth
+        chunks; chunk i uses support slice i.
+      ssbr: each query slice picks the support slice with the nearest body-part score.
+    """
+    if support_select == 'ssbr':
+        return np.array([int(np.argmin(np.abs(qs - supp_sel_score))) for qs in q_fg_score])
+    chunk_bounds = np.linspace(0, C_q, n_part + 1).astype(int)
+    assign = np.empty(C_q, dtype=int)
+    for chunk_i in range(n_part):
+        assign[chunk_bounds[chunk_i]:chunk_bounds[chunk_i + 1]] = chunk_i
+    return assign
 
 
 class Scores:
@@ -164,8 +196,7 @@ def test_from_cfg(
 
     supp_sid   = supp_pool[supp_idx]
     if target_data_dir:
-        import glob as _glob
-        _paths = sorted(_glob.glob(os.path.join(target_data_dir, 'image_*.nii.gz')))
+        _paths = sorted(glob.glob(os.path.join(target_data_dir, 'image_*.nii.gz')))
         query_sids = [os.path.basename(p).replace('image_', '').replace('.nii.gz', '') for p in _paths]
     else:
         query_sids = [sid for sid in query_pool if sid != supp_sid]
@@ -180,6 +211,11 @@ def test_from_cfg(
     if save_dir:
         os.makedirs(save_dir, exist_ok=True)
 
+    # per-query full-volume accumulators (one multi-label volume per query scan)
+    multi_img:  dict[str, np.ndarray] = {}
+    multi_gt:   dict[str, np.ndarray] = {}
+    multi_pred: dict[str, np.ndarray] = {}
+
     class_dice: dict[str, float] = {}
     class_iou:  dict[str, float] = {}
 
@@ -193,12 +229,8 @@ def test_from_cfg(
             print(f'  [SKIP] support {supp_sid} has no FG for {label_name}')
             continue
 
-        if support_select == 'ssbr':
-            sel_z = supp_fg_idx                      # full FG pool as candidates
-            supp_sel_score = supp_ssbr[sel_z]        # body-part score per candidate
-        else:
-            sel_z = supp_fg_idx[_support_indices(n_part, len(supp_fg_idx))]
-            supp_sel_score = None
+        sel_z, supp_sel_score = _select_support_slices(
+            support_select, supp_fg_idx, supp_ssbr, n_part)
 
         sup_imgs_list  = []
         sup_masks_list = []
@@ -214,6 +246,11 @@ def test_from_cfg(
             q_img, q_lbl = _load_scan(query_data_dir, qsid)
             q_fg_mask    = (q_lbl == label_val).astype(np.float32)
 
+            if save_dir and qsid not in multi_pred:
+                multi_img[qsid]  = q_img.astype(np.float32)          # full query volume
+                multi_gt[qsid]   = q_lbl.astype(np.uint8)            # full multi-label GT
+                multi_pred[qsid] = np.zeros_like(q_lbl, dtype=np.uint8)
+
             fg_idx = np.where(q_fg_mask.any(axis=(1, 2)))[0]
             if len(fg_idx) == 0:
                 print(f'  [SKIP] query {qsid} has no FG for {label_name}')
@@ -224,16 +261,12 @@ def test_from_cfg(
             C_q          = len(fg_idx)
 
             # assign[j] = index into sup_imgs_list used to segment query FG slice j
+            q_fg_score = None
             if support_select == 'ssbr':
-                q_fg_score = score_volume(ssbr_net, q_img, ssbr_res, device)[fg_idx]
-                assign = np.array([int(np.argmin(np.abs(qs - supp_sel_score)))
-                                   for qs in q_fg_score])
-            else:
-                chunk_bounds = np.linspace(0, C_q, n_part + 1).astype(int)
-                assign = np.empty(C_q, dtype=int)
-                for chunk_i in range(n_part):
-                    a, b = chunk_bounds[chunk_i], chunk_bounds[chunk_i + 1]
-                    assign[a:b] = chunk_i
+                q_full = score_volume(ssbr_net, q_img, ssbr_res, device)
+                q_mu, q_sd = q_full.mean(), q_full.std() + 1e-8
+                q_fg_score = (q_full[fg_idx] - q_mu) / q_sd
+            assign = _assign_support(support_select, C_q, n_part, q_fg_score, supp_sel_score)
 
             H, W           = q_img_fg.shape[1], q_img_fg.shape[2]
             query_pred_vol = torch.zeros(C_q, H, W, dtype=torch.long)
@@ -254,15 +287,24 @@ def test_from_cfg(
             print(f'  scan {qsid}: Dice={dice_val:.4f}  IoU={iou_val:.4f}')
 
             if save_dir:
-                pred_np  = query_pred_vol.numpy().astype(np.uint8)
-                itk_img  = sitk.GetImageFromArray(pred_np)
-                out_path = os.path.join(save_dir, f'pred_{qsid}_{label_name}.nii.gz')
-                sitk.WriteImage(itk_img, out_path, True)
+                # write this organ's binary prediction into the query's multi-label volume
+                pred_np = query_pred_vol.numpy().astype(np.uint8)   # [C_q,H,W] binary
+                for k, z in enumerate(fg_idx):
+                    multi_pred[qsid][z][pred_np[k] == 1] = label_val
 
         if scores.patient_dice:
             class_dice[label_name] = float(np.mean(scores.patient_dice))
             class_iou[label_name]  = float(np.mean(scores.patient_iou))
             print(f'  mean Dice={class_dice[label_name]:.4f}  mean IoU={class_iou[label_name]:.4f}')
+
+    if save_dir:
+        for qsid in multi_pred:
+            sitk.WriteImage(sitk.GetImageFromArray(multi_img[qsid]),
+                            os.path.join(save_dir, f'{qsid}_image.nii.gz'), True)
+            sitk.WriteImage(sitk.GetImageFromArray(multi_gt[qsid]),
+                            os.path.join(save_dir, f'{qsid}_gt.nii.gz'), True)
+            sitk.WriteImage(sitk.GetImageFromArray(multi_pred[qsid]),
+                            os.path.join(save_dir, f'{qsid}_pred.nii.gz'), True)
 
     print('\n===== Final results =====')
     results = {}
