@@ -5,12 +5,17 @@ Protocol identical to original Q-Net test.py / SSL-ALPNet eval (CHAOS dataset):
   - 1 support scan (supp_idx, default 0), N = n_part support slices evenly spaced in FG
   - for each query scan: only FG slices, split into n_part chunks; chunk i uses support slice i
   - metric: per-patient 3D Dice + IoU, mean per class over all test patients
+
+Support-slice selection is pluggable via --support_select:
+  percentile (default) reproduces the original protocol above; ssbr replaces the
+  chunk->support mapping with body-part-score nearest-neighbour matching (see
+  models/ssbr.py), letting each query slice pick its closest support slice without
+  using the query label.
 """
 
 import argparse
 import json
 import os
-from collections.abc import Callable
 
 import numpy as np
 import SimpleITK as sitk
@@ -19,6 +24,7 @@ import yaml
 
 from data.dataloader.dataset import get_fold_ids
 from models.fewshot import FewShotConfig, QNetFewShot, ALPNetFewShot
+from models.ssbr import load_ssbr, score_volume
 
 
 def _read_nii(path: str) -> np.ndarray:
@@ -70,11 +76,21 @@ def test_from_cfg(
     target_data_dir: str | None = None,
     device_str: str = 'cuda' if torch.cuda.is_available() else 'cpu',
     save_dir: str | None = None,
-    translator: Callable[[np.ndarray], np.ndarray] | None = None,
+    support_select: str = 'percentile',
+    ssbr_ckpt: str | None = None,
 ) -> dict:
     """
     Run volumetric test. Returns:
       {'LIVER': {'dice': x, 'iou': y}, ..., 'MEAN': {'dice': x, 'iou': y}}
+
+    support_select:
+      'percentile' (default, original protocol) — pick n_part support slices evenly
+        spaced in the support FG extent; split the query FG slices into n_part
+        contiguous chunks (by relative depth) and pair chunk i with support slice i.
+      'ssbr' — score every support and query slice with a trained SSBR body-part
+        regressor; for each query FG slice pick the support FG slice with the nearest
+        body-part score. Deployable: selection uses the query *image* only (no query
+        label), the query label is used solely to evaluate Dice.
     """
     data_cfg   = cfg['data']
     model_cfg  = cfg['model']
@@ -126,6 +142,15 @@ def test_from_cfg(
     model.to(device)
     model.eval()
 
+    if support_select not in ('percentile', 'ssbr'):
+        raise ValueError(f"support_select must be 'percentile' or 'ssbr', got {support_select}")
+    ssbr_net = ssbr_res = None
+    if support_select == 'ssbr':
+        if not ssbr_ckpt:
+            raise ValueError("support_select='ssbr' requires --ssbr_ckpt")
+        ssbr_net, ssbr_res = load_ssbr(ssbr_ckpt, device)
+        print(f'SSBR support selection: {ssbr_ckpt} (res={ssbr_res})')
+
     _, test_ids = get_fold_ids(data_dir, fold, n_folds)
     if not test_ids:
         raise ValueError(f'No test scans for fold {fold}')
@@ -149,6 +174,8 @@ def test_from_cfg(
     print(f'n_part={n_part}, eval_labels={eval_labels}')
 
     supp_img, supp_lbl = _load_scan(data_dir, supp_sid)
+    supp_ssbr = score_volume(ssbr_net, supp_img, ssbr_res, device) \
+                if support_select == 'ssbr' else None
 
     if save_dir:
         os.makedirs(save_dir, exist_ok=True)
@@ -166,7 +193,12 @@ def test_from_cfg(
             print(f'  [SKIP] support {supp_sid} has no FG for {label_name}')
             continue
 
-        sel_z = supp_fg_idx[_support_indices(n_part, len(supp_fg_idx))]
+        if support_select == 'ssbr':
+            sel_z = supp_fg_idx                      # full FG pool as candidates
+            supp_sel_score = supp_ssbr[sel_z]        # body-part score per candidate
+        else:
+            sel_z = supp_fg_idx[_support_indices(n_part, len(supp_fg_idx))]
+            supp_sel_score = None
 
         sup_imgs_list  = []
         sup_masks_list = []
@@ -180,8 +212,6 @@ def test_from_cfg(
 
         for qsid in query_sids:
             q_img, q_lbl = _load_scan(query_data_dir, qsid)
-            if translator is not None:
-                q_img = translator(q_img)
             q_fg_mask    = (q_lbl == label_val).astype(np.float32)
 
             fg_idx = np.where(q_fg_mask.any(axis=(1, 2)))[0]
@@ -193,19 +223,28 @@ def test_from_cfg(
             q_fg_mask_fg = q_fg_mask[fg_idx]
             C_q          = len(fg_idx)
 
-            chunk_bounds   = np.linspace(0, C_q, n_part + 1).astype(int)
+            # assign[j] = index into sup_imgs_list used to segment query FG slice j
+            if support_select == 'ssbr':
+                q_fg_score = score_volume(ssbr_net, q_img, ssbr_res, device)[fg_idx]
+                assign = np.array([int(np.argmin(np.abs(qs - supp_sel_score)))
+                                   for qs in q_fg_score])
+            else:
+                chunk_bounds = np.linspace(0, C_q, n_part + 1).astype(int)
+                assign = np.empty(C_q, dtype=int)
+                for chunk_i in range(n_part):
+                    a, b = chunk_bounds[chunk_i], chunk_bounds[chunk_i + 1]
+                    assign[a:b] = chunk_i
+
             H, W           = q_img_fg.shape[1], q_img_fg.shape[2]
             query_pred_vol = torch.zeros(C_q, H, W, dtype=torch.long)
 
             with torch.no_grad():
-                for chunk_i in range(n_part):
-                    s_img  = sup_imgs_list[chunk_i]
-                    s_mask = sup_masks_list[chunk_i]
-                    a, b   = chunk_bounds[chunk_i], chunk_bounds[chunk_i + 1]
-                    for j in range(a, b):
-                        qi   = torch.from_numpy(q_img_fg[j]).to(device).unsqueeze(0)
-                        pred = model(s_img, s_mask, qi)
-                        query_pred_vol[j] = pred.argmax(dim=1).cpu().squeeze(0)
+                for j in range(C_q):
+                    s_img  = sup_imgs_list[assign[j]]
+                    s_mask = sup_masks_list[assign[j]]
+                    qi     = torch.from_numpy(q_img_fg[j]).to(device).unsqueeze(0)
+                    pred   = model(s_img, s_mask, qi)
+                    query_pred_vol[j] = pred.argmax(dim=1).cpu().squeeze(0)
 
             q_label_vol = torch.from_numpy(q_fg_mask_fg).long()
             scores.record(query_pred_vol, q_label_vol)
@@ -251,10 +290,11 @@ if __name__ == '__main__':
     parser.add_argument('--target_data_dir', type=str, default=None)
     parser.add_argument('--device',          type=str,
                         default='cuda' if torch.cuda.is_available() else 'cpu')
-    parser.add_argument('--cyclegan_ckpt',   type=str, default=None,
-                        help='Path to CycleGAN checkpoint for test-time normalization')
-    parser.add_argument('--cyclegan_key',    type=str, default='G_AB',
-                        help='Generator key in checkpoint (G_AB or G_BA)')
+    parser.add_argument('--support_select',  type=str, default='percentile',
+                        choices=['percentile', 'ssbr'],
+                        help='support-slice selection: percentile (original) or ssbr')
+    parser.add_argument('--ssbr_ckpt',       type=str, default=None,
+                        help='trained SSBR checkpoint (required for --support_select ssbr)')
     args = parser.parse_args()
 
     with open(args.config) as f:
@@ -269,19 +309,12 @@ if __name__ == '__main__':
     if args.test_label is not None:
         cfg_file.setdefault('test', {})['test_label'] = args.test_label
 
-    translator = None
-    if args.cyclegan_ckpt:
-        from cyclegan.translate import load_generator, translate_volume
-        _dev = torch.device(args.device)
-        _G   = load_generator(args.cyclegan_ckpt, key=args.cyclegan_key, device=_dev)
-        translator = lambda vol: translate_volume(vol, _G, _dev)
-        print(f'CycleGAN translator loaded: {args.cyclegan_ckpt} [{args.cyclegan_key}]')
-
     test_from_cfg(
         cfg_file,
         checkpoint      = args.checkpoint,
         target_data_dir = args.target_data_dir,
         device_str      = args.device,
         save_dir        = args.save_dir,
-        translator      = translator,
+        support_select  = args.support_select,
+        ssbr_ckpt       = args.ssbr_ckpt,
     )
