@@ -5,7 +5,6 @@ from torch.utils.data import DataLoader
 
 from data.dataloader.dataset import EpisodeDataset, get_fold_ids
 from models.fewshot import QNetFewShot, ALPNetFewShot
-from models.loss import compute_celoss
 
 
 class FewShotDataModule(pl.LightningDataModule):

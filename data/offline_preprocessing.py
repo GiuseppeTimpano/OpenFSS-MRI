@@ -21,15 +21,6 @@ def n4_bias_field_correction(image: sitk.Image, shrink_factor=4, n_iters=[50, 40
     return corrected_full
 
 
-def intensity_clipping(image: sitk.Image, lower_percentile=1.0, upper_percentile=99.0) -> sitk.Image:
-    arr = sitk.GetArrayFromImage(image)
-    low, high = np.percentile(arr, lower_percentile), np.percentile(arr, upper_percentile)
-    arr_clipped = np.clip(arr, low, high)
-    out = sitk.GetImageFromArray(arr_clipped)
-    out.CopyInformation(image)
-    return out
-
-
 def intensity_clip_upper(image: sitk.Image, upper_percentile: float = 99.5) -> sitk.Image:
     arr = sitk.GetArrayFromImage(image)
     high = np.percentile(arr, upper_percentile)

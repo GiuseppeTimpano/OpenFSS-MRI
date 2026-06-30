@@ -12,7 +12,6 @@ Label remapping  AMOS → CHAOS convention:
 """
 import csv
 import json
-import os
 from pathlib import Path
 
 import numpy as np

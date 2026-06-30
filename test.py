@@ -5,12 +5,6 @@ Protocol identical to original Q-Net test.py / SSL-ALPNet eval (CHAOS dataset):
   - 1 support scan (supp_idx, default 0), N = n_part support slices evenly spaced in FG
   - for each query scan: only FG slices, split into n_part chunks; chunk i uses support slice i
   - metric: per-patient 3D Dice + IoU, mean per class over all test patients
-
-Support-slice selection is pluggable via --support_select:
-  percentile (default) reproduces the original protocol above; ssbr replaces the
-  chunk->support mapping with body-part-score nearest-neighbour matching (see
-  models/ssbr.py), letting each query slice pick its closest support slice without
-  using the query label.
 """
 
 import argparse
@@ -25,7 +19,6 @@ import yaml
 
 from data.dataloader.dataset import get_fold_ids
 from models.fewshot import FewShotConfig, QNetFewShot, ALPNetFewShot
-from models.ssbr import load_ssbr, score_volume
 
 
 def _read_nii(path: str) -> np.ndarray:
@@ -54,30 +47,14 @@ def _support_indices(n_part: int, n_fg: int) -> np.ndarray:
     return (np.array(pcts) * n_fg).astype(int)
 
 
-def _select_support_slices(support_select, supp_fg_idx, supp_ssbr, n_part):
-    """
-    Pick the support slices used as the few-shot candidates for one organ.
-      percentile (original): n_part FG slices evenly spaced across the support FG extent.
-      ssbr: the full FG pool, paired with per-volume z-scored body-part scores
-            (z-score removes the arbitrary offset/scale between volumes).
-    Returns (sel_z, supp_sel_score); supp_sel_score is None in percentile mode.
-    """
-    if support_select == 'ssbr':
-        mu, sd = supp_ssbr.mean(), supp_ssbr.std() + 1e-8
-        return supp_fg_idx, (supp_ssbr[supp_fg_idx] - mu) / sd
-    sel_z = supp_fg_idx[_support_indices(n_part, len(supp_fg_idx))]
-    return sel_z, None
+def _select_support_slices(supp_fg_idx, n_part):
+    """n_part FG slices evenly spaced across the support FG extent (original protocol)."""
+    return supp_fg_idx[_support_indices(n_part, len(supp_fg_idx))]
 
 
-def _assign_support(support_select, C_q, n_part, q_fg_score=None, supp_sel_score=None):
-    """
-    Map each query FG slice -> index into the support candidate list.
-      percentile (original): split the query FG slices into n_part contiguous depth
-        chunks; chunk i uses support slice i.
-      ssbr: each query slice picks the support slice with the nearest body-part score.
-    """
-    if support_select == 'ssbr':
-        return np.array([int(np.argmin(np.abs(qs - supp_sel_score))) for qs in q_fg_score])
+def _assign_support(C_q, n_part):
+    """Split the query FG slices into n_part contiguous depth chunks; chunk i uses
+    support slice i (original Q-Net / SSL-ALPNet protocol)."""
     chunk_bounds = np.linspace(0, C_q, n_part + 1).astype(int)
     assign = np.empty(C_q, dtype=int)
     for chunk_i in range(n_part):
@@ -108,21 +85,14 @@ def test_from_cfg(
     target_data_dir: str | None = None,
     device_str: str = 'cuda' if torch.cuda.is_available() else 'cpu',
     save_dir: str | None = None,
-    support_select: str = 'percentile',
-    ssbr_ckpt: str | None = None,
 ) -> dict:
     """
     Run volumetric test. Returns:
       {'LIVER': {'dice': x, 'iou': y}, ..., 'MEAN': {'dice': x, 'iou': y}}
 
-    support_select:
-      'percentile' (default, original protocol) — pick n_part support slices evenly
-        spaced in the support FG extent; split the query FG slices into n_part
-        contiguous chunks (by relative depth) and pair chunk i with support slice i.
-      'ssbr' — score every support and query slice with a trained SSBR body-part
-        regressor; for each query FG slice pick the support FG slice with the nearest
-        body-part score. Deployable: selection uses the query *image* only (no query
-        label), the query label is used solely to evaluate Dice.
+    Support slices: n_part FG slices evenly spaced in the support FG extent; query
+    FG slices split into n_part contiguous depth chunks, chunk i paired with support
+    slice i (original Q-Net / SSL-ALPNet protocol).
     """
     data_cfg   = cfg['data']
     model_cfg  = cfg['model']
@@ -174,15 +144,6 @@ def test_from_cfg(
     model.to(device)
     model.eval()
 
-    if support_select not in ('percentile', 'ssbr'):
-        raise ValueError(f"support_select must be 'percentile' or 'ssbr', got {support_select}")
-    ssbr_net = ssbr_res = None
-    if support_select == 'ssbr':
-        if not ssbr_ckpt:
-            raise ValueError("support_select='ssbr' requires --ssbr_ckpt")
-        ssbr_net, ssbr_res = load_ssbr(ssbr_ckpt, device)
-        print(f'SSBR support selection: {ssbr_ckpt} (res={ssbr_res})')
-
     _, test_ids = get_fold_ids(data_dir, fold, n_folds)
     if not test_ids:
         raise ValueError(f'No test scans for fold {fold}')
@@ -205,8 +166,6 @@ def test_from_cfg(
     print(f'n_part={n_part}, eval_labels={eval_labels}')
 
     supp_img, supp_lbl = _load_scan(data_dir, supp_sid)
-    supp_ssbr = score_volume(ssbr_net, supp_img, ssbr_res, device) \
-                if support_select == 'ssbr' else None
 
     if save_dir:
         os.makedirs(save_dir, exist_ok=True)
@@ -229,8 +188,7 @@ def test_from_cfg(
             print(f'  [SKIP] support {supp_sid} has no FG for {label_name}')
             continue
 
-        sel_z, supp_sel_score = _select_support_slices(
-            support_select, supp_fg_idx, supp_ssbr, n_part)
+        sel_z = _select_support_slices(supp_fg_idx, n_part)
 
         sup_imgs_list  = []
         sup_masks_list = []
@@ -261,12 +219,7 @@ def test_from_cfg(
             C_q          = len(fg_idx)
 
             # assign[j] = index into sup_imgs_list used to segment query FG slice j
-            q_fg_score = None
-            if support_select == 'ssbr':
-                q_full = score_volume(ssbr_net, q_img, ssbr_res, device)
-                q_mu, q_sd = q_full.mean(), q_full.std() + 1e-8
-                q_fg_score = (q_full[fg_idx] - q_mu) / q_sd
-            assign = _assign_support(support_select, C_q, n_part, q_fg_score, supp_sel_score)
+            assign = _assign_support(C_q, n_part)
 
             H, W           = q_img_fg.shape[1], q_img_fg.shape[2]
             query_pred_vol = torch.zeros(C_q, H, W, dtype=torch.long)
@@ -332,11 +285,6 @@ if __name__ == '__main__':
     parser.add_argument('--target_data_dir', type=str, default=None)
     parser.add_argument('--device',          type=str,
                         default='cuda' if torch.cuda.is_available() else 'cpu')
-    parser.add_argument('--support_select',  type=str, default='percentile',
-                        choices=['percentile', 'ssbr'],
-                        help='support-slice selection: percentile (original) or ssbr')
-    parser.add_argument('--ssbr_ckpt',       type=str, default=None,
-                        help='trained SSBR checkpoint (required for --support_select ssbr)')
     args = parser.parse_args()
 
     with open(args.config) as f:
@@ -357,6 +305,4 @@ if __name__ == '__main__':
         target_data_dir = args.target_data_dir,
         device_str      = args.device,
         save_dir        = args.save_dir,
-        support_select  = args.support_select,
-        ssbr_ckpt       = args.ssbr_ckpt,
     )
