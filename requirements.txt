@@ -12,3 +12,14 @@ pyyaml
 rich
 matplotlib
 termcolor
+
+# BiomedParse (third_party/BiomedParse, not pip-installable upstream)
+hydra-core
+fvcore
+timm
+transformers
+safetensors
+huggingface_hub
+# detectron2 needs a separate source build (CPU-only OK, no CUDA op actually used
+# at runtime — see HANDOFF.md BiomedParse adapter notes):
+#   pip install --no-build-isolation 'git+https://github.com/facebookresearch/detectron2.git'

@@ -1,3 +1,9 @@
 [submodule "third_party/MedSAM2"]
 	path = third_party/MedSAM2
 	url = https://github.com/bowang-lab/MedSAM2.git
+[submodule "third_party/UniverSeg"]
+	path = third_party/UniverSeg
+	url = https://github.com/JJGO/UniverSeg.git
+[submodule "third_party/BiomedParse"]
+	path = third_party/BiomedParse
+	url = https://github.com/microsoft/BiomedParse.git
