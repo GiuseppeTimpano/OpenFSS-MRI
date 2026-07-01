@@ -22,6 +22,7 @@ Image normalization is MedSAM2's (uint8 [0,255] + 512 + ImageNet), NOT the z-sco
 of the baseline — a model requirement (see models/medsam2_adapter.py).
 """
 import argparse
+import csv
 import glob
 import os
 
@@ -67,7 +68,7 @@ def _build_boxes(fg_mask: np.ndarray, fg_idx: np.ndarray, z0: int,
 def evaluate(cfg: dict, checkpoint: str, model_cfg: str,
              target_data_dir: str | None, fold: int | None,
              eval_labels: list[int] | None, prompt_mode: str, margin: int,
-             device: str, save_dir: str | None) -> dict:
+             device: str, save_dir: str | None, save_topk: int = 1) -> dict:
     data_cfg    = cfg['data']
     data_dir    = data_cfg['data_dir']
     n_folds     = data_cfg['n_folds']
@@ -93,26 +94,24 @@ def evaluate(cfg: dict, checkpoint: str, model_cfg: str,
 
     if save_dir:
         os.makedirs(save_dir, exist_ok=True)
-    multi_img:  dict[str, np.ndarray] = {}
-    multi_gt:   dict[str, np.ndarray] = {}
-    multi_pred: dict[str, np.ndarray] = {}
 
     class_dice: dict[str, float] = {}
     class_iou:  dict[str, float] = {}
+    csv_rows: list[dict] = []
 
     for label_val in eval_labels:
         label_name = label_names[label_val] if label_val < len(label_names) else str(label_val)
         print(f'\n== Class: {label_name} (label={label_val}) ==')
         scores = Scores()
+        scan_ids: list[str] = []
+        # kept only for this class's loop, discarded once best/worst are written out
+        cls_img: dict[str, np.ndarray] = {}
+        cls_gt:  dict[str, np.ndarray] = {}
+        cls_pred: dict[str, np.ndarray] = {}
 
         for qsid in query_sids:
             q_img, q_lbl = _load_raw(query_data_dir, qsid)
             q_fg = (q_lbl == label_val).astype(np.uint8)
-
-            if save_dir and qsid not in multi_pred:
-                multi_img[qsid]  = q_img.astype(np.float32)
-                multi_gt[qsid]   = q_lbl.astype(np.uint8)
-                multi_pred[qsid] = np.zeros_like(q_lbl, dtype=np.uint8)
 
             fg_idx = np.where(q_fg.any(axis=(1, 2)))[0]
             if len(fg_idx) == 0:
@@ -130,12 +129,14 @@ def evaluate(cfg: dict, checkpoint: str, model_cfg: str,
             pred_fg = torch.from_numpy(pred_full[fg_idx].astype(np.int64))
             gt_fg   = torch.from_numpy(q_fg[fg_idx].astype(np.int64))
             scores.record(pred_fg, gt_fg)
+            scan_ids.append(qsid)
             print(f'  scan {qsid}: Dice={scores.patient_dice[-1]:.4f}  '
                   f'IoU={scores.patient_iou[-1]:.4f}')
 
-            if save_dir:
-                for z in range(z0, z1 + 1):
-                    multi_pred[qsid][z][pred_full[z] == 1] = label_val
+            if save_dir and save_topk > 0:
+                cls_img[qsid]  = q_img.astype(np.float32)
+                cls_gt[qsid]   = q_fg
+                cls_pred[qsid] = pred_full
 
         if scores.patient_dice:
             class_dice[label_name] = float(np.mean(scores.patient_dice))
@@ -143,16 +144,46 @@ def evaluate(cfg: dict, checkpoint: str, model_cfg: str,
             print(f'  mean Dice={class_dice[label_name]:.4f}  '
                   f'mean IoU={class_iou[label_name]:.4f}')
 
-    if save_dir:
-        for qsid in multi_pred:
-            sitk.WriteImage(sitk.GetImageFromArray(multi_img[qsid]),
-                            os.path.join(save_dir, f'{qsid}_image.nii.gz'), True)
-            sitk.WriteImage(sitk.GetImageFromArray(multi_gt[qsid]),
-                            os.path.join(save_dir, f'{qsid}_gt.nii.gz'), True)
-            sitk.WriteImage(sitk.GetImageFromArray(multi_pred[qsid]),
-                            os.path.join(save_dir, f'{qsid}_pred.nii.gz'), True)
+            for sid, d, i in zip(scan_ids, scores.patient_dice, scores.patient_iou):
+                csv_rows.append({'class': label_name, 'label': label_val,
+                                  'scan': sid, 'dice': d, 'iou': i})
 
-    return aggregate_and_print(class_dice, class_iou)
+            if save_dir and save_topk > 0 and scan_ids:
+                order = sorted(range(len(scan_ids)), key=lambda k: scores.patient_dice[k])
+                worst_idx = set(order[:save_topk])
+                best_idx  = set(order[-save_topk:])
+                for k in worst_idx | best_idx:
+                    sid = scan_ids[k]
+                    tag = 'best' if k in best_idx else 'worst'
+                    d = scores.patient_dice[k]
+                    base = f'{label_name}_{tag}_{sid}_dice{d:.3f}'
+                    sitk.WriteImage(sitk.GetImageFromArray(cls_img[sid]),
+                                    os.path.join(save_dir, f'{base}_image.nii.gz'), True)
+                    sitk.WriteImage(sitk.GetImageFromArray(cls_gt[sid]),
+                                    os.path.join(save_dir, f'{base}_gt.nii.gz'), True)
+                    sitk.WriteImage(sitk.GetImageFromArray(cls_pred[sid]),
+                                    os.path.join(save_dir, f'{base}_pred.nii.gz'), True)
+
+    if save_dir and csv_rows:
+        csv_path = os.path.join(save_dir, 'scores.csv')
+        with open(csv_path, 'w', newline='') as f:
+            writer = csv.DictWriter(f, fieldnames=['class', 'label', 'scan', 'dice', 'iou'])
+            writer.writeheader()
+            writer.writerows(csv_rows)
+        print(f'\nPer-scan scores written to {csv_path}')
+
+    results = aggregate_and_print(class_dice, class_iou)
+
+    if save_dir and results:
+        summary_path = os.path.join(save_dir, 'summary.csv')
+        with open(summary_path, 'w', newline='') as f:
+            writer = csv.DictWriter(f, fieldnames=['class', 'dice', 'iou'])
+            writer.writeheader()
+            for name, vals in results.items():
+                writer.writerow({'class': name, 'dice': vals['dice'], 'iou': vals['iou']})
+        print(f'Summary written to {summary_path}')
+
+    return results
 
 
 if __name__ == '__main__':
@@ -171,7 +202,10 @@ if __name__ == '__main__':
                         choices=['perslice', 'key'])
     parser.add_argument('--margin',          type=int, default=3,
                         help='oracle box margin in pixels')
-    parser.add_argument('--save_dir',        type=str, default=None)
+    parser.add_argument('--save_dir',        type=str, default=None,
+                        help='where to write scores.csv/summary.csv and best/worst volumes')
+    parser.add_argument('--save_topk',       type=int, default=1,
+                        help='per class, save nii.gz for N best + N worst scans (0 = CSV only, no volumes)')
     parser.add_argument('--device',          type=str,
                         default='cuda' if torch.cuda.is_available() else 'cpu')
     args = parser.parse_args()
@@ -190,4 +224,5 @@ if __name__ == '__main__':
         margin          = args.margin,
         device          = args.device,
         save_dir        = args.save_dir,
+        save_topk       = args.save_topk,
     )
