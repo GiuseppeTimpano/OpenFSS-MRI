@@ -8,7 +8,7 @@ LLM backend (sam3/agent/client_llm.py, OpenAI-compatible endpoint):
   - real OpenAI ("gpt-4o"): OPENAI_API_KEY env, llm_server_url=None.
   - self-hosted (e.g. vLLM): llm_server_url="http://host:port/v1".
 Real external cost per image (up to max_generations round-trips) -- smoke
-test single slices first (scripts/demo_medsam3_agent.py).
+test single slices first (scripts/agent/demo_medsam3_agent.py).
 
 File-based upstream: agent loop reads image *paths*, not in-memory arrays --
 write each slice to disk before calling segment_image().

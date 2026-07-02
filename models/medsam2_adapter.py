@@ -1,26 +1,15 @@
 """
-MedSAM2 adapter for the foundation-model comparison.
+MedSAM2 adapter -- promptable (box + SAM2 memory-attention propagation across
+slices), NOT support-set few-shot like models/fewshot.py; wrapped at volume level.
 
-MedSAM2 (SAM2.1 fine-tuned, arXiv 2504.03600, repo bowang-lab/MedSAM2) is NOT a
-few-shot-from-support model like the prototype baseline. It is *promptable*: it
-takes a box on one slice of the query volume and propagates the mask to the other
-slices via SAM2 memory attention. So it is wrapped at the volume level (not the
-per-slice forward(support, query) contract of models/fewshot.py).
+Predictor API mirrors MedSAM2's medsam2_infer_3D_CT.py: init_state ->
+add_new_points_or_box (one box on one slice) -> propagate_in_video (both directions).
 
-The exact predictor API mirrors MedSAM2's medsam2_infer_3D_CT.py:
-  predictor = build_sam2_video_predictor_npz(model_cfg, checkpoint)
-  state     = predictor.init_state(img_resized, H, W)   # img_resized: [Z,3,512,512]
-  predictor.add_new_points_or_box(inference_state=state, frame_idx=z, obj_id=1,
-                                  box=np.array([x0,y0,x1,y1]))
-  for fidx, oids, logits in predictor.propagate_in_video(state[, reverse=True]):
-      mask = (logits[0] > 0.0)[0]
+Normalization is a MedSAM2 requirement, not a bug: uint8 [0,255], resized to 512,
+ImageNet standardization -- NOT the per-volume z-score of
+scripts/prototype/test.py's _load_scan.
 
-Normalization differs from the baseline on purpose: MedSAM2 wants uint8 [0,255]
-volumes resized to 512 + ImageNet standardization (NOT the per-volume z-score of
-test._load_scan). This is a model requirement, not a bug.
-
-`sam2` / MedSAM2 live in their own repo and are imported lazily so this module
-can be imported even where they are not installed.
+`sam2`/MedSAM2 imported lazily so this module loads even where they're absent.
 """
 import numpy as np
 import torch

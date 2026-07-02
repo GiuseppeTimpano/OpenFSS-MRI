@@ -17,7 +17,7 @@ run() {
   local out_dir="$SAVE_DIR/$out"
   mkdir -p "$out_dir"
   echo "=== UniverSeg: $dataset_dir ($seq) labels: $* ==="
-  PYTHONPATH=. $PYTHON eval_universeg.py \
+  PYTHONPATH=. $PYTHON scripts/eval/eval_universeg.py \
     --target_data_dir "$dataset_dir" \
     --test_label "$@" \
     --supp_idx "$SUPP_IDX" \

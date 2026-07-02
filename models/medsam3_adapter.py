@@ -1,39 +1,21 @@
 """
-MedSAM3 adapter (text-prompted, 3D via slice-wise loop) — ZERO-SHOT only.
+MedSAM3 adapter -- text-prompted, 3D via slice-wise loop, ZERO-SHOT only (no
+further fine-tuning here). Loads MedSAM3-v1's published LoRA weights
+(huggingface.co/lal-Joey/MedSAM3_v1) on top of facebook/sam3. Same paradigm slot
+as biomedparse_adapter.py (text, no box, no support set) -- see HANDOFF.md.
 
-MedSAM3-v1 (github.com/Joey-S-Liu/MedSAM3) is a LoRA fine-tune of Meta's SAM3
-(facebook/sam3, loaded from HuggingFace). This adapter loads the LoRA weights
-already published by the paper authors (huggingface.co/lal-Joey/MedSAM3_v1) and
-runs inference as-is — NO further fine-tuning is performed by this project.
-Same "third foundation-model paradigm" slot as biomedparse_adapter.py
-(text-prompted, no box/point, no support set) — see HANDOFF.md.
+Vendored as git submodule (third_party/MedSAM3, not pip-installable); this
+adapter inlines third_party/MedSAM3/infer_sam.py's SAM3LoRAInference.predict()
+logic to operate on in-memory PIL slices. Upstream has no volumetric/NIfTI
+handling -- the slice loop is this project's addition.
 
-NOT pip-installable (no clean package boundary upstream, the repo is itself a
-fork of a generic SAM3-LoRA scaffold — see HANDOFF.md notes on MedSAM3): vendored
-as a pinned git submodule (third_party/MedSAM3) and imported by adding its root
-to sys.path, mirroring third_party/MedSAM3/infer_sam.py's own SAM3LoRAInference
-class (predict() method) — this adapter inlines that logic to operate on
-in-memory PIL slices instead of round-tripping through disk paths.
+CONTAMINATION: MedSAM3-v1's LoRA training set is unpublished/proprietary (arXiv
+2511.19046 §4.1). No CHAOS/AMOS/CirrMRI overlap found by grep, but this is an
+open/unverifiable risk, not confirmed-clean -- report as "leakage unknown", not
+"clean".
 
-2D-only upstream: infer_sam.py has no volumetric/NIfTI handling at all, so the
-slice loop below is entirely this project's addition (same pattern as
-biomedparse_adapter.volume_to_uint8 + per-slice loop, adapted since MedSAM3 has
-no native batched-volume forward pass like BiomedParse's).
-
-Contamination note: training set for MedSAM3-v1's LoRA weights is NOT published
-(658,094 images / 330 concepts, proprietary — see paper arXiv:2511.19046 §4.1).
-No CHAOS/AMOS/CirrMRI/organ-specific dataset names appear anywhere in the public
-repo or paper §4.1 dataset list (verified by grep across the cloned repo). This
-means, unlike MedSAM2/UniverSeg (confirmed CHAOS-trained) or BiomedParse
-(confirmed AMOS/TS-MRI-trained), there is currently NO EVIDENCE of leakage on
-any of this project's eval sets (CHAOS, AMOS, CirrMRI) — but also no evidence of
-cleanliness; this is an open/unverifiable risk, not a confirmed-clean result.
-Treat all three datasets as valid to try zero-shot, but flag results as
-"leakage status unknown" rather than "clean" in any writeup.
-
-License note: no LICENSE file in the upstream repo; setup.py claims Apache for
-the LoRA scaffold code, but the base facebook/sam3 weights (gated HF download)
-carry Meta's own separate license. Fine for local experimentation; flag before
+LICENSE: upstream has no LICENSE file; base facebook/sam3 weights (gated HF
+download) carry Meta's own license. Fine for local experimentation; check before
 redistributing weights or publishing results externally.
 """
 import os

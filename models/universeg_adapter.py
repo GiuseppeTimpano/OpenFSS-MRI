@@ -1,23 +1,14 @@
 """
-UniverSeg adapter for the foundation-model comparison (in-context FSS, deployable —
-no oracle box, just a support set: same information budget as the prototype baseline).
+UniverSeg adapter -- in-context FSS, deployable (support set only, no oracle box;
+same info budget as the prototype baseline). Fixed, frozen pretrained model: given
+a support set (images+masks) it cross-attends jointly to predict the target mask
+(not a metric/prototype match like ALPNet/QNet). Native input 128x128, 1-channel,
+min-max [0,1] (see repo's oasis.py).
 
-UniverSeg (ICCV 2023, arXiv 2304.06131, repo JJGO/UniverSeg) is a fixed pretrained
-model with NO per-task training or fine-tuning: it takes a target slice + a support
-set (images + binary labels) and predicts the target mask directly via cross-attention
-between target and support, jointly over the whole support set at once (not a
-metric/prototype match like ALPNet/QNet). Native input size is fixed at 128x128,
-1-channel, pixel values min-max normalized to [0,1] (see repo README + example_data/
-oasis.py: percentile/`nib` scan -> [0,1] float -> PIL bilinear resize to 128x128;
-labels resized nearest).
+Output is raw logits (no internal sigmoid) -> sigmoid then threshold 0.5.
 
-Output is raw logits (no sigmoid applied internally, see universeg/model.py
-`out_activation=None`) -> apply sigmoid then threshold at 0.5.
-
-`universeg` is vendored as a pinned git submodule (`third_party/UniverSeg`, same pattern
-as `third_party/MedSAM2`) and installed editable (`pip install -e third_party/UniverSeg`).
-It downloads/caches its pretrained weights via `torch.hub` on first use. Imported eagerly
-here since, unlike `sam2` (models/medsam2_adapter.py), it has no heavy optional deps.
+Vendored as git submodule (third_party/UniverSeg), installed editable; downloads
+weights via torch.hub on first use. Imported eagerly (no heavy optional deps).
 """
 import numpy as np
 import torch

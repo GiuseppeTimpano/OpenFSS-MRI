@@ -1,28 +1,15 @@
 """
-MedSAM3 zero-shot evaluation — volume-level, text-prompted, no box/support set.
-Fourth paradigm alongside eval_medsam2.py (box+propagation), eval_universeg.py
-(support set) and eval_biomedparse.py (text, no fine-tuning by us either), see
-models/medsam3_adapter.py docstring.
+MedSAM3 zero-shot eval -- volume-level, text-prompted, no box/support set (4th
+paradigm alongside eval_medsam2.py box+propagation, eval_universeg.py support-set,
+eval_biomedparse.py text; see models/medsam3_adapter.py).
 
-Reuses the identical scorer (eval_common.Scores) and per-organ + MEAN aggregation
-so its numbers sit in the same table as the other adapters / prototype baseline.
+Reuses eval_common.Scores / aggregate_and_print for the shared per-organ + MEAN
+table. Per organ: one text prompt (models.medsam3_adapter.PROMPT_TEMPLATES),
+slice-by-slice (no native volume forward pass), no oracle box, no agent refinement.
 
-Protocol (per organ, per query volume):
-  - crop to the FG depth range (same scoring stack as the other eval_*.py scripts).
-  - one short noun-phrase text prompt (models.medsam3_adapter.PROMPT_TEMPLATES),
-    looped slice-by-slice (upstream has no native volume forward pass) — no
-    oracle box, no support scan, no agent refinement loop (P1-style, single
-    forward pass per slice, matches the "without agent" arm of the original
-    paper's ablation).
-
-Image normalization: uint8 [0,255] percentile windowing (same convention as
-MedSAM2/BiomedParse's volume_to_uint8).
-
-IMPORTANT (contamination): MedSAM3-v1's training set is NOT published (proprietary,
-paper §4.1 lists only aggregate stats, no dataset names). No evidence of CHAOS/
-AMOS/CirrMRI overlap was found (verified by grep across the public repo), but this
-is NOT a confirmed-clean result either — treat leakage status as UNKNOWN, not
-verified, for all three datasets. Report this caveat alongside any numbers.
+CONTAMINATION: MedSAM3-v1's training set is unpublished/proprietary. No evidence
+of CHAOS/AMOS/CirrMRI overlap found, but leakage status is UNKNOWN, not
+confirmed-clean, for all three -- flag this in any writeup.
 """
 import argparse
 import csv

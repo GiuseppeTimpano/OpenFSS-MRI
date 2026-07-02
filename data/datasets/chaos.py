@@ -136,7 +136,7 @@ if __name__ == "__main__":
     tmp_dir  = Path('data/datasets/CHAOS/tmp')
     proc_dir = Path('data/datasets/CHAOS/processed')
 
-    script_path = Path(__file__).parent.parent / 'scripts' / 'dcm_to_nii.sh'
+    script_path = Path(__file__).parent.parent.parent / 'scripts' / 'data_prep' / 'dcm_to_nii.sh'
 
     # Step 1: DICOM → NIfTI images (tmp/images/T1DUAL/, tmp/images/T2SPIR/)
     subprocess.run(['bash', str(script_path), str(raw_dir), str(tmp_dir / 'images')], check=True)

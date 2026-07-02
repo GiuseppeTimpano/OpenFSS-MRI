@@ -1,21 +1,12 @@
 """
-Run all Setting-1 experiments.
+Runs all Setting-1 experiments: train on T1 or T2, test both T1 and T2 per trained
+model. Final table: rows = (model, train_domain, fold), cols = test T1 / test T2.
 
-Train on T1 or T2, then test on both T1 and T2 for each trained model.
-Final table: rows = (model, train_domain, fold), cols = test T1 / test T2.
+Each run's result is written as its own JSON under RESULTS_DIR (parallel-safe --
+no shared-file race); use --merge to collect them into one CSV.
 
-Results are written as individual JSON files under RESULTS_DIR so that
-parallel runs never race on the same file.  Use --merge to collect all
-JSON files into a single CSV.
-
-Usage:
-  python run_experiments.py                              # all experiments
-  python run_experiments.py --model qnet                 # only qnet
-  python run_experiments.py --train_domain T1            # only T1-trained
-  python run_experiments.py --fold 0                     # only fold 0
-  python run_experiments.py --skip_train                 # test only
-  python run_experiments.py --dry_run                    # print without executing
-  python run_experiments.py --merge                      # merge JSONs → CSV
+  PYTHONPATH=. python scripts/prototype/run_experiments.py [--model M]
+      [--train_domain T1|T2] [--fold N] [--skip_train] [--dry_run] [--merge]
 """
 
 import argparse

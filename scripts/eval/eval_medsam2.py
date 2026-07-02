@@ -1,25 +1,16 @@
 """
-UniverSeg zero-shot evaluation — in-context few-shot, deployable (NO oracle box).
+MedSAM2 zero-shot eval (P1) -- volume-level, oracle box + propagation. Promptable,
+not few-shot, so separate harness from scripts/prototype/test.py; reuses
+eval_common.Scores for the shared per-organ + MEAN table.
 
-UniverSeg is pretrained once and frozen (no per-task training/fine-tuning like
-ALPNet/QNet, no prompt/propagation like MedSAM2): given a support set (images +
-binary masks) it predicts the target mask directly via cross-attention, jointly over
-the whole support set at once. This is the direct "in-context" challenger to the
-prototype baseline (same axis: support-based-no-update) — see eval_common.Scores /
-aggregate_and_print reuse, so results land in the same table.
+Per organ: ORACLE box from GT (upper bound, NOT deployable -- deployable variant
+is P3) on the prompt slice(s), propagated both directions, scored on FG slices.
 
-Support protocol mirrors test.py exactly (same support pool, same supp_idx, same
-n_part FG slices evenly spaced in the support scan) for an apples-to-apples "same
-support budget" comparison against the prototype baseline. The one deliberate
-difference: test.py assigns ONE support slice per query depth-chunk (required by
-ALPNet/QNet's single-support forward contract); here all n_part support slices are
-fed jointly as one context set to EVERY query slice, since that is UniverSeg's native
-usage and squeezes more out of the same support scan (see models/universeg_adapter.py).
+prompt_mode: perslice (default, oracle box every FG slice) | key (one box on
+largest-area slice + propagation, MedSAM2's native usage).
 
-Image normalization: percentile clip + min-max to [0,1] float (see
-models/universeg_adapter.volume_to_unit_float), NOT the per-volume z-score of
-test._load_scan and NOT MedSAM2's uint8+ImageNet — a model requirement (UniverSeg
-expects [0,1] float, fixed 128x128 input).
+Normalization is MedSAM2's (uint8+512+ImageNet), not the baseline's z-score --
+see models/medsam2_adapter.py.
 """
 import argparse
 import csv
@@ -33,7 +24,7 @@ import yaml
 
 from data.dataloader.dataset import get_fold_ids
 from eval_common import Scores, aggregate_and_print
-from models.universeg_adapter import UniverSegSegmenter, volume_to_unit_float
+from models.medsam2_adapter import MedSAM2Segmenter, volume_to_uint8
 
 
 def _read_nii(path: str) -> np.ndarray:
@@ -41,28 +32,33 @@ def _read_nii(path: str) -> np.ndarray:
 
 
 def _load_raw(data_dir: str, sid: str) -> tuple[np.ndarray, np.ndarray]:
+    """Load RAW image (no z-score) + int label. MedSAM2 does its own [0,255] scaling."""
     img = _read_nii(os.path.join(data_dir, f'image_{sid}.nii.gz')).astype(np.float32)
     lbl = _read_nii(os.path.join(data_dir, f'label_{sid}.nii.gz')).astype(np.int32)
     return img, lbl
 
 
-def _support_indices(n_part: int, n_fg: int) -> np.ndarray:
-    """Identical to test.py: n_part slice indices evenly spaced across n_fg FG slices."""
-    if n_part == 1:
-        pcts = [0.5]
-    else:
-        half_part     = 1.0 / (n_part * 2)
-        part_interval = (1.0 - 1.0 / n_part) / (n_part - 1)
-        pcts = [half_part + part_interval * i for i in range(n_part)]
-    return (np.array(pcts) * n_fg).astype(int)
+def _bbox(mask2d: np.ndarray, margin: int, H: int, W: int) -> np.ndarray:
+    ys, xs = np.where(mask2d)
+    x0 = max(0, int(xs.min()) - margin); x1 = min(W - 1, int(xs.max()) + margin)
+    y0 = max(0, int(ys.min()) - margin); y1 = min(H - 1, int(ys.max()) + margin)
+    return np.array([x0, y0, x1, y1], dtype=np.float32)
 
 
-def _select_support_slices(supp_fg_idx: np.ndarray, n_part: int) -> np.ndarray:
-    return supp_fg_idx[_support_indices(n_part, len(supp_fg_idx))]
+def _build_boxes(fg_mask: np.ndarray, fg_idx: np.ndarray, z0: int,
+                 mode: str, margin: int) -> dict[int, np.ndarray]:
+    """{local_frame_idx -> oracle box}. Local idx = z - z0 (crop offset)."""
+    H, W = fg_mask.shape[1], fg_mask.shape[2]
+    if mode == 'key':
+        areas = fg_mask[fg_idx].reshape(len(fg_idx), -1).sum(1)
+        zc = int(fg_idx[int(np.argmax(areas))])
+        return {zc - z0: _bbox(fg_mask[zc], margin, H, W)}
+    return {int(z) - z0: _bbox(fg_mask[z], margin, H, W) for z in fg_idx}
 
 
-def evaluate(cfg: dict, target_data_dir: str | None, fold: int | None,
-             supp_idx: int, n_part: int, eval_labels: list[int] | None,
+def evaluate(cfg: dict, checkpoint: str, model_cfg: str,
+             target_data_dir: str | None, fold: int | None,
+             eval_labels: list[int] | None, prompt_mode: str, margin: int,
              device: str, save_dir: str | None, save_topk: int = 1) -> dict:
     data_cfg    = cfg['data']
     data_dir    = data_cfg['data_dir']
@@ -71,29 +67,21 @@ def evaluate(cfg: dict, target_data_dir: str | None, fold: int | None,
     if eval_labels is None:
         eval_labels = list(range(1, len(label_names)))
 
-    _, test_ids = get_fold_ids(data_dir, fold if fold is not None else data_cfg.get('fold', 0), n_folds)
-    if not test_ids:
-        raise ValueError(f'No test scans for fold {fold}')
-    supp_sid = test_ids[supp_idx]
-
     query_data_dir = target_data_dir or data_dir
     if target_data_dir:
         paths = sorted(glob.glob(os.path.join(target_data_dir, 'image_*.nii.gz')))
         query_sids = [os.path.basename(p).replace('image_', '').replace('.nii.gz', '')
                       for p in paths]
     else:
-        query_sids = [sid for sid in test_ids if sid != supp_sid]
+        _, query_sids = get_fold_ids(data_dir, fold if fold is not None else 0, n_folds)
     if not query_sids:
         raise ValueError(f'No query scans found in {query_data_dir}')
 
-    print(f'UniverSeg in-context | support: {supp_sid} | queries={len(query_sids)} '
-          f'| n_part={n_part} | eval_labels={eval_labels}')
+    print(f'MedSAM2 zero-shot | queries={len(query_sids)} | prompt={prompt_mode} '
+          f'| margin={margin} | eval_labels={eval_labels}')
     print(f'query dir: {query_data_dir}')
 
-    supp_img, supp_lbl = _load_raw(data_dir, supp_sid)
-    supp_img01 = volume_to_unit_float(supp_img)
-
-    seg = UniverSegSegmenter(device=device)
+    seg = MedSAM2Segmenter(checkpoint, model_cfg, device=device)
 
     if save_dir:
         os.makedirs(save_dir, exist_ok=True)
@@ -105,17 +93,6 @@ def evaluate(cfg: dict, target_data_dir: str | None, fold: int | None,
     for label_val in eval_labels:
         label_name = label_names[label_val] if label_val < len(label_names) else str(label_val)
         print(f'\n== Class: {label_name} (label={label_val}) ==')
-
-        supp_fg_mask = (supp_lbl == label_val).astype(np.uint8)
-        supp_fg_idx  = np.where(supp_fg_mask.any(axis=(1, 2)))[0]
-        if len(supp_fg_idx) == 0:
-            print(f'  [SKIP] support {supp_sid} has no FG for {label_name}')
-            continue
-
-        sel_z = _select_support_slices(supp_fg_idx, n_part)
-        s_imgs  = supp_img01[sel_z]
-        s_masks = supp_fg_mask[sel_z]
-
         scores = Scores()
         scan_ids: list[str] = []
         # kept only for this class's loop, discarded once best/worst are written out
@@ -133,9 +110,10 @@ def evaluate(cfg: dict, target_data_dir: str | None, fold: int | None,
                 continue
 
             z0, z1 = int(fg_idx.min()), int(fg_idx.max())
-            q_vol01 = volume_to_unit_float(q_img)[z0:z1 + 1]
-            seg_crop = seg.segment_volume(q_vol01, s_imgs, s_masks)   # [z1-z0+1,H,W]
+            vol_u8 = volume_to_uint8(q_img)[z0:z1 + 1]          # window full vol, then crop
+            boxes  = _build_boxes(q_fg, fg_idx, z0, prompt_mode, margin)
 
+            seg_crop = seg.segment_volume(vol_u8, boxes)        # [z1-z0+1,H,W]
             pred_full = np.zeros_like(q_fg)
             pred_full[z0:z1 + 1] = seg_crop
 
@@ -202,13 +180,19 @@ def evaluate(cfg: dict, target_data_dir: str | None, fold: int | None,
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--config',          type=str, default='configs/resnet.yaml')
+    parser.add_argument('--medsam2_ckpt',    type=str, required=True,
+                        help='MedSAM2 checkpoint (.pt)')
+    parser.add_argument('--sam2_cfg',        type=str, required=True,
+                        help='SAM2.1 model config (e.g. sam2.1_hiera_t512.yaml)')
     parser.add_argument('--target_data_dir', type=str, default=None,
                         help='query dir (processed image_*/label_*); default = config data_dir')
-    parser.add_argument('--fold',            type=int, default=None)
-    parser.add_argument('--supp_idx',        type=int, default=0)
-    parser.add_argument('--n_part',          type=int, default=3,
-                        help='number of support FG slices (same default as test.py)')
+    parser.add_argument('--fold',            type=int, default=None,
+                        help='only used when --target_data_dir is not given')
     parser.add_argument('--test_label',      type=int, nargs='+', default=None)
+    parser.add_argument('--prompt_mode',     type=str, default='perslice',
+                        choices=['perslice', 'key'])
+    parser.add_argument('--margin',          type=int, default=3,
+                        help='oracle box margin in pixels')
     parser.add_argument('--save_dir',        type=str, default=None,
                         help='where to write scores.csv/summary.csv and best/worst volumes')
     parser.add_argument('--save_topk',       type=int, default=1,
@@ -222,11 +206,13 @@ if __name__ == '__main__':
 
     evaluate(
         cfg_file,
+        checkpoint      = args.medsam2_ckpt,
+        model_cfg       = args.sam2_cfg,
         target_data_dir = args.target_data_dir,
         fold            = args.fold,
-        supp_idx        = args.supp_idx,
-        n_part          = args.n_part,
         eval_labels     = args.test_label,
+        prompt_mode     = args.prompt_mode,
+        margin          = args.margin,
         device          = args.device,
         save_dir        = args.save_dir,
         save_topk       = args.save_topk,

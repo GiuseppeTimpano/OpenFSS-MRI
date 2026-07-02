@@ -1,23 +1,15 @@
 """
-BiomedParse zero-shot evaluation (P1-style) — volume-level, text-prompted, no box/
-support set. Third paradigm alongside eval_medsam2.py (box+propagation) and
-eval_universeg.py (support set), see models/biomedparse_adapter.py docstring.
+UniverSeg zero-shot eval -- in-context few-shot, deployable (NO oracle box). Frozen
+pretrained model, direct challenger to the prototype baseline on the same
+"support-based, no update" axis; reuses eval_common for the shared table.
 
-Reuses the identical scorer (eval_common.Scores) and per-organ + MEAN aggregation
-so its numbers sit in the same table as the other adapters / prototype baseline.
+Support protocol mirrors scripts/prototype/test.py (same pool/supp_idx/n_part),
+except ALL n_part support slices are fed jointly to EVERY query slice (UniverSeg's
+native usage), vs. test.py's one-support-slice-per-depth-chunk (ALPNet/QNet's
+contract).
 
-Protocol (per organ, per query volume):
-  - crop to the FG depth range (same scoring stack as the other eval_*.py scripts).
-  - one text prompt for the whole volume (models.biomedparse_adapter.PROMPT_TEMPLATES),
-    one forward pass, no oracle box, no support scan — this is BiomedParse's native
-    deployable usage (fully zero-shot given the text prompt).
-
-Image normalization: uint8 [0,255] percentile windowing (same convention as MedSAM2's
-volume_to_uint8), NOT the z-score of the baseline nor UniverSeg's [0,1] float — a
-model requirement, see models/biomedparse_adapter.py.
-
-IMPORTANT (contamination): BiomedParse v2 is trained on AMOS + TotalSegmentator-MRI
-(see HANDOFF.md). Only run this on datasets confirmed clean for it (CirrMRI).
+Normalization: percentile-clip + min-max [0,1] float (models/universeg_adapter.py
+volume_to_unit_float) -- not the baseline's z-score, not MedSAM2's uint8+ImageNet.
 """
 import argparse
 import csv
@@ -31,7 +23,7 @@ import yaml
 
 from data.dataloader.dataset import get_fold_ids
 from eval_common import Scores, aggregate_and_print
-from models.biomedparse_adapter import BiomedParseSegmenter, PROMPT_TEMPLATES, volume_to_uint8
+from models.universeg_adapter import UniverSegSegmenter, volume_to_unit_float
 
 
 def _read_nii(path: str) -> np.ndarray:
@@ -44,10 +36,24 @@ def _load_raw(data_dir: str, sid: str) -> tuple[np.ndarray, np.ndarray]:
     return img, lbl
 
 
-def evaluate(cfg: dict, checkpoint: str | None, target_data_dir: str | None,
-             fold: int | None, eval_labels: list[int] | None,
-             device: str, save_dir: str | None, limit: int | None = None,
-             save_topk: int = 1) -> dict:
+def _support_indices(n_part: int, n_fg: int) -> np.ndarray:
+    """Identical to test.py: n_part slice indices evenly spaced across n_fg FG slices."""
+    if n_part == 1:
+        pcts = [0.5]
+    else:
+        half_part     = 1.0 / (n_part * 2)
+        part_interval = (1.0 - 1.0 / n_part) / (n_part - 1)
+        pcts = [half_part + part_interval * i for i in range(n_part)]
+    return (np.array(pcts) * n_fg).astype(int)
+
+
+def _select_support_slices(supp_fg_idx: np.ndarray, n_part: int) -> np.ndarray:
+    return supp_fg_idx[_support_indices(n_part, len(supp_fg_idx))]
+
+
+def evaluate(cfg: dict, target_data_dir: str | None, fold: int | None,
+             supp_idx: int, n_part: int, eval_labels: list[int] | None,
+             device: str, save_dir: str | None, save_topk: int = 1) -> dict:
     data_cfg    = cfg['data']
     data_dir    = data_cfg['data_dir']
     n_folds     = data_cfg['n_folds']
@@ -55,23 +61,29 @@ def evaluate(cfg: dict, checkpoint: str | None, target_data_dir: str | None,
     if eval_labels is None:
         eval_labels = list(range(1, len(label_names)))
 
+    _, test_ids = get_fold_ids(data_dir, fold if fold is not None else data_cfg.get('fold', 0), n_folds)
+    if not test_ids:
+        raise ValueError(f'No test scans for fold {fold}')
+    supp_sid = test_ids[supp_idx]
+
     query_data_dir = target_data_dir or data_dir
     if target_data_dir:
         paths = sorted(glob.glob(os.path.join(target_data_dir, 'image_*.nii.gz')))
         query_sids = [os.path.basename(p).replace('image_', '').replace('.nii.gz', '')
                       for p in paths]
     else:
-        _, query_sids = get_fold_ids(data_dir, fold if fold is not None else 0, n_folds)
+        query_sids = [sid for sid in test_ids if sid != supp_sid]
     if not query_sids:
         raise ValueError(f'No query scans found in {query_data_dir}')
-    if limit:
-        query_sids = query_sids[:limit]
 
-    print(f'BiomedParse zero-shot (text prompt) | queries={len(query_sids)} '
-          f'| eval_labels={eval_labels}')
+    print(f'UniverSeg in-context | support: {supp_sid} | queries={len(query_sids)} '
+          f'| n_part={n_part} | eval_labels={eval_labels}')
     print(f'query dir: {query_data_dir}')
 
-    seg = BiomedParseSegmenter(checkpoint, device=device)
+    supp_img, supp_lbl = _load_raw(data_dir, supp_sid)
+    supp_img01 = volume_to_unit_float(supp_img)
+
+    seg = UniverSegSegmenter(device=device)
 
     if save_dir:
         os.makedirs(save_dir, exist_ok=True)
@@ -82,11 +94,18 @@ def evaluate(cfg: dict, checkpoint: str | None, target_data_dir: str | None,
 
     for label_val in eval_labels:
         label_name = label_names[label_val] if label_val < len(label_names) else str(label_val)
-        prompt = PROMPT_TEMPLATES.get(label_name)
-        if prompt is None:
-            print(f'\n== Class: {label_name} (label={label_val}) == [SKIP] no prompt template')
+        print(f'\n== Class: {label_name} (label={label_val}) ==')
+
+        supp_fg_mask = (supp_lbl == label_val).astype(np.uint8)
+        supp_fg_idx  = np.where(supp_fg_mask.any(axis=(1, 2)))[0]
+        if len(supp_fg_idx) == 0:
+            print(f'  [SKIP] support {supp_sid} has no FG for {label_name}')
             continue
-        print(f'\n== Class: {label_name} (label={label_val}) == prompt="{prompt}"')
+
+        sel_z = _select_support_slices(supp_fg_idx, n_part)
+        s_imgs  = supp_img01[sel_z]
+        s_masks = supp_fg_mask[sel_z]
+
         scores = Scores()
         scan_ids: list[str] = []
         # kept only for this class's loop, discarded once best/worst are written out
@@ -104,9 +123,9 @@ def evaluate(cfg: dict, checkpoint: str | None, target_data_dir: str | None,
                 continue
 
             z0, z1 = int(fg_idx.min()), int(fg_idx.max())
-            vol_u8 = volume_to_uint8(q_img)[z0:z1 + 1]          # window full vol, then crop
+            q_vol01 = volume_to_unit_float(q_img)[z0:z1 + 1]
+            seg_crop = seg.segment_volume(q_vol01, s_imgs, s_masks)   # [z1-z0+1,H,W]
 
-            seg_crop = seg.segment_volume(vol_u8, prompt)        # [z1-z0+1,H,W]
             pred_full = np.zeros_like(q_fg)
             pred_full[z0:z1 + 1] = seg_crop
 
@@ -173,15 +192,13 @@ def evaluate(cfg: dict, checkpoint: str | None, target_data_dir: str | None,
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--config',          type=str, default='configs/resnet.yaml')
-    parser.add_argument('--biomedparse_ckpt', type=str, default=None,
-                        help='local biomedparse_v2.ckpt; default = download from HF hub')
     parser.add_argument('--target_data_dir', type=str, default=None,
                         help='query dir (processed image_*/label_*); default = config data_dir')
-    parser.add_argument('--fold',            type=int, default=None,
-                        help='only used when --target_data_dir is not given')
+    parser.add_argument('--fold',            type=int, default=None)
+    parser.add_argument('--supp_idx',        type=int, default=0)
+    parser.add_argument('--n_part',          type=int, default=3,
+                        help='number of support FG slices (same default as test.py)')
     parser.add_argument('--test_label',      type=int, nargs='+', default=None)
-    parser.add_argument('--limit',           type=int, default=None,
-                        help='cap number of query scans (smoke test)')
     parser.add_argument('--save_dir',        type=str, default=None,
                         help='where to write scores.csv/summary.csv and best/worst volumes')
     parser.add_argument('--save_topk',       type=int, default=1,
@@ -195,12 +212,12 @@ if __name__ == '__main__':
 
     evaluate(
         cfg_file,
-        checkpoint      = args.biomedparse_ckpt,
         target_data_dir = args.target_data_dir,
         fold            = args.fold,
+        supp_idx        = args.supp_idx,
+        n_part          = args.n_part,
         eval_labels     = args.test_label,
         device          = args.device,
         save_dir        = args.save_dir,
-        limit           = args.limit,
         save_topk       = args.save_topk,
     )

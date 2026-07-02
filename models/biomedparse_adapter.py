@@ -1,36 +1,17 @@
 """
-BiomedParse (v2) adapter for the foundation-model comparison (text-prompted, 3D).
+BiomedParse (v2) adapter -- text-prompted, 3D, no box/support set (third paradigm
+alongside MedSAM2 box-prompt and UniverSeg/prototype support-set, see HANDOFF.md).
 
-BiomedParse v2 (Nature Methods + BoltzFormer arch, repo microsoft/BiomedParse) is a
-text-prompted foundation segmenter: given a 3D volume + a free-text description of
-the target organ it predicts a per-slice mask end-to-end. No box/point prompt, no
-support set — the third paradigm alongside prompt-box (MedSAM2) and support-set
-(UniverSeg/prototype), see HANDOFF.md.
+Vendored as git submodule (third_party/BiomedParse, not pip-installable); imported
+via sys.path + hydra config-dir compose. Checkpoint downloaded lazily from HF
+(microsoft/BiomedParse) unless a local path is passed.
 
-NOT pip-installable (no setup.py/pyproject upstream): vendored as a pinned git
-submodule (`third_party/BiomedParse`) and imported by adding its root to sys.path +
-hydra config-dir compose, mirroring `third_party/BiomedParse/inference.py`'s own
-CLI entrypoint (the "Inference 3D Examples" section of the upstream README).
+Input: utils.process_input(vol, 512) (pad+resize, model's own normalization, NOT
+z-score/ImageNet). We call with exactly one class per volume, so plain
+sigmoid>0.5 is equivalent to upstream's merge_multiclass_masks for N=1.
 
-Checkpoint: HuggingFace `microsoft/BiomedParse` (`biomedparse_v2.ckpt`), downloaded
-lazily via `huggingface_hub.hf_hub_download` on first use (large, cached under the
-default HF cache dir) unless a local path is passed explicitly.
-
-Input contract (see third_party/BiomedParse/inference.py `main()` and utils.py):
-  volume -> utils.process_input(vol, 512): pads to square (in-plane) + bicubic
-  resize to 512x512, cast to int (the model does its own internal normalization,
-  NOT the z-score/ImageNet normalization the other adapters use).
-  text prompt -> one descriptive sentence for the target organ; we always call with
-  exactly ONE class (one organ at a time, like the other adapters' per-label loop),
-  so no "[SEP]" multi-prompt joining / merge_multiclass_masks argmax is needed — a
-  simple sigmoid>0.5 threshold on the single class channel is equivalent (verified
-  against inference.py's own merge_multiclass_masks: for N=1 it argmaxes against a
-  constant 0.5 background channel, which is the same threshold).
-
-Contamination note: v2 pretraining (CVPR-BiomedSegFM, junma/CVPR-BiomedSegFM)
-includes AMOS and the TotalSegmentator MRI split — see HANDOFF.md contamination
-matrix. NOT clean on CHAOS/AMOS/TS-MRI; only usable on datasets released after that
-training corpus was frozen (CirrMRI, per the project's existing timeline argument).
+CONTAMINATION: v2 pretraining includes AMOS + TotalSegmentator-MRI (HANDOFF.md
+matrix). Not clean on CHAOS/AMOS/TS-MRI; only CirrMRI is usable here.
 """
 import os
 import sys

@@ -1,18 +1,12 @@
 """
 Single-slice smoke test for the MedSAM3 agent loop (models/medsam3_agent_adapter.py).
-NOT a full eval -- one scan, one FG slice, one organ. Build eval_medsam3_agent.py
-(mirroring eval_medsam3.py) only after this works and LLM cost/latency is known.
+NOT a full eval -- one scan, one slice, one organ; build eval_medsam3_agent.py
+(mirroring eval_medsam3.py) once this works and LLM cost/latency is known.
 
 Example:
-  PYTHONPATH=. .venv/bin/python scripts/demo_medsam3_agent.py \\
+  PYTHONPATH=. .venv/bin/python scripts/agent/demo_medsam3_agent.py \\
       --target_data_dir data/datasets/CIRRMR/processed/T1 --test_label 1 \\
       --llm_model gpt-4o   # needs OPENAI_API_KEY
-
-  # self-hosted OpenAI-compatible server:
-  PYTHONPATH=. .venv/bin/python scripts/demo_medsam3_agent.py \\
-      --target_data_dir data/datasets/CHAOS/processed/T1 --test_label 1 \\
-      --llm_model meta-llama/Llama-4-Maverick-17B-128E-Instruct-FP8 \\
-      --llm_server_url http://localhost:8000/v1
 """
 import argparse
 import glob

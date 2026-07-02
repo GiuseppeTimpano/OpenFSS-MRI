@@ -19,7 +19,7 @@ run() {
   local out_dir="$SAVE_DIR/$out"
   mkdir -p "$out_dir"
   echo "=== MedSAM2: $dataset_dir ($seq) labels: $* ==="
-  PYTHONPATH=. $PYTHON eval_medsam2.py \
+  PYTHONPATH=. $PYTHON scripts/eval/eval_medsam2.py \
     --medsam2_ckpt "$CKPT" \
     --sam2_cfg "$SAM2_CFG" \
     --target_data_dir "$dataset_dir" \

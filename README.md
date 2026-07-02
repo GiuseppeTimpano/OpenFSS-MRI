@@ -19,7 +19,7 @@ python data/datasets/chaos.py
 Edit `configs/default.yaml` to set the data directory, fold, model, and settings, then run:
 
 ```bash
-python train.py --config configs/default.yaml
+PYTHONPATH=. python scripts/prototype/train.py --config configs/default.yaml
 ```
 
 ---
@@ -27,12 +27,12 @@ python train.py --config configs/default.yaml
 ## 3. Testing
 
 ```bash
-python test.py --config configs/default.yaml --checkpoint path/to/ckpt.pth
+PYTHONPATH=. python scripts/prototype/test.py --config configs/default.yaml --checkpoint path/to/ckpt.pth
 ```
 
 For cross-domain testing (e.g. trained on T1, test on T2):
 
 ```bash
-python test.py --config configs/default.yaml --checkpoint path/to/ckpt.pth \
+PYTHONPATH=. python scripts/prototype/test.py --config configs/default.yaml --checkpoint path/to/ckpt.pth \
     --target_data_dir data/datasets/CHAOS/processed/T2
 ```

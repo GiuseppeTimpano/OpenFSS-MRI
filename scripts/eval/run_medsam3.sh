@@ -1,16 +1,16 @@
 #!/usr/bin/env bash
-# Plain pretrained SAM3 baseline (--no_lora): NO MedSAM3-v1 LoRA weights applied.
-# Same datasets/labels as run_medsam3.sh -- diagnostic to tell apart
-# "grounding head can't localize small organs" (architectural, would show up
-# here too) from "LoRA weights specifically hurt RK/LK/SPLEEN"
-# (training-data/overfit, would NOT show up here) -- see models/medsam3_adapter.py
-# build_medsam3_lora_model() docstring.
+# Full MedSAM3 eval (zero-shot, no fine-tuning): CirrMRI (LIVER) + CHAOS
+# (LIVER, RK, LK, SPLEEN), T1+T2.
+# Leakage status vs. MedSAM3-v1's (unpublished) training set is UNKNOWN for ALL
+# datasets here -- no evidence of overlap was found (see models/medsam3_adapter.py),
+# but this is NOT a confirmed-clean result like CirrMRI is for MedSAM2/UniverSeg.
+# Flag this caveat in any writeup of these numbers.
 # No --limit -> full dataset. Adjust DEVICE/SAVE_DIR as needed.
 set -euo pipefail
 
 PYTHON=.venv/bin/python
 DEVICE="${DEVICE:-cuda}"
-SAVE_DIR="${SAVE_DIR:-results/medsam3_nolora}"
+SAVE_DIR="${SAVE_DIR:-results/medsam3}"
 SAVE_TOPK="${SAVE_TOPK:-1}"   # per class: N best + N worst nii.gz saved; 0 = CSV only
 
 run() {
@@ -18,14 +18,13 @@ run() {
   shift 3
   local out_dir="$SAVE_DIR/$out"
   mkdir -p "$out_dir"
-  echo "=== MedSAM3 (no LoRA, plain SAM3): $dataset_dir ($seq) labels: $* ==="
-  PYTHONPATH=. $PYTHON eval_medsam3.py \
+  echo "=== MedSAM3: $dataset_dir ($seq) labels: $* ==="
+  PYTHONPATH=. $PYTHON scripts/eval/eval_medsam3.py \
     --target_data_dir "$dataset_dir" \
     --test_label "$@" \
     --device "$DEVICE" \
     --save_dir "$out_dir" \
     --save_topk "$SAVE_TOPK" \
-    --no_lora \
     2>&1 | tee "$out_dir/run.log"
 }
 
