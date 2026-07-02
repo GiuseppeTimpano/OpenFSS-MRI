@@ -23,6 +23,7 @@ data/datasets/AMOS/
 
 evaluation_util/
 weights/
+results/
 
 # generated / local docs
 handoff/
