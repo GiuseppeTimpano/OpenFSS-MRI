@@ -7,3 +7,6 @@
 [submodule "third_party/BiomedParse"]
 	path = third_party/BiomedParse
 	url = https://github.com/microsoft/BiomedParse.git
+[submodule "third_party/MedSAM3"]
+	path = third_party/MedSAM3
+	url = https://github.com/Joey-S-Liu/MedSAM3.git

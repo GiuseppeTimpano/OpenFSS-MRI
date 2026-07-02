@@ -13,7 +13,17 @@ rich
 matplotlib
 termcolor
 
-# BiomedParse (third_party/BiomedParse, not pip-installable upstream)
+# MedSAM2 (third_party/MedSAM2, editable install — provides the `sam2` package
+# used lazily by models/medsam2_adapter.py; has compiled CUDA extensions, needs a
+# working torch+CUDA toolchain at install time)
+-e third_party/MedSAM2
+
+# UniverSeg (third_party/UniverSeg, editable install — provides the `universeg`
+# package used lazily by models/universeg_adapter.py)
+-e third_party/UniverSeg
+
+# BiomedParse (third_party/BiomedParse, not pip-installable upstream — imported via
+# sys.path insert, see models/biomedparse_adapter.py)
 hydra-core
 fvcore
 timm
@@ -23,3 +33,18 @@ huggingface_hub
 # detectron2 needs a separate source build (CPU-only OK, no CUDA op actually used
 # at runtime — see HANDOFF.md BiomedParse adapter notes):
 #   pip install --no-build-isolation 'git+https://github.com/facebookresearch/detectron2.git'
+
+# MedSAM3 (third_party/MedSAM3, not pip-installable upstream — imported via
+# sys.path insert, see models/medsam3_adapter.py). hydra-core/transformers/
+# huggingface_hub/matplotlib/scipy/scikit-image already covered above.
+opencv-python
+pycocotools
+omegaconf
+einops
+open-clip-torch
+ftfy
+regex
+torchmetrics
+iopath
+# openai only needed for the agent loop (sam3/agent/), not for zero-shot infer_sam.py:
+openai
