@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Full UniverSeg eval (in-context, deployable): CirrMRI (LIVER) + CHAOS (LIVER, RK, LK, SPLEEN), T1+T2.
+# Full UniverSeg eval (in-context, deployable): CirrMRI (LIVER), T1+T2.
+# CHAOS excluded: UniverSeg was trained on CHAOS, so it's not a held-out set for this model.
 # No --limit -> full dataset (support scan comes from the fold's own test split).
 set -euo pipefail
 
@@ -30,9 +31,5 @@ run() {
 # CirrMRI: liver only
 run data/datasets/CIRRMR/processed/T1 T1 cirrmri_t1 1
 run data/datasets/CIRRMR/processed/T2 T2 cirrmri_t2 1
-
-# CHAOS: liver + kidneys + spleen
-run data/datasets/CHAOS/processed/T1 T1 chaos_t1 1 2 3 4
-run data/datasets/CHAOS/processed/T2 T2 chaos_t2 1 2 3 4
 
 echo "Done. Logs in $SAVE_DIR/"
