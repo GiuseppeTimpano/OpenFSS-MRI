@@ -67,40 +67,35 @@ def volume_to_uint8(vol: np.ndarray, p_low: float = 0.5, p_high: float = 99.5) -
     return v.astype(np.uint8)
 
 
-class MedSAM3Segmenter:
-    """Volume-level MedSAM3 wrapper: one text prompt -> per-slice mask, looping
-    the upstream 2D-only LoRA model slice-by-slice (no native volume forward
-    pass, unlike BiomedParse)."""
+def build_medsam3_lora_model(config_path: str | None, weights_path: str | None,
+                              device: torch.device, use_lora: bool = True):
+    """Build SAM3 + apply the published MedSAM3-v1 LoRA weights (zero-shot,
+    no fine-tuning by this project). Shared by MedSAM3Segmenter (single
+    forward pass) and models.medsam3_agent_adapter.MedSAM3AgentSegmenter
+    (same weights, driven through the multi-round agent loop instead) so the
+    two never drift out of sync on how the LoRA model is built.
 
-    def __init__(
-        self,
-        config_path: str | None = None,
-        weights_path: str | None = None,
-        resolution: int = 1008,
-        detection_threshold: float = 0.5,
-        nms_iou_threshold: float = 0.5,
-        device: str = "cuda",
-    ):
-        if _REPO_ROOT not in sys.path:
-            sys.path.insert(0, _REPO_ROOT)
+    use_lora=False skips the MedSAM3-v1 LoRA entirely and returns plain
+    pretrained facebook/sam3 (base HF weights, load_from_HF=True below) --
+    baseline to tell apart "grounding head can't localize small organs"
+    (architectural) from "LoRA weights specifically hurt kidney/spleen"
+    (training-data/overfit) when the LoRA'd model's RK/LK/SPLEEN dice is bad
+    even on scans it may have trained on (see results/medsam3/*/scores.csv)."""
+    if _REPO_ROOT not in sys.path:
+        sys.path.insert(0, _REPO_ROOT)
 
-        from sam3.model_builder import build_sam3_image_model
-        from sam3.train.data.sam3_image_dataset import (
-            Datapoint, Image as SAMImage, FindQueryLoaded, InferenceMetadata,
-        )
-        from sam3.train.data.collator import collate_fn_api
-        from sam3.model.utils.misc import copy_data_to_device
-        from sam3.train.transforms.basic_for_api import (
-            ComposeAPI, RandomResizeAPI, ToTensorAPI, NormalizeAPI,
-        )
+    from sam3.model_builder import build_sam3_image_model
+
+    model = build_sam3_image_model(
+        device=device.type,
+        compile=False,
+        load_from_HF=True,
+        bpe_path=os.path.join(_REPO_ROOT, "sam3/assets/bpe_simple_vocab_16e6.txt.gz"),
+        eval_mode=True,
+    )
+
+    if use_lora:
         from lora_layers import LoRAConfig, apply_lora_to_model, load_lora_weights
-
-        self._SAMImage = SAMImage
-        self._FindQueryLoaded = FindQueryLoaded
-        self._InferenceMetadata = InferenceMetadata
-        self._Datapoint = Datapoint
-        self._collate_fn_api = collate_fn_api
-        self._copy_data_to_device = copy_data_to_device
 
         if config_path is None:
             config_path = os.path.join(_REPO_ROOT, 'configs', 'full_lora_config.yaml')
@@ -114,18 +109,6 @@ class MedSAM3Segmenter:
             weights_path = hf_hub_download(
                 repo_id='lal-Joey/MedSAM3_v1', filename='best_lora_weights.pt')
 
-        self.resolution = resolution
-        self.detection_threshold = detection_threshold
-        self.nms_iou_threshold = nms_iou_threshold
-        self.device = torch.device(device if torch.cuda.is_available() else "cpu")
-
-        self.model = build_sam3_image_model(
-            device=self.device.type,
-            compile=False,
-            load_from_HF=True,
-            bpe_path=os.path.join(_REPO_ROOT, "sam3/assets/bpe_simple_vocab_16e6.txt.gz"),
-            eval_mode=True,
-        )
         lora_cfg = config["lora"]
         lora_config = LoRAConfig(
             rank=lora_cfg["rank"],
@@ -139,10 +122,54 @@ class MedSAM3Segmenter:
             apply_to_detr_decoder=lora_cfg["apply_to_detr_decoder"],
             apply_to_mask_decoder=lora_cfg["apply_to_mask_decoder"],
         )
-        self.model = apply_lora_to_model(self.model, lora_config)
-        load_lora_weights(self.model, weights_path)
-        self.model.to(self.device)
-        self.model.eval()
+        model = apply_lora_to_model(model, lora_config)
+        load_lora_weights(model, weights_path)
+
+    model.to(device)
+    model.eval()
+    return model
+
+
+class MedSAM3Segmenter:
+    """Volume-level MedSAM3 wrapper: one text prompt -> per-slice mask, looping
+    the upstream 2D-only LoRA model slice-by-slice (no native volume forward
+    pass, unlike BiomedParse)."""
+
+    def __init__(
+        self,
+        config_path: str | None = None,
+        weights_path: str | None = None,
+        resolution: int = 1008,
+        detection_threshold: float = 0.5,
+        nms_iou_threshold: float = 0.5,
+        device: str = "cuda",
+        use_lora: bool = False,
+    ):
+        if _REPO_ROOT not in sys.path:
+            sys.path.insert(0, _REPO_ROOT)
+
+        from sam3.train.data.sam3_image_dataset import (
+            Datapoint, Image as SAMImage, FindQueryLoaded, InferenceMetadata,
+        )
+        from sam3.train.data.collator import collate_fn_api
+        from sam3.model.utils.misc import copy_data_to_device
+        from sam3.train.transforms.basic_for_api import (
+            ComposeAPI, RandomResizeAPI, ToTensorAPI, NormalizeAPI,
+        )
+
+        self._SAMImage = SAMImage
+        self._FindQueryLoaded = FindQueryLoaded
+        self._InferenceMetadata = InferenceMetadata
+        self._Datapoint = Datapoint
+        self._collate_fn_api = collate_fn_api
+        self._copy_data_to_device = copy_data_to_device
+
+        self.resolution = resolution
+        self.detection_threshold = detection_threshold
+        self.nms_iou_threshold = nms_iou_threshold
+        self.device = torch.device(device if torch.cuda.is_available() else "cpu")
+
+        self.model = build_medsam3_lora_model(config_path, weights_path, self.device, use_lora=use_lora)
 
         self.transform = ComposeAPI(transforms=[
             RandomResizeAPI(sizes=resolution, max_size=resolution,

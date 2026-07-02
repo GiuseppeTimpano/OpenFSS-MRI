@@ -52,7 +52,7 @@ def _load_raw(data_dir: str, sid: str) -> tuple[np.ndarray, np.ndarray]:
 def evaluate(cfg: dict, config_path: str | None, weights_path: str | None,
              target_data_dir: str | None, fold: int | None,
              eval_labels: list[int] | None, device: str, save_dir: str | None,
-             limit: int | None = None, save_topk: int = 1) -> dict:
+             limit: int | None = None, save_topk: int = 1, use_lora: bool = True) -> dict:
     data_cfg    = cfg['data']
     data_dir    = data_cfg['data_dir']
     n_folds     = data_cfg['n_folds']
@@ -72,13 +72,14 @@ def evaluate(cfg: dict, config_path: str | None, weights_path: str | None,
     if limit:
         query_sids = query_sids[:limit]
 
-    print(f'MedSAM3 zero-shot (text prompt, no fine-tuning) | queries={len(query_sids)} '
-          f'| eval_labels={eval_labels}')
+    tag = 'MedSAM3-v1 LoRA (text prompt)' if use_lora else 'plain SAM3, NO medical LoRA (text prompt)'
+    print(f'{tag} | queries={len(query_sids)} | eval_labels={eval_labels}')
     print(f'query dir: {query_data_dir}')
-    print('NOTE: leakage status vs. MedSAM3-v1 training set is UNKNOWN (not published), '
-          'not confirmed clean.')
+    if use_lora:
+        print('NOTE: leakage status vs. MedSAM3-v1 training set is UNKNOWN (not published), '
+              'not confirmed clean.')
 
-    seg = MedSAM3Segmenter(config_path, weights_path, device=device)
+    seg = MedSAM3Segmenter(config_path, weights_path, device=device, use_lora=use_lora)
 
     if save_dir:
         os.makedirs(save_dir, exist_ok=True)
@@ -196,6 +197,9 @@ if __name__ == '__main__':
                         help='per class, save nii.gz for N best + N worst scans (0 = CSV only, no volumes)')
     parser.add_argument('--device',          type=str,
                         default='cuda' if torch.cuda.is_available() else 'cpu')
+    parser.add_argument('--no_lora',         action='store_true',
+                        help='skip MedSAM3-v1 LoRA weights, run plain pretrained SAM3 '
+                             '(baseline to isolate LoRA-training effects from grounding-head limits)')
     args = parser.parse_args()
 
     with open(args.config) as f:
@@ -212,4 +216,5 @@ if __name__ == '__main__':
         save_dir        = args.save_dir,
         limit           = args.limit,
         save_topk       = args.save_topk,
+        use_lora        = not args.no_lora,
     )
