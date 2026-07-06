@@ -1,0 +1,6 @@
+# MRI_muscle dataset — zero-shot MedSAM2 eval config.
+
+data:
+  data_dir: data/datasets/MRI_muscle/processed/WATER
+  n_folds: 5
+  label_names: [BG, L_QF, L_HS, L_SA, L_GR, R_QF, R_HS, R_SA, R_GR]
