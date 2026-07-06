@@ -143,3 +143,12 @@ def build_gt_classmap(label_dir: str,
         with open(out_path, 'w') as f:
             json.dump(classmap, f)
         print(f'gt_classmap_{min_px}.json written')
+
+def z_volume_norm(image_itk: sitk.Image) -> sitk.Image:
+    """Per-volume z-score normalization. Returns float32 sitk.Image."""
+    arr = sitk.GetArrayFromImage(image_itk).astype(np.float32)
+    m, s = arr.mean(), arr.std()
+    arr = (arr - m) / (s + 1e-8)
+    out = sitk.GetImageFromArray(arr)
+    out.CopyInformation(image_itk)
+    return out

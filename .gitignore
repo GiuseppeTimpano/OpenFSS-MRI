@@ -20,6 +20,7 @@ utils/felzenszwalb_3d/build/
 # data (large files, not tracked)
 data/datasets/CHAOS/
 data/datasets/AMOS/
+data/datasets/MRI_muscle
 
 evaluation_util/
 weights/
@@ -27,8 +28,12 @@ results/
 
 # generated / local docs
 handoff/
+AGENTS.md
 CLAUDE.md
 HANDOFF.md
+graphify-out/
 
 *.csv
 *.nii.gz
+
+.opencode/
