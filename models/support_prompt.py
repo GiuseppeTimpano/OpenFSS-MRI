@@ -455,3 +455,145 @@ def support_prompt_for_query_dense_bodymasked_similarity(seg, supp_frame_u8: np.
         if best is None or score > best[0]:
             best = (score, fidx, pos_xy, neg_xy)
     return best[1], best[2], best[3]
+
+
+def bbox_from_similarity_blob(pos_map: np.ndarray, neg_map: np.ndarray,
+                               query_body2d: np.ndarray, img_hw: tuple,
+                               score_thresh: float = 0.0, margin_px: float = 0.0) -> tuple:
+    """Derives a box prompt (for MedSAM2Segmenter.segment_volume) from the same
+    score_map object blob used by pick_points_dense_bodymasked_similarity: connected
+    component of {score_map > score_thresh} (score_map = pos_map - neg_map) containing
+    argmax(score_map), intersected with the query body mask (falls back to the
+    unclipped blob if that intersection is empty). Returns the blob's tight bounding
+    box in ORIGINAL (H,W) pixel coords, (x0,y0,x1,y1), expanded by margin_px on each
+    side (clamped to image bounds). Unlike the point-prompt variants, this gives SAM2
+    an estimate of the object's EXTENT directly instead of relying on it to grow a
+    mask outward from a single point (motivated by results/support_prompt_debug's
+    P002_1_stack2 case: point placement was correct but the propagated mask stayed
+    tiny). No query GT is read."""
+    from skimage.measure import label as cc_label
+
+    h, w = pos_map.shape
+    H, W = img_hw
+
+    def cell_to_xy(row, col):
+        return (float(col) / w * W, float(row) / h * H)
+
+    score_map = pos_map - neg_map
+    pos_idx = np.unravel_index(np.argmax(score_map), score_map.shape)
+
+    blob_seed = score_map > score_thresh
+    labeled = cc_label(blob_seed)
+    comp_id = labeled[pos_idx]
+    if comp_id != 0:
+        blob = (labeled == comp_id)
+    else:
+        blob = np.zeros_like(blob_seed)
+        blob[pos_idx] = True
+
+    body = torch.from_numpy(query_body2d.astype(np.float32))[None, None]
+    body = F.interpolate(body, size=(h, w), mode="bilinear", align_corners=False)[0, 0]
+    body_grid = (body.numpy() > 0.5)
+
+    blob_in_body = blob & body_grid
+    if not blob_in_body.any():
+        blob_in_body = blob
+
+    ys, xs = np.where(blob_in_body)
+    y0, x0 = ys.min(), xs.min()
+    y1, x1 = ys.max() + 1, xs.max() + 1
+    px0, py0 = cell_to_xy(y0, x0)
+    px1, py1 = cell_to_xy(y1, x1)
+    px0 = max(0.0, px0 - margin_px)
+    py0 = max(0.0, py0 - margin_px)
+    px1 = min(float(W), px1 + margin_px)
+    py1 = min(float(H), py1 + margin_px)
+    return (px0, py0, px1, py1)
+
+
+def support_prompt_for_query_dense_bodymasked_bbox(seg, supp_frame_u8: np.ndarray,
+                                                    supp_mask2d: np.ndarray, query_frames: list,
+                                                    thr_hi: float = 0.7, thr_lo: float = 0.3,
+                                                    body_thresh: float = 10.0,
+                                                    body_min_px: int = 50,
+                                                    score_thresh: float = 0.0,
+                                                    margin_px: float = 0.0) -> tuple:
+    """Box-prompt counterpart of support_prompt_for_query_dense_bodymasked_similarity:
+    same body-masked positive/background bags and best-query-frame selection, but
+    returns a box (bbox_from_similarity_blob) instead of a pos/neg point pair -- for use
+    with MedSAM2Segmenter.segment_volume (box-prompt path), not segment_volume_points.
+    Same query-frame-selection criterion (max(pos_map - neg_map)) as the point variants.
+
+    returns: (frame_idx, box_xyxy)
+    """
+    supp_feat = seg.embed_frame(supp_frame_u8)
+    supp_body = body_mask2d(supp_frame_u8, body_thresh, body_min_px)
+    Pos_n, Neg_n = extract_support_vectors_bodymasked(supp_feat, supp_mask2d, supp_body,
+                                                       thr_hi, thr_lo)
+
+    best = None  # (score, frame_idx, box)
+    for fidx, frame_u8 in query_frames:
+        feat = seg.embed_frame(frame_u8)
+        pos_map, neg_map = dense_similarity_maps(feat, Pos_n, Neg_n)
+        q_body = body_mask2d(frame_u8, body_thresh, body_min_px)
+        box = bbox_from_similarity_blob(pos_map, neg_map, q_body, frame_u8.shape,
+                                        score_thresh, margin_px)
+        score = float((pos_map - neg_map).max())
+        if best is None or score > best[0]:
+            best = (score, fidx, box)
+    return best[1], best[2]
+
+
+def support_prompt_for_query_dense_bodymasked_bbox_consensus(seg, supp_frame_u8: np.ndarray,
+                                                              supp_mask2d: np.ndarray, query_frames: list,
+                                                              thr_hi: float = 0.7, thr_lo: float = 0.3,
+                                                              body_thresh: float = 10.0,
+                                                              body_min_px: int = 50,
+                                                              score_thresh: float = 0.0,
+                                                              margin_px: float = 0.0,
+                                                              consensus_k: int = 5) -> tuple:
+    """Consensus-frame counterpart of support_prompt_for_query_dense_bodymasked_bbox, added
+    alongside it (not a replacement -- kept as a fully separate call path so the two can be
+    A/B'd). Motivation: the winner-take-all frame choice (single global max(pos_map-neg_map))
+    is occasionally won by a frame where the embedding falsely locks onto a non-target
+    structure with high confidence (e.g. bone/tendon texture resembling the support
+    prototype) -- see results/support_prompt_analysis/sense_HV010_1_stack2_*.png, where the
+    winning frame's blob sits over the bone marrow cavity, far from the true muscle. The real
+    target, across neighboring query frames, produces a blob at a roughly STABLE location,
+    while a spurious match tends to be a one-off outlier. This computes every candidate
+    frame's box (bbox_from_similarity_blob) and score as before, takes the top consensus_k
+    frames by score, and picks the one whose box center is closest to the MEDIAN box center
+    of that top-k set -- i.e. trades a bit of raw peak-score for spatial agreement with its
+    neighbors. Falls back to the plain argmax when consensus_k <= 1 or there's only one
+    candidate frame (median of one point is itself, so behavior matches
+    support_prompt_for_query_dense_bodymasked_bbox in that case).
+
+    returns: (frame_idx, box_xyxy)
+    """
+    supp_feat = seg.embed_frame(supp_frame_u8)
+    supp_body = body_mask2d(supp_frame_u8, body_thresh, body_min_px)
+    Pos_n, Neg_n = extract_support_vectors_bodymasked(supp_feat, supp_mask2d, supp_body,
+                                                       thr_hi, thr_lo)
+
+    candidates = []  # (score, frame_idx, box, center_xy)
+    for fidx, frame_u8 in query_frames:
+        feat = seg.embed_frame(frame_u8)
+        pos_map, neg_map = dense_similarity_maps(feat, Pos_n, Neg_n)
+        q_body = body_mask2d(frame_u8, body_thresh, body_min_px)
+        box = bbox_from_similarity_blob(pos_map, neg_map, q_body, frame_u8.shape,
+                                        score_thresh, margin_px)
+        score = float((pos_map - neg_map).max())
+        center = ((box[0] + box[2]) / 2.0, (box[1] + box[3]) / 2.0)
+        candidates.append((score, fidx, box, center))
+
+    candidates.sort(key=lambda c: -c[0])
+    top = candidates[:max(1, min(consensus_k, len(candidates)))]
+    med_cx = float(np.median([c[3][0] for c in top]))
+    med_cy = float(np.median([c[3][1] for c in top]))
+
+    def dist_to_median(c):
+        cx, cy = c[3]
+        return (cx - med_cx) ** 2 + (cy - med_cy) ** 2
+
+    winner = min(top, key=dist_to_median)
+    return winner[1], winner[2]

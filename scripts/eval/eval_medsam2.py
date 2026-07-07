@@ -7,10 +7,10 @@ Per organ: ORACLE box from GT (upper bound, NOT deployable -- deployable variant
 is P3) on the prompt slice(s), propagated both directions, scored on FG slices.
 
 prompt_mode: perslice (default, oracle box every FG slice) | key (one box on
-largest-area slice + propagation, MedSAM2's native usage) | support (point prompt
-from a random support scan's mask, PerSAM-style SAM2-embedding matching, no query
-GT read -- dense bag-of-vectors + body mask + similarity-ring negative, see
-models/support_prompt.py:support_prompt_for_query_dense_bodymasked_similarity).
+largest-area slice + propagation, MedSAM2's native usage) | support_bbox (box
+prompt derived from a random support scan's mask, PerSAM-style SAM2-embedding
+matching, no query GT read -- dense bag-of-vectors + body mask + similarity-blob
+bbox, see models/support_prompt.py:support_prompt_for_query_dense_bodymasked_bbox).
 
 Normalization is MedSAM2's (uint8+512+ImageNet), not the baseline's z-score --
 see models/medsam2_adapter.py.
@@ -29,7 +29,7 @@ import yaml
 from data.dataloader.dataset import get_fold_ids
 from eval_common import Scores, aggregate_and_print
 from models.medsam2_adapter import MedSAM2Segmenter, volume_to_uint8
-from models.support_prompt import key_slice, support_prompt_for_query_dense_bodymasked_similarity
+from models.support_prompt import key_slice, support_prompt_for_query_dense_bodymasked_bbox
 
 
 def _read_nii(path: str) -> np.ndarray:
@@ -80,6 +80,9 @@ def evaluate(cfg: dict, checkpoint: str, model_cfg: str,
                       for p in paths]
     else:
         _, query_sids = get_fold_ids(data_dir, fold if fold is not None else 0, n_folds)
+    # P* = pathological patients; exclude from query AND support pool (support drawn
+    # from query_sids too) -- too different from HV support/query to trust matching.
+    query_sids = [s for s in query_sids if not s.startswith('P')]
     if not query_sids:
         raise ValueError(f'No query scans found in {query_data_dir}')
 
@@ -108,7 +111,7 @@ def evaluate(cfg: dict, checkpoint: str, model_cfg: str,
 
         support_fg_idx: dict[str, np.ndarray] = {}
         rng = None
-        if prompt_mode == 'support':
+        if prompt_mode == 'support_bbox':
             rng = random.Random(seed + label_val)
             for sid in query_sids:
                 lbl = _read_nii(os.path.join(query_data_dir, f'label_{sid}.nii.gz'))
@@ -128,7 +131,7 @@ def evaluate(cfg: dict, checkpoint: str, model_cfg: str,
             z0, z1 = int(fg_idx.min()), int(fg_idx.max())
             vol_u8 = volume_to_uint8(q_img)[z0:z1 + 1]          # window full vol, then crop
 
-            if prompt_mode == 'support':
+            if prompt_mode == 'support_bbox':
                 pool = [s for s in support_fg_idx if s != qsid]
                 if not pool:
                     print(f'  [SKIP] query {qsid} has no support scan available for {label_name}')
@@ -141,10 +144,10 @@ def evaluate(cfg: dict, checkpoint: str, model_cfg: str,
                 supp_mask2d = supp_fg[supp_z].astype(bool)
 
                 query_frames = [(int(z) - z0, vol_u8[int(z) - z0]) for z in fg_idx]
-                frame_idx, pos_xy, neg_xy = support_prompt_for_query_dense_bodymasked_similarity(
+                frame_idx, box = support_prompt_for_query_dense_bodymasked_bbox(
                     seg, supp_frame_u8, supp_mask2d, query_frames)
-                points = {frame_idx: (pos_xy, neg_xy)}
-                seg_crop = seg.segment_volume_points(vol_u8, points, refine_iters=refine_iters)
+                seg_crop = seg.segment_volume(vol_u8, {frame_idx: np.asarray(box, dtype=np.float32)},
+                                               refine_iters=refine_iters)
             else:
                 boxes = _build_boxes(q_fg, fg_idx, z0, prompt_mode, margin)
                 seg_crop = seg.segment_volume(vol_u8, boxes)        # [z1-z0+1,H,W]
@@ -224,13 +227,14 @@ if __name__ == '__main__':
                         help='only used when --target_data_dir is not given')
     parser.add_argument('--test_label',      type=int, nargs='+', default=None)
     parser.add_argument('--prompt_mode',     type=str, default='perslice',
-                        choices=['perslice', 'key', 'support'])
+                        choices=['perslice', 'key', 'support_bbox'])
     parser.add_argument('--margin',          type=int, default=3,
                         help='oracle box margin in pixels')
     parser.add_argument('--seed',            type=int, default=42,
-                        help='random support-scan selection (prompt_mode=support)')
+                        help='random support-scan selection (prompt_mode=support_bbox)')
     parser.add_argument('--refine_iters',    type=int, default=0,
-                        help='cascaded point->box refinement iters (prompt_mode=support)')
+                        help='cascaded box->mask->box refinement on the seed frame before '
+                             'propagation (prompt_mode=support_bbox); 0 = off')
     parser.add_argument('--save_dir',        type=str, default=None,
                         help='where to write scores.csv/summary.csv and best/worst volumes')
     parser.add_argument('--save_topk',       type=int, default=1,

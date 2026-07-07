@@ -63,6 +63,7 @@ def main():
 
     paths = sorted(glob.glob(os.path.join(args.target_data_dir, 'image_*.nii.gz')))
     query_sids = [os.path.basename(p).replace('image_', '').replace('.nii.gz', '') for p in paths]
+    query_sids = [s for s in query_sids if not s.startswith('P')]  # exclude pathological
     if not query_sids:
         raise ValueError(f'No query scans found in {args.target_data_dir}')
 

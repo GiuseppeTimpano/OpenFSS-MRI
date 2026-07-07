@@ -38,7 +38,7 @@ lora:
 
 training:
   data_dir: "data/datasets/AMOS_coco/T2"   # scripts/medsam3_lora/build_coco_dataset.py output (train/ + valid/)
-  batch_size: 4
+  batch_size: 1
   num_workers: 2
 
   learning_rate: 5e-5
@@ -48,7 +48,7 @@ training:
   adam_epsilon: 1e-8
   max_grad_norm: 1.0
 
-  num_epochs: 50            # ~60 patients (larger than CHAOS's ~16-20) -- watch eval_steps loss, no auto early-stop, cut short if it overfits
+  num_epochs: 10            # val_loss minimo a epoch 2, poi risale -- overfit oltre; niente auto early-stop nello script, quindi taglio corto qui
   warmup_steps: 100
   lr_scheduler: "cosine"
 
@@ -59,7 +59,7 @@ training:
 
   mixed_precision: "bf16"
   seed: 42
-  gradient_accumulation_steps: 4  # effective batch 16
+  gradient_accumulation_steps: 16  # effective batch 16 (batch_size 1 x 16)
 
 output:
   output_dir: "outputs/medsam3_lora_amos"

@@ -86,11 +86,19 @@ class MedSAM2Segmenter:
 
     @torch.inference_mode()
     def segment_volume(self, vol_u8: np.ndarray,
-                       boxes: dict[int, np.ndarray]) -> np.ndarray:
+                       boxes: dict[int, np.ndarray],
+                       refine_iters: int = 0) -> np.ndarray:
         """
         vol_u8 : [Z,H,W] uint8 [0,255] (already cropped to the propagation range).
         boxes  : {frame_idx -> [x0,y0,x1,y1]} in ORIGINAL (H,W) coords; one or more
                  prompted slices. Propagation conditions on all prompted frames.
+        refine_iters : cascaded box refinement on each prompted frame BEFORE
+                       propagation: derive a tighter box from the box-prompt mask
+                       preview (single-frame decode, no propagation), re-prompt with
+                       that box, repeat until the box stabilizes or refine_iters is
+                       hit. 0 = no refinement (single box-prompt pass, previous
+                       behavior). Same pattern as segment_volume_points' refine_iters,
+                       ported to the box-prompt path.
         returns: [Z,H,W] uint8 binary mask.
         """
         Z, H, W = vol_u8.shape
@@ -105,9 +113,20 @@ class MedSAM2Segmenter:
         with autocast:
             state = self.predictor.init_state(img_resized, H, W)
             for fidx, box in sorted(boxes.items()):
-                self.predictor.add_new_points_or_box(
+                cur_box = tuple(float(v) for v in box)
+                _, _, mask_logits = self.predictor.add_new_points_or_box(
                     inference_state=state, frame_idx=int(fidx), obj_id=1,
-                    box=np.asarray(box, dtype=np.float32))
+                    box=np.asarray(cur_box, dtype=np.float32))
+
+                for _ in range(refine_iters):
+                    mask = (mask_logits[0, 0] > 0.0).cpu().numpy()
+                    new_box = mask_to_box(mask)
+                    if new_box is None or new_box == cur_box:
+                        break
+                    cur_box = new_box
+                    _, _, mask_logits = self.predictor.add_new_points_or_box(
+                        inference_state=state, frame_idx=int(fidx), obj_id=1,
+                        box=np.asarray(cur_box, dtype=np.float32))
 
             for reverse in (False, True):
                 for fidx, _oids, logits in self.predictor.propagate_in_video(
