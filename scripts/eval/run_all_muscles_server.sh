@@ -5,7 +5,6 @@
 set -euo pipefail
 
 cd /home/utente/Scrivania/.Giuseppe/OpenFSS-MRI
-source .venv/bin/activate
 
 export PYTHONPATH=.
 
