@@ -123,7 +123,7 @@ def _render(out_png, supp_frame_u8, supp_mask2d, supp_sid, supp_z,
 
     ax[0].imshow(supp_frame_u8, cmap='gray')
     ax[0].contour(supp_mask2d, colors='yellow', linewidths=1.5)
-    ax[0].set_title(f'support {supp_sid} (z={supp_z})')
+    ax[0].set_title(f'support {supp_sid} (z={supp_z})', fontsize=10, pad=8)
     ax[0].axis('off')
 
     ax[1].imshow(q_frame_u8, cmap='gray')
@@ -131,7 +131,8 @@ def _render(out_png, supp_frame_u8, supp_mask2d, supp_sid, supp_z,
     ax[1].contour(gt2d, colors='yellow', linewidths=1.5)
     ax[1].add_patch(Rectangle((x0, y0), x1 - x0, y1 - y0, fill=False,
                               edgecolor='cyan', linewidth=2.5))
-    ax[1].set_title(f'similarity + BOX  conf={conf:.3f}  box_gt_iou={box_gt_iou:.2f}')
+    ax[1].set_title(f'similarity + BOX  conf={conf:.3f}  box_gt_iou={box_gt_iou:.2f}',
+                    fontsize=10, pad=8)
     ax[1].axis('off')
 
     ax[2].imshow(q_frame_u8, cmap='gray')
@@ -139,11 +140,11 @@ def _render(out_png, supp_frame_u8, supp_mask2d, supp_sid, supp_z,
     ax[2].contour(pred2d, colors='red', linewidths=1.5)
     ax[2].add_patch(Rectangle((x0, y0), x1 - x0, y1 - y0, fill=False,
                               edgecolor='cyan', linewidth=2.0))
-    ax[2].set_title(f'{qsid} z={prompted_z}  Dice(vol)={d:.3f}')
+    ax[2].set_title(f'{qsid} z={prompted_z}  Dice(vol)={d:.3f}', fontsize=10, pad=8)
     ax[2].axis('off')
 
     plt.tight_layout()
-    plt.savefig(out_png, dpi=110)
+    plt.savefig(out_png, dpi=110, bbox_inches='tight', pad_inches=0.3)
     plt.close(fig)
 
 
