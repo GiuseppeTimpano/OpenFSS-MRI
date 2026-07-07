@@ -114,9 +114,9 @@ def _upsample(map2d: np.ndarray, hw) -> np.ndarray:
 
 
 def _render(out_png, supp_frame_u8, supp_mask2d, supp_sid, supp_z,
-            q_frame_u8, prompted_z, box, gt2d, pred2d, score, d, box_gt_iou, qsid):
+            q_frame_u8, prompted_z, box, gt2d, pred2d, score_map, conf, d, box_gt_iou, qsid):
     H, W = q_frame_u8.shape
-    score_up = _upsample(score, (H, W))
+    score_up = _upsample(score_map, (H, W))
     x0, y0, x1, y1 = box
 
     fig, ax = plt.subplots(1, 3, figsize=(18, 6))
@@ -131,7 +131,7 @@ def _render(out_png, supp_frame_u8, supp_mask2d, supp_sid, supp_z,
     ax[1].contour(gt2d, colors='yellow', linewidths=1.5)
     ax[1].add_patch(Rectangle((x0, y0), x1 - x0, y1 - y0, fill=False,
                               edgecolor='cyan', linewidth=2.5))
-    ax[1].set_title(f'similarity + BOX  conf={score:.3f}  box_gt_iou={box_gt_iou:.2f}')
+    ax[1].set_title(f'similarity + BOX  conf={conf:.3f}  box_gt_iou={box_gt_iou:.2f}')
     ax[1].axis('off')
 
     ax[2].imshow(q_frame_u8, cmap='gray')
@@ -247,7 +247,8 @@ def main():
             out = os.path.join(args.out_dir,
                                f'{label_name}_{qsid}{tag}_dice{d:.3f}_boxiou{box_gt_iou:.2f}.png')
             _render(out, supp_frame_u8, supp_mask2d, supp_sid, supp_z,
-                    q_frame_u8, prompted_z, box, gt2d, pred2d, score, d, box_gt_iou, qsid)
+                    q_frame_u8, prompted_z, box, gt2d, pred2d, pos_map - neg_map, score,
+                    d, box_gt_iou, qsid)
             print(f'{qsid}: support={supp_sid} Dice={d:.4f} box_gt_iou={box_gt_iou:.3f} '
                   f'conf={score:.3f} -> {os.path.basename(out)}')
 
