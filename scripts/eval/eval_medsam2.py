@@ -65,7 +65,8 @@ def evaluate(cfg: dict, checkpoint: str, model_cfg: str,
              target_data_dir: str | None, fold: int | None,
              eval_labels: list[int] | None, prompt_mode: str, margin: int,
              device: str, save_dir: str | None, save_topk: int = 1,
-             seed: int = 42, refine_iters: int = 0) -> dict:
+             seed: int = 42, refine_iters: int = 0,
+             query_slice: str = 'auto') -> dict:
     data_cfg    = cfg['data']
     data_dir    = data_cfg['data_dir']
     n_folds     = data_cfg['n_folds']
@@ -143,7 +144,19 @@ def evaluate(cfg: dict, checkpoint: str, model_cfg: str,
                 supp_frame_u8 = volume_to_uint8(supp_img)[supp_z]
                 supp_mask2d = supp_fg[supp_z].astype(bool)
 
-                query_frames = [(int(z) - z0, vol_u8[int(z) - z0]) for z in fg_idx]
+                if query_slice == 'key':
+                    # Operator-in-the-loop proxy: fix the start slice to the query's
+                    # max-cross-section slice (a clinician would pick the reference slice),
+                    # so the similarity picks the box ON THAT slice instead of also choosing
+                    # the slice. Box is still 100% from support similarity -- NO query GT box
+                    # is read (key_slice reads GT only to locate the slice, standing in for
+                    # the human). Isolates box-quality-given-slice: compare vs 'auto' (adds
+                    # slice-selection error) and vs the oracle prompt_mode=key (same slice,
+                    # GT box) upper bound.
+                    zc = key_slice(q_fg)
+                    query_frames = [(zc - z0, vol_u8[zc - z0])]
+                else:
+                    query_frames = [(int(z) - z0, vol_u8[int(z) - z0]) for z in fg_idx]
                 frame_idx, box = support_prompt_for_query_dense_bodymasked_bbox(
                     seg, supp_frame_u8, supp_mask2d, query_frames)
                 seg_crop = seg.segment_volume(vol_u8, {frame_idx: np.asarray(box, dtype=np.float32)},
@@ -235,6 +248,12 @@ if __name__ == '__main__':
     parser.add_argument('--refine_iters',    type=int, default=0,
                         help='cascaded box->mask->box refinement on the seed frame before '
                              'propagation (prompt_mode=support_bbox); 0 = off')
+    parser.add_argument('--query_slice',     type=str, default='auto',
+                        choices=['auto', 'key'],
+                        help='(prompt_mode=support_bbox) which query slice seeds the box: '
+                             'auto = similarity picks the best FG slice; key = operator '
+                             'proxy, fix to the query max-cross-section slice (box still '
+                             'from similarity, no GT box read)')
     parser.add_argument('--save_dir',        type=str, default=None,
                         help='where to write scores.csv/summary.csv and best/worst volumes')
     parser.add_argument('--save_topk',       type=int, default=1,
@@ -260,4 +279,5 @@ if __name__ == '__main__':
         save_topk       = args.save_topk,
         seed            = args.seed,
         refine_iters    = args.refine_iters,
+        query_slice     = args.query_slice,
     )
