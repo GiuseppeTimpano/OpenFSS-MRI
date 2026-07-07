@@ -40,6 +40,20 @@ def volume_to_uint8(vol: np.ndarray, p_low: float = 0.5, p_high: float = 99.5) -
     return v.astype(np.uint8)
 
 
+def mask_to_box(mask: np.ndarray, margin: int = 0):
+    """mask: [H,W] bool. Tight bbox (x0,y0,x1,y1) + margin, or None if mask empty.
+    Used for cascaded point->box iterative refinement (MedSAM2Segmenter.segment_volume_points)."""
+    ys, xs = np.nonzero(mask)
+    if ys.size == 0:
+        return None
+    H, W = mask.shape
+    x0 = max(0, int(xs.min()) - margin)
+    y0 = max(0, int(ys.min()) - margin)
+    x1 = min(W - 1, int(xs.max()) + margin)
+    y1 = min(H - 1, int(ys.max()) + margin)
+    return (float(x0), float(y0), float(x1), float(y1))
+
+
 class MedSAM2Segmenter:
     """Volume-level MedSAM2 wrapper: box prompt(s) on chosen slice(s) + bidirectional
     propagation across the volume."""
@@ -56,6 +70,19 @@ class MedSAM2Segmenter:
         mean = torch.tensor(_IMAGENET_MEAN, device=self.device)[:, None, None]
         std  = torch.tensor(_IMAGENET_STD,  device=self.device)[:, None, None]
         return (t - mean) / std
+
+    @torch.inference_mode()
+    def embed_frame(self, frame_u8: np.ndarray) -> torch.Tensor:
+        """frame_u8: [H,W] uint8 -> [C,h,w] SAM2 image-encoder feature (most-semantic
+        FPN level), for PerSAM-style prototype/similarity matching (models/support_prompt.py).
+        Independent of any video/inference_state -- just runs the image encoder."""
+        img = self._preprocess(frame_u8[None])  # [1,3,IMG_SIZE,IMG_SIZE]
+        autocast = (torch.autocast(self.device_type, dtype=torch.bfloat16)
+                    if self.device_type == "cuda"
+                    else torch.autocast(self.device_type, enabled=False))
+        with autocast:
+            out = self.predictor.forward_image(img)
+        return out["backbone_fpn"][-1][0]
 
     @torch.inference_mode()
     def segment_volume(self, vol_u8: np.ndarray,
@@ -81,6 +108,61 @@ class MedSAM2Segmenter:
                 self.predictor.add_new_points_or_box(
                     inference_state=state, frame_idx=int(fidx), obj_id=1,
                     box=np.asarray(box, dtype=np.float32))
+
+            for reverse in (False, True):
+                for fidx, _oids, logits in self.predictor.propagate_in_video(
+                        state, reverse=reverse):
+                    seg[fidx][(logits[0] > 0.0).cpu().numpy()[0]] = 1
+        return seg
+
+    @torch.inference_mode()
+    def segment_volume_points(self, vol_u8: np.ndarray,
+                              points: dict[int, tuple],
+                              refine_iters: int = 0) -> np.ndarray:
+        """
+        Point-prompted variant of segment_volume, for prompt_mode=support (see
+        models/support_prompt.py) -- does NOT touch/replace segment_volume (box-oracle
+        path, prompt_mode in {perslice,key}), added alongside it.
+
+        vol_u8       : [Z,H,W] uint8 [0,255].
+        points       : {frame_idx -> (pos_xy, neg_xy)}, each xy in ORIGINAL (H,W) coords,
+                       label 1=positive/0=negative.
+        refine_iters : cascaded PerSAM-style refinement on each prompted (key) frame BEFORE
+                       propagation: derive a tight box from the point-prompt mask, re-prompt
+                       with that box (SAM2 feeds the previous mask logits into the decoder
+                       automatically), repeat until the box stabilizes or refine_iters is hit.
+                       0 = no refinement (single point-prompt pass), matching the plan's
+                       original scope.
+        returns: [Z,H,W] uint8 binary mask.
+        """
+        Z, H, W = vol_u8.shape
+        seg = np.zeros((Z, H, W), dtype=np.uint8)
+        if not points:
+            return seg
+
+        img_resized = self._preprocess(vol_u8)
+        autocast = (torch.autocast(self.device_type, dtype=torch.bfloat16)
+                    if self.device_type == "cuda"
+                    else torch.autocast(self.device_type, enabled=False))
+        with autocast:
+            state = self.predictor.init_state(img_resized, H, W)
+            for fidx, (pos_xy, neg_xy) in sorted(points.items()):
+                pts = np.asarray([pos_xy, neg_xy], dtype=np.float32)
+                labels = np.asarray([1, 0], dtype=np.int32)
+                _, _, mask_logits = self.predictor.add_new_points_or_box(
+                    inference_state=state, frame_idx=int(fidx), obj_id=1,
+                    points=pts, labels=labels)
+
+                box = None
+                for _ in range(refine_iters):
+                    mask = (mask_logits[0, 0] > 0.0).cpu().numpy()
+                    new_box = mask_to_box(mask)
+                    if new_box is None or new_box == box:
+                        break
+                    box = new_box
+                    _, _, mask_logits = self.predictor.add_new_points_or_box(
+                        inference_state=state, frame_idx=int(fidx), obj_id=1,
+                        box=np.asarray(box, dtype=np.float32))
 
             for reverse in (False, True):
                 for fidx, _oids, logits in self.predictor.propagate_in_video(

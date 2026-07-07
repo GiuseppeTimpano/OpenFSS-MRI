@@ -7,7 +7,10 @@ Per organ: ORACLE box from GT (upper bound, NOT deployable -- deployable variant
 is P3) on the prompt slice(s), propagated both directions, scored on FG slices.
 
 prompt_mode: perslice (default, oracle box every FG slice) | key (one box on
-largest-area slice + propagation, MedSAM2's native usage).
+largest-area slice + propagation, MedSAM2's native usage) | support (point prompt
+from a random support scan's mask, PerSAM-style SAM2-embedding matching, no query
+GT read -- dense bag-of-vectors + body mask + similarity-ring negative, see
+models/support_prompt.py:support_prompt_for_query_dense_bodymasked_similarity).
 
 Normalization is MedSAM2's (uint8+512+ImageNet), not the baseline's z-score --
 see models/medsam2_adapter.py.
@@ -16,6 +19,7 @@ import argparse
 import csv
 import glob
 import os
+import random
 
 import numpy as np
 import SimpleITK as sitk
@@ -25,6 +29,7 @@ import yaml
 from data.dataloader.dataset import get_fold_ids
 from eval_common import Scores, aggregate_and_print
 from models.medsam2_adapter import MedSAM2Segmenter, volume_to_uint8
+from models.support_prompt import key_slice, support_prompt_for_query_dense_bodymasked_similarity
 
 
 def _read_nii(path: str) -> np.ndarray:
@@ -59,7 +64,8 @@ def _build_boxes(fg_mask: np.ndarray, fg_idx: np.ndarray, z0: int,
 def evaluate(cfg: dict, checkpoint: str, model_cfg: str,
              target_data_dir: str | None, fold: int | None,
              eval_labels: list[int] | None, prompt_mode: str, margin: int,
-             device: str, save_dir: str | None, save_topk: int = 1) -> dict:
+             device: str, save_dir: str | None, save_topk: int = 1,
+             seed: int = 42, refine_iters: int = 0) -> dict:
     data_cfg    = cfg['data']
     data_dir    = data_cfg['data_dir']
     n_folds     = data_cfg['n_folds']
@@ -100,6 +106,16 @@ def evaluate(cfg: dict, checkpoint: str, model_cfg: str,
         cls_gt:  dict[str, np.ndarray] = {}
         cls_pred: dict[str, np.ndarray] = {}
 
+        support_fg_idx: dict[str, np.ndarray] = {}
+        rng = None
+        if prompt_mode == 'support':
+            rng = random.Random(seed + label_val)
+            for sid in query_sids:
+                lbl = _read_nii(os.path.join(query_data_dir, f'label_{sid}.nii.gz'))
+                idx = np.where((lbl == label_val).any(axis=(1, 2)))[0]
+                if len(idx):
+                    support_fg_idx[sid] = idx
+
         for qsid in query_sids:
             q_img, q_lbl = _load_raw(query_data_dir, qsid)
             q_fg = (q_lbl == label_val).astype(np.uint8)
@@ -111,9 +127,27 @@ def evaluate(cfg: dict, checkpoint: str, model_cfg: str,
 
             z0, z1 = int(fg_idx.min()), int(fg_idx.max())
             vol_u8 = volume_to_uint8(q_img)[z0:z1 + 1]          # window full vol, then crop
-            boxes  = _build_boxes(q_fg, fg_idx, z0, prompt_mode, margin)
 
-            seg_crop = seg.segment_volume(vol_u8, boxes)        # [z1-z0+1,H,W]
+            if prompt_mode == 'support':
+                pool = [s for s in support_fg_idx if s != qsid]
+                if not pool:
+                    print(f'  [SKIP] query {qsid} has no support scan available for {label_name}')
+                    continue
+                supp_sid = rng.choice(pool)
+                supp_img, supp_lbl = _load_raw(query_data_dir, supp_sid)
+                supp_fg = (supp_lbl == label_val).astype(np.uint8)
+                supp_z = key_slice(supp_fg)
+                supp_frame_u8 = volume_to_uint8(supp_img)[supp_z]
+                supp_mask2d = supp_fg[supp_z].astype(bool)
+
+                query_frames = [(int(z) - z0, vol_u8[int(z) - z0]) for z in fg_idx]
+                frame_idx, pos_xy, neg_xy = support_prompt_for_query_dense_bodymasked_similarity(
+                    seg, supp_frame_u8, supp_mask2d, query_frames)
+                points = {frame_idx: (pos_xy, neg_xy)}
+                seg_crop = seg.segment_volume_points(vol_u8, points, refine_iters=refine_iters)
+            else:
+                boxes = _build_boxes(q_fg, fg_idx, z0, prompt_mode, margin)
+                seg_crop = seg.segment_volume(vol_u8, boxes)        # [z1-z0+1,H,W]
             pred_full = np.zeros_like(q_fg)
             pred_full[z0:z1 + 1] = seg_crop
 
@@ -190,9 +224,13 @@ if __name__ == '__main__':
                         help='only used when --target_data_dir is not given')
     parser.add_argument('--test_label',      type=int, nargs='+', default=None)
     parser.add_argument('--prompt_mode',     type=str, default='perslice',
-                        choices=['perslice', 'key'])
+                        choices=['perslice', 'key', 'support'])
     parser.add_argument('--margin',          type=int, default=3,
                         help='oracle box margin in pixels')
+    parser.add_argument('--seed',            type=int, default=42,
+                        help='random support-scan selection (prompt_mode=support)')
+    parser.add_argument('--refine_iters',    type=int, default=0,
+                        help='cascaded point->box refinement iters (prompt_mode=support)')
     parser.add_argument('--save_dir',        type=str, default=None,
                         help='where to write scores.csv/summary.csv and best/worst volumes')
     parser.add_argument('--save_topk',       type=int, default=1,
@@ -216,4 +254,6 @@ if __name__ == '__main__':
         device          = args.device,
         save_dir        = args.save_dir,
         save_topk       = args.save_topk,
+        seed            = args.seed,
+        refine_iters    = args.refine_iters,
     )
