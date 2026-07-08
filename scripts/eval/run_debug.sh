@@ -9,8 +9,10 @@
 #   oracle       vis, box from query GT: isolates SAM2 itself   -> results/debug_vis/oracle_key/
 #   support      vis, box from matching (R_SA, R_GR)            -> results/debug_vis/<label>_auto/
 #   allsupp      vis, 1 R_SA query vs EVERY support (variance)  -> results/debug_vis/R_SA_HV010_allsupp/
+#   dice [dir]   reprint the table of a past run; no dir => every run under results/
 #
-# Triage any run:  python3 scripts/eval/debug_medsam2.py triage <scores.csv>
+# Each experiment writes scores.csv in its out dir and prints its own table at the end;
+# vis experiments (oracle/support/allsupp) also write one debug PNG per scan there.
 set -euo pipefail
 
 cd /home/utente/Scrivania/.Giuseppe/OpenFSS-MRI
@@ -26,50 +28,76 @@ EVAL="python3 scripts/eval/eval_medsam2.py --config $EVAL_CFG --medsam2_ckpt $CK
       --sam2_cfg $CFG --target_data_dir $DATA --device $DEV"
 VIS="python3 scripts/eval/debug_medsam2.py vis --config $EVAL_CFG --medsam2_ckpt $CKPT
      --sam2_cfg $CFG --target_data_dir $DATA --device $DEV --refine_iters 1"
+TRIAGE="python3 scripts/eval/debug_medsam2.py triage"
 
 case "${1:-}" in
 
 all_muscles)  # no --test_label => evaluate() runs labels 1..8
-  $EVAL --prompt_mode support_bbox --refine_iters 1 \
-        --save_dir results/all_muscles --save_topk 2
-  echo "=== DONE — triage: python3 scripts/eval/debug_medsam2.py triage results/all_muscles/scores.csv"
+  OUT=results/all_muscles
+  $EVAL --prompt_mode support_bbox --refine_iters 1 --save_dir $OUT --save_topk 2
+  $TRIAGE $OUT
   ;;
 
 keyslice)     # start slice = max cross-section; box still 100% from similarity
+  OUT=results/all_muscles_keyslice
   $EVAL --prompt_mode support_bbox --query_slice key --refine_iters 1 \
-        --save_dir results/all_muscles_keyslice --save_topk 2
-  echo "=== DONE — triage: python3 scripts/eval/debug_medsam2.py triage results/all_muscles_keyslice/scores.csv"
+        --save_dir $OUT --save_topk 2
+  $TRIAGE $OUT
   ;;
 
 refine_ab)    # same seed/pairing, only refine_iters changes
   for R in 0 2; do
-    echo "=== REFINE $R ==="
     $EVAL --test_label 6 --prompt_mode support_bbox --refine_iters "$R" \
           --save_dir "results/refine_ab/refine$R" --save_topk 3
   done
-  echo "=== DONE — compare results/refine_ab/refine{0,2}/scores.csv"
+  for R in 0 2; do
+    echo; echo "########## refine_iters=$R ##########"
+    $TRIAGE "results/refine_ab/refine$R"
+  done
   ;;
 
 oracle)       # box = query GT: MedSAM2 upper bound, no matching involved
-  $VIS --box_source oracle --query_slice key --out_dir results/debug_vis/oracle_key
-  echo "=== DONE — high Dice here means the bottleneck is the matching, not SAM2"
+  OUT=results/debug_vis/oracle_key
+  $VIS --box_source oracle --query_slice key --out_dir $OUT
+  $TRIAGE $OUT
+  echo "=== PNGs in $OUT/ — high Dice here means the bottleneck is the matching, not SAM2"
   ;;
 
 support)      # the two thin muscles that fail (R_SA=7, R_GR=8)
   for L in 7 8; do
     NAME=$([ "$L" = 7 ] && echo R_SA || echo R_GR)
-    $VIS --box_source support --test_labels "$L" --query_slice auto \
-         --out_dir "results/debug_vis/${NAME}_auto"
+    OUT="results/debug_vis/${NAME}_auto"
+    $VIS --box_source support --test_labels "$L" --query_slice auto --out_dir "$OUT"
+    $TRIAGE "$OUT"
+    echo "=== PNGs in $OUT/ — boxiou~0 in the filename = mislocation (Regime A)"
   done
-  echo "=== DONE — boxiou~0 in the filename = mislocation (Regime A)"
   ;;
 
 allsupp)      # how much the result depends on WHICH support is drawn
+  OUT=results/debug_vis/R_SA_HV010_allsupp
   $VIS --box_source support --test_labels 7 --only HV010_1_stack2 --all_supports \
-       --query_slice auto --out_dir results/debug_vis/R_SA_HV010_allsupp
+       --query_slice auto --out_dir $OUT
+  $TRIAGE $OUT
+  echo "=== PNGs in $OUT/ — one per candidate support"
+  ;;
+
+dice)         # reprint a past run: reads scores.csv, does not touch the model
+  if [ -n "${2:-}" ]; then
+    $TRIAGE "$2"
+  else
+    shopt -s globstar nullglob   # globstar: refine_ab nests scores.csv two levels down
+    FOUND=(results/**/scores.csv)
+    if [ ${#FOUND[@]} -eq 0 ]; then
+      echo "No scores.csv under results/ -- run an experiment first"; exit 1
+    fi
+    for f in "${FOUND[@]}"; do
+      echo; echo "########## ${f%/scores.csv} ##########"
+      $TRIAGE "$f"
+    done
+  fi
   ;;
 
 *)
-  sed -n '2,12p' "$0"; exit 1
+  sed -n '2,15p' "$0"; exit 1
   ;;
 esac

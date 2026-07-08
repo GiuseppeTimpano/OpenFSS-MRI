@@ -1,7 +1,9 @@
 """
 Debug tool for the MedSAM2 eval on MRI_muscle. Two subcommands:
 
-  triage <scores.csv>          per-class table + failing scans, worst first.
+  triage <run>                 Dice/IoU per class + failing scans, worst first. <run> is a
+                               scores.csv or the dir holding it -- works on ANY experiment,
+                               eval_medsam2.py or vis, since both write the same schema.
   vis --box_source oracle      box = query GT bbox, no matching -> isolates SAM2 itself.
   vis --box_source support     box from support matching (prompt_mode=support_bbox).
 
@@ -25,35 +27,56 @@ import numpy as np
 # ============================== triage (CSV only, no model) ==============================
 
 
+CSV_FIELDS = ['class', 'label', 'scan', 'dice', 'iou']
+
+
 def _load_scores(path: str) -> list[dict]:
+    if os.path.isdir(path):
+        path = os.path.join(path, 'scores.csv')
     with open(path, newline='') as f:
         rows = list(csv.DictReader(f))
     for r in rows:
         r['dice'] = float(r['dice'])
         r['iou'] = float(r['iou'])
+        if r.get('boxiou') not in (None, ''):
+            r['boxiou'] = float(r['boxiou'])
     return rows
 
 
 def cmd_triage(args) -> None:
-    """Reads the per-scan scores.csv written by eval_medsam2.py (class,label,scan,dice,iou)."""
+    """Reads a per-scan scores.csv (class,label,scan,dice,iou[,boxiou]) written by
+    eval_medsam2.py or by `vis`. Accepts the csv path or its directory."""
     rows = _load_scores(args.scores_csv)
     by_class: dict[str, list[dict]] = defaultdict(list)
     for r in rows:
         by_class[r['class']].append(r)
 
+    has_box = any('boxiou' in r for r in rows)  # support runs only
+
+    def _bi(rs):  # mean boxiou, or None
+        v = [r['boxiou'] for r in rs if 'boxiou' in r]
+        return mean(v) if v else None
+
     stats = []
     for cls, rs in by_class.items():
         d = [r['dice'] for r in rs]
-        stats.append((cls, len(d), mean(d), median(d), min(d), max(d)))
+        stats.append((cls, len(d), mean(d), median(d), min(d), max(d),
+                      mean(r['iou'] for r in rs), _bi(rs)))
     stats.sort(key=lambda s: s[2])  # worst class first
 
+    box_hdr = f'{"boxiou":>9}' if has_box else ''
     print(f'\n=== Per-class (n={len(rows)} scans, {len(by_class)} classes) ===')
-    print(f'{"class":<8}{"n":>4}{"mean":>9}{"median":>9}{"min":>9}{"max":>9}')
-    for cls, n, mn, md, lo, hi in stats:
-        print(f'{cls:<8}{n:>4}{mn:>9.4f}{md:>9.4f}{lo:>9.4f}{hi:>9.4f}')
+    print(f'{"class":<8}{"n":>4}{"mean":>9}{"median":>9}{"min":>9}{"max":>9}'
+          f'{"iou":>9}{box_hdr}')
+    for cls, n, mn, md, lo, hi, iu, bi in stats:
+        line = f'{cls:<8}{n:>4}{mn:>9.4f}{md:>9.4f}{lo:>9.4f}{hi:>9.4f}{iu:>9.4f}'
+        print(line + (f'{bi:>9.4f}' if has_box and bi is not None else ''))
     overall = [r['dice'] for r in rows]
-    print(f'{"ALL":<8}{len(overall):>4}{mean(overall):>9.4f}'
-          f'{median(overall):>9.4f}{min(overall):>9.4f}{max(overall):>9.4f}')
+    all_bi = _bi(rows)
+    line = (f'{"ALL":<8}{len(overall):>4}{mean(overall):>9.4f}{median(overall):>9.4f}'
+            f'{min(overall):>9.4f}{max(overall):>9.4f}'
+            f'{mean(r["iou"] for r in rows):>9.4f}')
+    print(line + (f'{all_bi:>9.4f}' if has_box and all_bi is not None else ''))
 
     print(f'\n=== Scans below threshold (Dice < {args.thr}) ===')
     any_fail = False
@@ -69,7 +92,16 @@ def cmd_triage(args) -> None:
 
     print('\n=== 10 worst scans overall ===')
     for r in sorted(rows, key=lambda r: r['dice'])[:10]:
-        print(f'  {r["class"]:<8} {r["scan"]:<20} Dice={r["dice"]:.4f} IoU={r["iou"]:.4f}')
+        b = f' boxiou={r["boxiou"]:.3f}' if 'boxiou' in r else ''
+        print(f'  {r["class"]:<8} {r["scan"]:<20} Dice={r["dice"]:.4f} IoU={r["iou"]:.4f}{b}')
+
+    if has_box:  # split the failures: bad box (matching) vs bad mask (SAM2)
+        fails = [r for r in rows if r['dice'] < args.thr and 'boxiou' in r]
+        a = [r for r in fails if r['boxiou'] < args.box_thr]
+        b = [r for r in fails if r['boxiou'] >= args.box_thr]
+        print(f'\n=== Failure regimes (Dice < {args.thr}, boxiou < {args.box_thr}) ===')
+        print(f'  A mislocation  {len(a):>3}/{len(fails)}  box on wrong tissue -> matching')
+        print(f'  B growth       {len(b):>3}/{len(fails)}  box ok, mask does not grow -> SAM2')
 
 
 # ============================== vis (loads MedSAM2) ==============================
@@ -83,6 +115,11 @@ def _dice(pred: np.ndarray, gt: np.ndarray) -> float:
     inter = np.logical_and(pred, gt).sum()
     denom = pred.sum() + gt.sum()
     return 1.0 if denom == 0 else float(2.0 * inter / denom)
+
+
+def _iou(pred: np.ndarray, gt: np.ndarray) -> float:
+    union = np.logical_or(pred, gt).sum()
+    return 1.0 if union == 0 else float(np.logical_and(pred, gt).sum() / union)
 
 
 def _gt_bbox(mask2d: np.ndarray):
@@ -180,6 +217,7 @@ def cmd_vis(args) -> None:
 
     os.makedirs(args.out_dir, exist_ok=True)
     seg = MedSAM2Segmenter(args.medsam2_ckpt, args.sam2_cfg, device=device)
+    csv_rows: list[dict] = []   # same schema as eval_medsam2.py, + boxiou for support
 
     for label_val in test_labels:
         label_name = label_names[label_val] if label_val < len(label_names) else str(label_val)
@@ -220,7 +258,10 @@ def cmd_vis(args) -> None:
                 seg_crop = seg.segment_volume(vol_u8, boxes, refine_iters=args.refine_iters)
                 pred_full = np.zeros_like(q_fg)
                 pred_full[z0:z1 + 1] = seg_crop
-                d = _dice(pred_full[fg_idx].astype(bool), q_fg[fg_idx].astype(bool))
+                pb, gb = pred_full[fg_idx].astype(bool), q_fg[fg_idx].astype(bool)
+                d, i = _dice(pb, gb), _iou(pb, gb)
+                csv_rows.append({'class': label_name, 'label': label_val,
+                                 'scan': qsid, 'dice': d, 'iou': i})
 
                 frame_idx = key_slice(q_fg) - z0   # key slice is always in boxes if mode=key
                 if frame_idx not in boxes:
@@ -265,11 +306,15 @@ def cmd_vis(args) -> None:
                                               refine_iters=args.refine_iters)
                 pred_full = np.zeros_like(q_fg)
                 pred_full[z0:z1 + 1] = seg_crop
-                d = _dice(pred_full[fg_idx].astype(bool), q_fg[fg_idx].astype(bool))
+                pb, gb = pred_full[fg_idx].astype(bool), q_fg[fg_idx].astype(bool)
+                d, i = _dice(pb, gb), _iou(pb, gb)
 
                 gt2d = fg_crop[frame_idx].astype(bool)
                 pred2d = seg_crop[frame_idx].astype(bool)
                 boxiou = _box_iou(tuple(box), _gt_bbox(gt2d))
+                csv_rows.append({'class': label_name, 'label': label_val, 'boxiou': boxiou,
+                                 'scan': f'{qsid}@{supp_sid}' if args.all_supports else qsid,
+                                 'dice': d, 'iou': i})
                 score_up = _upsample(pos_map - neg_map, q_frame_u8.shape)
 
                 def s0(ax, f=supp_frame_u8, m=supp_mask2d):
@@ -293,6 +338,18 @@ def cmd_vis(args) -> None:
                 print(f'[{label_name}] {qsid}: support={supp_sid} Dice={d:.4f} '
                       f'boxiou={boxiou:.3f} conf={conf:.3f} -> {os.path.basename(out)}')
 
+    if not csv_rows:
+        print('No scans scored — nothing written.')
+        return
+    fields = CSV_FIELDS + (['boxiou'] if args.box_source == 'support' else [])
+    csv_path = os.path.join(args.out_dir, 'scores.csv')
+    with open(csv_path, 'w', newline='') as f:
+        w = csv.DictWriter(f, fieldnames=fields)
+        w.writeheader()
+        w.writerows(csv_rows)
+    print(f'\nPer-scan scores -> {csv_path}\n'
+          f'  triage: python3 scripts/eval/debug_medsam2.py triage {args.out_dir}')
+
 
 # ============================== CLI ==============================
 
@@ -302,9 +359,11 @@ def main() -> None:
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest='cmd', required=True)
 
-    t = sub.add_parser('triage', help='per-class table + failing scans from a scores.csv')
-    t.add_argument('scores_csv')
+    t = sub.add_parser('triage', help='Dice/IoU per class from any run: a scores.csv or its dir')
+    t.add_argument('scores_csv', help='path to scores.csv, or the run dir holding it')
     t.add_argument('--thr', type=float, default=0.40, help='Dice below this = failed scan')
+    t.add_argument('--box_thr', type=float, default=0.10,
+                   help='support runs: boxiou below this = mislocation (Regime A)')
     t.set_defaults(func=cmd_triage)
 
     v = sub.add_parser('vis', help='debug PNGs (box + segmentation)')
