@@ -28,6 +28,7 @@ import numpy as np
 
 
 CSV_FIELDS = ['class', 'label', 'scan', 'dice', 'iou']
+Z_FIELDS = ['class', 'scan', 'z', 'dice', 'z_prompt']
 
 
 def _load_scores(path: str) -> list[dict]:
@@ -41,6 +42,46 @@ def _load_scores(path: str) -> list[dict]:
         if r.get('boxiou') not in (None, ''):
             r['boxiou'] = float(r['boxiou'])
     return rows
+
+
+BANDS = [(0.0, 'prompt'), (0.25, '0-25%'), (0.5, '25-50%'),
+         (0.75, '50-75%'), (1.0, '75-100%')]
+
+
+def _print_propagation(path: str) -> None:
+    """Mean Dice by normalized z-distance from the prompt slice, if dice_by_z.csv is there.
+    Flat = propagation holds; falling = the mask is lost away from the prompt."""
+    d = path if os.path.isdir(path) else os.path.dirname(path)
+    z_path = os.path.join(d, 'dice_by_z.csv')
+    if not os.path.exists(z_path):
+        return
+    with open(z_path, newline='') as f:
+        rows = list(csv.DictReader(f))
+    if not rows or int(rows[0]['z_prompt']) < 0:
+        print('\n=== Propagation === per-slice prompts, nothing propagates.')
+        return
+
+    span: dict[tuple, int] = {}   # (class,scan) -> max |z - z_prompt|
+    for r in rows:
+        k = (r['class'], r['scan'])
+        span[k] = max(span.get(k, 0), abs(int(r['z']) - int(r['z_prompt'])))
+
+    buckets: dict[tuple, list] = defaultdict(list)
+    for r in rows:
+        k = (r['class'], r['scan'])
+        far = abs(int(r['z']) - int(r['z_prompt'])) / max(1, span[k])
+        band = next(name for hi, name in BANDS if far <= hi)
+        buckets[(r['class'], band)].append(float(r['dice']))
+
+    classes = sorted({r['class'] for r in rows},
+                     key=lambda c: mean(buckets[(c, '75-100%')] or [0]))
+    names = [n for _, n in BANDS]
+    print('\n=== Propagation: mean Dice by distance from the prompt slice ===')
+    print(f'{"class":<8}' + ''.join(f'{n:>10}' for n in names))
+    for c in classes:
+        cells = ''.join(f'{mean(buckets[(c, n)]):>10.4f}' if buckets[(c, n)] else f'{"-":>10}'
+                        for n in names)
+        print(f'{c:<8}{cells}')
 
 
 def cmd_triage(args) -> None:
@@ -95,6 +136,8 @@ def cmd_triage(args) -> None:
         b = f' boxiou={r["boxiou"]:.3f}' if 'boxiou' in r else ''
         print(f'  {r["class"]:<8} {r["scan"]:<20} Dice={r["dice"]:.4f} IoU={r["iou"]:.4f}{b}')
 
+    _print_propagation(args.scores_csv)
+
     if has_box:  # split the failures: bad box (matching) vs bad mask (SAM2)
         fails = [r for r in rows if r['dice'] < args.thr and 'boxiou' in r]
         a = [r for r in fails if r['boxiou'] < args.box_thr]
@@ -115,6 +158,13 @@ def _dice(pred: np.ndarray, gt: np.ndarray) -> float:
     inter = np.logical_and(pred, gt).sum()
     denom = pred.sum() + gt.sum()
     return 1.0 if denom == 0 else float(2.0 * inter / denom)
+
+
+def _dice_by_z(pred_full: np.ndarray, gt_full: np.ndarray, fg_idx: np.ndarray) -> list:
+    """Per-slice Dice over the GT z-extent. A high Dice on the prompt slice next to a
+    collapsing profile means the box was fine and propagation is what fails."""
+    return [(int(z), _dice(pred_full[z].astype(bool), gt_full[z].astype(bool)))
+            for z in fg_idx]
 
 
 def _iou(pred: np.ndarray, gt: np.ndarray) -> float:
@@ -218,6 +268,7 @@ def cmd_vis(args) -> None:
     os.makedirs(args.out_dir, exist_ok=True)
     seg = MedSAM2Segmenter(args.medsam2_ckpt, args.sam2_cfg, device=device)
     csv_rows: list[dict] = []   # same schema as eval_medsam2.py, + boxiou for support
+    z_rows: list[dict] = []     # per-slice Dice -> dice_by_z.csv (propagation profile)
 
     for label_val in test_labels:
         label_name = label_names[label_val] if label_val < len(label_names) else str(label_val)
@@ -266,6 +317,11 @@ def cmd_vis(args) -> None:
                 frame_idx = key_slice(q_fg) - z0   # key slice is always in boxes if mode=key
                 if frame_idx not in boxes:
                     frame_idx = next(iter(boxes))
+                # perslice: every z is prompted, so there is nothing to propagate
+                z_prompt = -1 if mode == 'perslice' else z0 + frame_idx
+                for z, dz in _dice_by_z(pred_full, q_fg, fg_idx):
+                    z_rows.append({'class': label_name, 'scan': qsid, 'z': z,
+                                   'dice': dz, 'z_prompt': z_prompt})
                 box = boxes[frame_idx]
                 frame_u8, gt2d = vol_u8[frame_idx], fg_crop[frame_idx].astype(bool)
                 pred2d = seg_crop[frame_idx].astype(bool)
@@ -312,9 +368,12 @@ def cmd_vis(args) -> None:
                 gt2d = fg_crop[frame_idx].astype(bool)
                 pred2d = seg_crop[frame_idx].astype(bool)
                 boxiou = _box_iou(tuple(box), _gt_bbox(gt2d))
+                scan_id = f'{qsid}@{supp_sid}' if args.all_supports else qsid
                 csv_rows.append({'class': label_name, 'label': label_val, 'boxiou': boxiou,
-                                 'scan': f'{qsid}@{supp_sid}' if args.all_supports else qsid,
-                                 'dice': d, 'iou': i})
+                                 'scan': scan_id, 'dice': d, 'iou': i})
+                for z, dz in _dice_by_z(pred_full, q_fg, fg_idx):
+                    z_rows.append({'class': label_name, 'scan': scan_id, 'z': z,
+                                   'dice': dz, 'z_prompt': z0 + frame_idx})
                 score_up = _upsample(pos_map - neg_map, q_frame_u8.shape)
 
                 def s0(ax, f=supp_frame_u8, m=supp_mask2d):
@@ -347,7 +406,14 @@ def cmd_vis(args) -> None:
         w = csv.DictWriter(f, fieldnames=fields)
         w.writeheader()
         w.writerows(csv_rows)
-    print(f'\nPer-scan scores -> {csv_path}\n'
+
+    z_path = os.path.join(args.out_dir, 'dice_by_z.csv')
+    with open(z_path, 'w', newline='') as f:
+        w = csv.DictWriter(f, fieldnames=Z_FIELDS)
+        w.writeheader()
+        w.writerows(z_rows)
+
+    print(f'\nPer-scan scores -> {csv_path}\nPer-slice Dice  -> {z_path}\n'
           f'  triage: python3 scripts/eval/debug_medsam2.py triage {args.out_dir}')
 
 

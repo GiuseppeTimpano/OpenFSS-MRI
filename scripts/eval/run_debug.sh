@@ -6,13 +6,14 @@
 #   all_muscles  eval support_bbox, 8 labels, query_slice=auto  -> results/all_muscles/
 #   keyslice     same but query_slice=key (operator proxy)      -> results/all_muscles_keyslice/
 #   refine_ab    A/B refine_iters 0 vs 2, label R_HS            -> results/refine_ab/
-#   oracle       vis, box from query GT: isolates SAM2 itself   -> results/debug_vis/oracle_key/
+#   oracle       vis, GT box on the key slice: isolates SAM2   -> results/debug_vis/oracle_key/
+#   oracle_perslice  vis, GT box on every slice: no propagation -> results/debug_vis/oracle_perslice/
 #   support      vis, box from matching (R_SA, R_GR)            -> results/debug_vis/<label>_auto/
 #   allsupp      vis, 1 R_SA query vs EVERY support (variance)  -> results/debug_vis/R_SA_HV010_allsupp/
 #   dice [dir]   reprint the table of a past run; no dir => every run under results/
 #
-# Each experiment writes scores.csv in its out dir and prints its own table at the end;
-# vis experiments (oracle/support/allsupp) also write one debug PNG per scan there.
+# Each experiment writes scores.csv + dice_by_z.csv in its out dir and prints its own table;
+# vis experiments also write one debug PNG per scan there.
 set -euo pipefail
 
 cd /home/utente/Scrivania/.Giuseppe/OpenFSS-MRI
@@ -56,11 +57,17 @@ refine_ab)    # same seed/pairing, only refine_iters changes
   done
   ;;
 
-oracle)       # box = query GT: MedSAM2 upper bound, no matching involved
+oracle)       # box = query GT on ONE slice: MedSAM2 upper bound, no matching involved
   OUT=results/debug_vis/oracle_key
   $VIS --box_source oracle --query_slice key --out_dir $OUT
   $TRIAGE $OUT
   echo "=== PNGs in $OUT/ — high Dice here means the bottleneck is the matching, not SAM2"
+  ;;
+
+oracle_perslice)  # box = query GT on EVERY slice: nothing left to propagate.
+  OUT=results/debug_vis/oracle_perslice   # gap vs `oracle` = cost of z-propagation alone
+  $VIS --box_source oracle --query_slice auto --out_dir $OUT
+  $TRIAGE $OUT
   ;;
 
 support)      # the two thin muscles that fail (R_SA=7, R_GR=8)
@@ -98,6 +105,6 @@ dice)         # reprint a past run: reads scores.csv, does not touch the model
   ;;
 
 *)
-  sed -n '2,15p' "$0"; exit 1
+  sed -n '2,16p' "$0"; exit 1
   ;;
 esac
