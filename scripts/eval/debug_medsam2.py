@@ -192,27 +192,32 @@ def _box_iou(a, b) -> float:
     return float(inter / ua) if ua > 0 else 0.0
 
 
-def _predict_box_support(seg, supp_frame_u8, supp_mask2d, query_frames):
-    """Mirrors support_prompt_for_query_dense_bodymasked_bbox but keeps the intermediates
-    (does not modify support_prompt.py). Returns the max-score frame:
-    (frame_idx, box, score, pos_map, neg_map, frame_u8)."""
+def _predict_box_support(seg, supp_frame_u8, supp_mask2d, query_frames,
+                         n_anchors=1, min_gap=3):
+    """Mirrors support_anchors_dense_bodymasked_bbox but keeps the intermediates
+    (does not modify support_prompt.py). Returns (boxes, frame_idx, box, score,
+    pos_map, neg_map, frame_u8): the anchor dict for segment_volume, then the
+    best-scoring anchor, which is the one the figure is drawn on."""
     from models.support_prompt import (body_mask2d, extract_support_vectors_bodymasked,
-                                       dense_similarity_maps, bbox_from_similarity_blob)
+                                       dense_similarity_maps, bbox_from_similarity_blob,
+                                       pick_anchors)
     supp_feat = seg.embed_frame(supp_frame_u8)
     supp_body = body_mask2d(supp_frame_u8, BODY_THRESH, BODY_MIN_PX)
     Pos_n, Neg_n = extract_support_vectors_bodymasked(supp_feat, supp_mask2d, supp_body,
                                                       THR_HI, THR_LO)
-    best = None
+    cands = []
     for fidx, frame_u8 in query_frames:
         feat = seg.embed_frame(frame_u8)
         pos_map, neg_map = dense_similarity_maps(feat, Pos_n, Neg_n)
         q_body = body_mask2d(frame_u8, BODY_THRESH, BODY_MIN_PX)
         box = bbox_from_similarity_blob(pos_map, neg_map, q_body, frame_u8.shape,
                                         SCORE_THRESH, MARGIN_PX)
-        score = float((pos_map - neg_map).max())
-        if best is None or score > best[0]:
-            best = (score, fidx, box, pos_map, neg_map, frame_u8)
-    return best[1], best[2], best[0], best[3], best[4], best[5]
+        cands.append((float((pos_map - neg_map).max()), fidx, box, pos_map, neg_map, frame_u8))
+
+    picked = pick_anchors(cands, n_anchors, min_gap)
+    boxes = {c[1]: np.asarray(c[2], dtype=np.float32) for c in picked}
+    best = picked[0]
+    return boxes, best[1], best[2], best[0], best[3], best[4], best[5]
 
 
 def _upsample(map2d: np.ndarray, hw) -> np.ndarray:
@@ -356,10 +361,10 @@ def cmd_vis(args) -> None:
                 supp_frame_u8 = volume_to_uint8(supp_img)[supp_z]
                 supp_mask2d = supp_fg[supp_z].astype(bool)
 
-                frame_idx, box, conf, pos_map, neg_map, q_frame_u8 = _predict_box_support(
-                    seg, supp_frame_u8, supp_mask2d, query_frames)
-                seg_crop = seg.segment_volume(vol_u8, {frame_idx: np.asarray(box, dtype=np.float32)},
-                                              refine_iters=args.refine_iters)
+                boxes, frame_idx, box, conf, pos_map, neg_map, q_frame_u8 = _predict_box_support(
+                    seg, supp_frame_u8, supp_mask2d, query_frames,
+                    args.n_anchors, args.anchor_min_gap)
+                seg_crop = seg.segment_volume(vol_u8, boxes, refine_iters=args.refine_iters)
                 pred_full = np.zeros_like(q_fg)
                 pred_full[z0:z1 + 1] = seg_crop
                 pb, gb = pred_full[fg_idx].astype(bool), q_fg[fg_idx].astype(bool)
@@ -371,9 +376,11 @@ def cmd_vis(args) -> None:
                 scan_id = f'{qsid}@{supp_sid}' if args.all_supports else qsid
                 csv_rows.append({'class': label_name, 'label': label_val, 'boxiou': boxiou,
                                  'scan': scan_id, 'dice': d, 'iou': i})
+                # with several anchors, "distance from the prompt" = distance to the nearest one
+                anchors_z = [z0 + f for f in boxes]
                 for z, dz in _dice_by_z(pred_full, q_fg, fg_idx):
-                    z_rows.append({'class': label_name, 'scan': scan_id, 'z': z,
-                                   'dice': dz, 'z_prompt': z0 + frame_idx})
+                    z_rows.append({'class': label_name, 'scan': scan_id, 'z': z, 'dice': dz,
+                                   'z_prompt': min(anchors_z, key=lambda a: abs(a - z))})
                 score_up = _upsample(pos_map - neg_map, q_frame_u8.shape)
 
                 def s0(ax, f=supp_frame_u8, m=supp_mask2d):
@@ -393,7 +400,7 @@ def cmd_vis(args) -> None:
                 _render(out, [s0, s1, s2],
                         [f'support {supp_sid} (z={supp_z})',
                          f'similarity + BOX  conf={conf:.3f}  boxiou={boxiou:.2f}',
-                         f'{qsid} z={z0 + frame_idx}  Dice(vol)={d:.3f}'])
+                         f'{qsid} z={z0 + frame_idx}  anchors={len(boxes)}  Dice(vol)={d:.3f}'])
                 print(f'[{label_name}] {qsid}: support={supp_sid} Dice={d:.4f} '
                       f'boxiou={boxiou:.3f} conf={conf:.3f} -> {os.path.basename(out)}')
 
@@ -446,6 +453,10 @@ def main() -> None:
                    help='support: auto = similarity picks the slice, key = max-area. '
                         'oracle: auto => per-slice boxes (upper bound), key => a single box')
     v.add_argument('--margin', type=int, default=0, help='box_source=oracle only')
+    v.add_argument('--n_anchors', type=int, default=1,
+                   help='box_source=support: prompt the box on the N best-scoring slices')
+    v.add_argument('--anchor_min_gap', type=int, default=3,
+                   help='min z-distance between anchors (--n_anchors > 1)')
     v.add_argument('--refine_iters', type=int, default=1)
     v.add_argument('--seed', type=int, default=42, help='must match the eval to reproduce pairings')
     v.add_argument('--only', nargs='+', default=None, help='limit to these query sids')

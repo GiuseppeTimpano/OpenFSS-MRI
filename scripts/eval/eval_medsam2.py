@@ -10,7 +10,8 @@ prompt_mode: perslice (default, oracle box every FG slice) | key (one box on
 largest-area slice + propagation, MedSAM2's native usage) | support_bbox (box
 prompt derived from a random support scan's mask, PerSAM-style SAM2-embedding
 matching, no query GT read -- dense bag-of-vectors + body mask + similarity-blob
-bbox, see models/support_prompt.py:support_prompt_for_query_dense_bodymasked_bbox).
+bbox, see models/support_prompt.py:support_anchors_dense_bodymasked_bbox). --n_anchors > 1
+re-anchors that box on several slices, so propagation restarts before it decays.
 
 Normalization is MedSAM2's (uint8+512+ImageNet), not the baseline's z-score --
 see models/medsam2_adapter.py.
@@ -29,7 +30,7 @@ import yaml
 from data.dataloader.dataset import get_fold_ids
 from eval_common import Scores, aggregate_and_print
 from models.medsam2_adapter import MedSAM2Segmenter, volume_to_uint8
-from models.support_prompt import key_slice, support_prompt_for_query_dense_bodymasked_bbox
+from models.support_prompt import key_slice, support_anchors_dense_bodymasked_bbox
 
 
 def _read_nii(path: str) -> np.ndarray:
@@ -66,7 +67,8 @@ def evaluate(cfg: dict, checkpoint: str, model_cfg: str,
              eval_labels: list[int] | None, prompt_mode: str, margin: int,
              device: str, save_dir: str | None, save_topk: int = 1,
              seed: int = 42, refine_iters: int = 0,
-             query_slice: str = 'auto') -> dict:
+             query_slice: str = 'auto', n_anchors: int = 1,
+             anchor_min_gap: int = 3) -> dict:
     data_cfg    = cfg['data']
     data_dir    = data_cfg['data_dir']
     n_folds     = data_cfg['n_folds']
@@ -157,10 +159,10 @@ def evaluate(cfg: dict, checkpoint: str, model_cfg: str,
                     query_frames = [(zc - z0, vol_u8[zc - z0])]
                 else:
                     query_frames = [(int(z) - z0, vol_u8[int(z) - z0]) for z in fg_idx]
-                frame_idx, box = support_prompt_for_query_dense_bodymasked_bbox(
-                    seg, supp_frame_u8, supp_mask2d, query_frames)
-                seg_crop = seg.segment_volume(vol_u8, {frame_idx: np.asarray(box, dtype=np.float32)},
-                                               refine_iters=refine_iters)
+                boxes = support_anchors_dense_bodymasked_bbox(
+                    seg, supp_frame_u8, supp_mask2d, query_frames,
+                    n_anchors=n_anchors, min_gap=anchor_min_gap)
+                seg_crop = seg.segment_volume(vol_u8, boxes, refine_iters=refine_iters)
             else:
                 boxes = _build_boxes(q_fg, fg_idx, z0, prompt_mode, margin)
                 seg_crop = seg.segment_volume(vol_u8, boxes)        # [z1-z0+1,H,W]
@@ -254,6 +256,11 @@ if __name__ == '__main__':
                              'auto = similarity picks the best FG slice; key = operator '
                              'proxy, fix to the query max-cross-section slice (box still '
                              'from similarity, no GT box read)')
+    parser.add_argument('--n_anchors',       type=int, default=1,
+                        help='(prompt_mode=support_bbox, query_slice=auto) prompt the box on '
+                             'the N best-scoring slices instead of 1; 1 = previous behavior')
+    parser.add_argument('--anchor_min_gap',  type=int, default=3,
+                        help='min z-distance between anchors (--n_anchors > 1)')
     parser.add_argument('--save_dir',        type=str, default=None,
                         help='where to write scores.csv/summary.csv and best/worst volumes')
     parser.add_argument('--save_topk',       type=int, default=1,
@@ -280,4 +287,6 @@ if __name__ == '__main__':
         seed            = args.seed,
         refine_iters    = args.refine_iters,
         query_slice     = args.query_slice,
+        n_anchors       = args.n_anchors,
+        anchor_min_gap  = args.anchor_min_gap,
     )

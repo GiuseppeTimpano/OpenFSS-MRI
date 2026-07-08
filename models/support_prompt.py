@@ -132,6 +132,48 @@ def bbox_from_similarity_blob(pos_map: np.ndarray, neg_map: np.ndarray,
     return (px0, py0, px1, py1)
 
 
+def score_query_frames(seg, supp_frame_u8: np.ndarray, supp_mask2d: np.ndarray,
+                        query_frames: list, thr_hi: float = 0.7, thr_lo: float = 0.3,
+                        body_thresh: float = 10.0, body_min_px: int = 50,
+                        score_thresh: float = 0.0, margin_px: float = 0.0) -> list:
+    """seg: MedSAM2Segmenter (only seg.embed_frame is used).
+    supp_frame_u8/supp_mask2d: support key slice + its GT mask.
+    query_frames: list[(frame_idx, frame_u8)] candidates.
+
+    One box per candidate frame, from that frame's similarity blob. No query GT read.
+    returns: [(score, frame_idx, box_xyxy)] in query_frames order.
+    """
+    supp_feat = seg.embed_frame(supp_frame_u8)
+    supp_body = body_mask2d(supp_frame_u8, body_thresh, body_min_px)
+    Pos_n, Neg_n = extract_support_vectors_bodymasked(supp_feat, supp_mask2d, supp_body,
+                                                       thr_hi, thr_lo)
+
+    cands = []
+    for fidx, frame_u8 in query_frames:
+        feat = seg.embed_frame(frame_u8)
+        pos_map, neg_map = dense_similarity_maps(feat, Pos_n, Neg_n)
+        q_body = body_mask2d(frame_u8, body_thresh, body_min_px)
+        box = bbox_from_similarity_blob(pos_map, neg_map, q_body, frame_u8.shape,
+                                        score_thresh, margin_px)
+        cands.append((float((pos_map - neg_map).max()), fidx, box))
+    return cands
+
+
+def pick_anchors(cands: list, n_anchors: int = 1, min_gap: int = 3) -> list:
+    """cands: [(score, frame_idx, ...)], extra fields ignored. Greedy: take the highest
+    score, then the next one at least min_gap slices away, up to n_anchors. Spreads the
+    prompts along z instead of clustering them on one confident slice.
+    n_anchors=1 == plain argmax (sort is stable, so ties break as in the argmax loop).
+    returns: the selected candidates, score-descending."""
+    picked: list = []
+    for c in sorted(cands, key=lambda c: -c[0]):
+        if len(picked) >= n_anchors:
+            break
+        if all(abs(c[1] - p[1]) >= min_gap for p in picked):
+            picked.append(c)
+    return picked
+
+
 def support_prompt_for_query_dense_bodymasked_bbox(seg, supp_frame_u8: np.ndarray,
                                                     supp_mask2d: np.ndarray, query_frames: list,
                                                     thr_hi: float = 0.7, thr_lo: float = 0.3,
@@ -139,31 +181,35 @@ def support_prompt_for_query_dense_bodymasked_bbox(seg, supp_frame_u8: np.ndarra
                                                     body_min_px: int = 50,
                                                     score_thresh: float = 0.0,
                                                     margin_px: float = 0.0) -> tuple:
-    """seg: MedSAM2Segmenter (only seg.embed_frame is used).
-    supp_frame_u8/supp_mask2d: support key slice + its GT mask.
-    query_frames: list[(frame_idx, frame_u8)] candidates.
-
-    Picks the query frame with the highest max(pos_map - neg_map) -- no query GT read --
-    and returns a box prompt from that frame's similarity blob.
+    """Single-prompt case: the query frame with the highest max(pos_map - neg_map).
 
     returns: (frame_idx, box_xyxy)
     """
-    supp_feat = seg.embed_frame(supp_frame_u8)
-    supp_body = body_mask2d(supp_frame_u8, body_thresh, body_min_px)
-    Pos_n, Neg_n = extract_support_vectors_bodymasked(supp_feat, supp_mask2d, supp_body,
-                                                       thr_hi, thr_lo)
+    cands = score_query_frames(seg, supp_frame_u8, supp_mask2d, query_frames, thr_hi,
+                                thr_lo, body_thresh, body_min_px, score_thresh, margin_px)
+    _, fidx, box = pick_anchors(cands, n_anchors=1)[0]
+    return fidx, box
 
-    best = None  # (score, frame_idx, box)
-    for fidx, frame_u8 in query_frames:
-        feat = seg.embed_frame(frame_u8)
-        pos_map, neg_map = dense_similarity_maps(feat, Pos_n, Neg_n)
-        q_body = body_mask2d(frame_u8, body_thresh, body_min_px)
-        box = bbox_from_similarity_blob(pos_map, neg_map, q_body, frame_u8.shape,
-                                        score_thresh, margin_px)
-        score = float((pos_map - neg_map).max())
-        if best is None or score > best[0]:
-            best = (score, fidx, box)
-    return best[1], best[2]
+
+def support_anchors_dense_bodymasked_bbox(seg, supp_frame_u8: np.ndarray,
+                                           supp_mask2d: np.ndarray, query_frames: list,
+                                           n_anchors: int = 1, min_gap: int = 3,
+                                           thr_hi: float = 0.7, thr_lo: float = 0.3,
+                                           body_thresh: float = 10.0,
+                                           body_min_px: int = 50,
+                                           score_thresh: float = 0.0,
+                                           margin_px: float = 0.0) -> dict:
+    """Multi-prompt (B4): re-anchor the box on up to n_anchors slices instead of one.
+    SAM2 then propagates from every anchor, so a bad box no longer sinks the whole volume
+    and memory attention is refreshed before the object is lost. Boxes for all candidate
+    frames are computed anyway, so this costs no extra encoder passes.
+
+    returns: {frame_idx -> box_xyxy float32}, ready for MedSAM2Segmenter.segment_volume.
+    """
+    cands = score_query_frames(seg, supp_frame_u8, supp_mask2d, query_frames, thr_hi,
+                                thr_lo, body_thresh, body_min_px, score_thresh, margin_px)
+    return {fidx: np.asarray(box, dtype=np.float32)
+            for _, fidx, box in pick_anchors(cands, n_anchors, min_gap)}
 
 
 def support_prompt_for_query_dense_bodymasked_bbox_consensus(seg, supp_frame_u8: np.ndarray,
@@ -182,22 +228,10 @@ def support_prompt_for_query_dense_bodymasked_bbox_consensus(seg, supp_frame_u8:
 
     returns: (frame_idx, box_xyxy)
     """
-    supp_feat = seg.embed_frame(supp_frame_u8)
-    supp_body = body_mask2d(supp_frame_u8, body_thresh, body_min_px)
-    Pos_n, Neg_n = extract_support_vectors_bodymasked(supp_feat, supp_mask2d, supp_body,
-                                                       thr_hi, thr_lo)
-
-    candidates = []  # (score, frame_idx, box, center_xy)
-    for fidx, frame_u8 in query_frames:
-        feat = seg.embed_frame(frame_u8)
-        pos_map, neg_map = dense_similarity_maps(feat, Pos_n, Neg_n)
-        q_body = body_mask2d(frame_u8, body_thresh, body_min_px)
-        box = bbox_from_similarity_blob(pos_map, neg_map, q_body, frame_u8.shape,
-                                        score_thresh, margin_px)
-        score = float((pos_map - neg_map).max())
-        center = ((box[0] + box[2]) / 2.0, (box[1] + box[3]) / 2.0)
-        candidates.append((score, fidx, box, center))
-
+    candidates = [(score, fidx, box, ((box[0] + box[2]) / 2.0, (box[1] + box[3]) / 2.0))
+                  for score, fidx, box in
+                  score_query_frames(seg, supp_frame_u8, supp_mask2d, query_frames, thr_hi,
+                                     thr_lo, body_thresh, body_min_px, score_thresh, margin_px)]
     candidates.sort(key=lambda c: -c[0])
     top = candidates[:max(1, min(consensus_k, len(candidates)))]
     med_cx = float(np.median([c[3][0] for c in top]))

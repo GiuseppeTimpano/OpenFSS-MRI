@@ -8,6 +8,7 @@
 #   refine_ab    A/B refine_iters 0 vs 2, label R_HS            -> results/refine_ab/
 #   oracle       vis, GT box on the key slice: isolates SAM2   -> results/debug_vis/oracle_key/
 #   oracle_perslice  vis, GT box on every slice: no propagation -> results/debug_vis/oracle_perslice/
+#   anchors      B4 sweep: 1/2/4/8 box anchors, all 8 labels     -> results/anchors/n<N>/
 #   support      vis, box from matching (R_SA, R_GR)            -> results/debug_vis/<label>_auto/
 #   allsupp      vis, 1 R_SA query vs EVERY support (variance)  -> results/debug_vis/R_SA_HV010_allsupp/
 #   dice [dir]   reprint the table of a past run; no dir => every run under results/
@@ -68,6 +69,17 @@ oracle_perslice)  # box = query GT on EVERY slice: nothing left to propagate.
   OUT=results/debug_vis/oracle_perslice   # gap vs `oracle` = cost of z-propagation alone
   $VIS --box_source oracle --query_slice auto --out_dir $OUT
   $TRIAGE $OUT
+  ;;
+
+anchors)      # B4: re-anchor the support box on N slices. n=1 must reproduce all_muscles.
+  for N in 1 2 4 8; do
+    $EVAL --prompt_mode support_bbox --refine_iters 1 --n_anchors "$N" \
+          --save_dir "results/anchors/n$N" --save_topk 1
+  done
+  for N in 1 2 4 8; do
+    echo; echo "########## n_anchors=$N ##########"
+    $TRIAGE "results/anchors/n$N"
+  done
   ;;
 
 support)      # the two thin muscles that fail (R_SA=7, R_GR=8)
