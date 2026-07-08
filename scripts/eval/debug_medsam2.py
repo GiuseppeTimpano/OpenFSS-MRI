@@ -192,19 +192,16 @@ def _box_iou(a, b) -> float:
     return float(inter / ua) if ua > 0 else 0.0
 
 
-def _predict_box_support(seg, supp_frame_u8, supp_mask2d, query_frames,
-                         n_anchors=1, min_gap=3):
+def _predict_box_support(seg, supp_slices, query_frames, n_anchors=1, min_gap=3):
     """Mirrors support_anchors_dense_bodymasked_bbox but keeps the intermediates
     (does not modify support_prompt.py). Returns (boxes, frame_idx, box, score,
     pos_map, neg_map, frame_u8): the anchor dict for segment_volume, then the
     best-scoring anchor, which is the one the figure is drawn on."""
-    from models.support_prompt import (body_mask2d, extract_support_vectors_bodymasked,
+    from models.support_prompt import (body_mask2d, build_support_bag,
                                        dense_similarity_maps, bbox_from_similarity_blob,
                                        pick_anchors)
-    supp_feat = seg.embed_frame(supp_frame_u8)
-    supp_body = body_mask2d(supp_frame_u8, BODY_THRESH, BODY_MIN_PX)
-    Pos_n, Neg_n = extract_support_vectors_bodymasked(supp_feat, supp_mask2d, supp_body,
-                                                      THR_HI, THR_LO)
+    Pos_n, Neg_n = build_support_bag(seg, supp_slices, THR_HI, THR_LO,
+                                     BODY_THRESH, BODY_MIN_PX)
     cands = []
     for fidx, frame_u8 in query_frames:
         feat = seg.embed_frame(frame_u8)
@@ -253,7 +250,7 @@ def cmd_vis(args) -> None:
     import torch
     import yaml
     from models.medsam2_adapter import MedSAM2Segmenter, volume_to_uint8
-    from models.support_prompt import key_slice
+    from models.support_prompt import key_slice, pick_support_slices
     from eval_medsam2 import _read_nii, _load_raw, _build_boxes
 
     device = args.device or ('cuda' if torch.cuda.is_available() else 'cpu')
@@ -357,13 +354,16 @@ def cmd_vis(args) -> None:
             for supp_sid in supports:
                 supp_img, supp_lbl = _load_raw(args.target_data_dir, supp_sid)
                 supp_fg = (supp_lbl == label_val).astype(np.uint8)
-                supp_z = key_slice(supp_fg)
-                supp_frame_u8 = volume_to_uint8(supp_img)[supp_z]
+                supp_vol_u8 = volume_to_uint8(supp_img)
+                supp_zs = pick_support_slices(supp_fg, args.support_slices,
+                                              args.support_min_gap)
+                supp = [(supp_vol_u8[z], supp_fg[z].astype(bool)) for z in supp_zs]
+                supp_z = key_slice(supp_fg)                 # the one the figure draws
+                supp_frame_u8 = supp_vol_u8[supp_z]
                 supp_mask2d = supp_fg[supp_z].astype(bool)
 
                 boxes, frame_idx, box, conf, pos_map, neg_map, q_frame_u8 = _predict_box_support(
-                    seg, supp_frame_u8, supp_mask2d, query_frames,
-                    args.n_anchors, args.anchor_min_gap)
+                    seg, supp, query_frames, args.n_anchors, args.anchor_min_gap)
                 seg_crop = seg.segment_volume(vol_u8, boxes, refine_iters=args.refine_iters)
                 pred_full = np.zeros_like(q_fg)
                 pred_full[z0:z1 + 1] = seg_crop
@@ -398,7 +398,7 @@ def cmd_vis(args) -> None:
                 out = os.path.join(args.out_dir,
                                    f'{label_name}_{qsid}{tag}_dice{d:.3f}_boxiou{boxiou:.2f}.png')
                 _render(out, [s0, s1, s2],
-                        [f'support {supp_sid} (z={supp_z})',
+                        [f'support {supp_sid} (z={supp_z})  bag z={supp_zs}',
                          f'similarity + BOX  conf={conf:.3f}  boxiou={boxiou:.2f}',
                          f'{qsid} z={z0 + frame_idx}  anchors={len(boxes)}  Dice(vol)={d:.3f}'])
                 print(f'[{label_name}] {qsid}: support={supp_sid} Dice={d:.4f} '
@@ -457,6 +457,10 @@ def main() -> None:
                    help='box_source=support: prompt the box on the N best-scoring slices')
     v.add_argument('--anchor_min_gap', type=int, default=3,
                    help='min z-distance between anchors (--n_anchors > 1)')
+    v.add_argument('--support_slices', type=int, default=1,
+                   help='box_source=support: B1, build the Pos/Neg bag from K support slices')
+    v.add_argument('--support_min_gap', type=int, default=3,
+                   help='min z-distance between support slices (--support_slices > 1)')
     v.add_argument('--refine_iters', type=int, default=1)
     v.add_argument('--seed', type=int, default=42, help='must match the eval to reproduce pairings')
     v.add_argument('--only', nargs='+', default=None, help='limit to these query sids')

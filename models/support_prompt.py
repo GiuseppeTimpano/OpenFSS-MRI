@@ -16,6 +16,17 @@ def key_slice(fg_mask: np.ndarray) -> int:
     return int(np.argmax(areas))
 
 
+def pick_support_slices(fg_mask: np.ndarray, n_slices: int = 1,
+                        min_gap: int = 3) -> list:
+    """fg_mask: [Z,H,W]. B1: the K slices whose vectors go into the support bag. Same
+    greedy as pick_anchors, scored by FG area instead of matching score, so the slices
+    are spread along z and cover the shape variation, not just the fattest section.
+    n_slices=1 == key_slice. returns: sorted z-indices."""
+    areas = fg_mask.reshape(fg_mask.shape[0], -1).sum(axis=1)
+    cands = [(float(a), int(z)) for z, a in enumerate(areas) if a > 0]
+    return sorted(z for _, z in pick_anchors(cands, n_slices, min_gap))
+
+
 def body_mask2d(img_u8: np.ndarray, thresh: float = 10.0,
                  min_component_px: int = 50) -> np.ndarray:
     """img_u8: [H,W] uint8. Thresholds out air/padding, keeps EVERY connected component
@@ -132,21 +143,42 @@ def bbox_from_similarity_blob(pos_map: np.ndarray, neg_map: np.ndarray,
     return (px0, py0, px1, py1)
 
 
-def score_query_frames(seg, supp_frame_u8: np.ndarray, supp_mask2d: np.ndarray,
-                        query_frames: list, thr_hi: float = 0.7, thr_lo: float = 0.3,
+def build_support_bag(seg, supp_slices: list, thr_hi: float = 0.7, thr_lo: float = 0.3,
+                       body_thresh: float = 10.0, body_min_px: int = 50) -> tuple:
+    """B1: one Pos/Neg bag from K slices of the SAME support volume (still 1-shot).
+    supp_slices: [(frame_u8, mask2d)]. Columns are already L2-normalized per slice, so
+    concatenating needs no renormalization. K=1 reproduces the single-key-slice bag.
+    Returns (Pos_n [C,Np], Neg_n [C,Nn])."""
+    pos, neg, C, device = [], [], None, None
+    for frame_u8, mask2d in supp_slices:
+        feat = seg.embed_frame(frame_u8)
+        C, device = feat.shape[0], feat.device
+        body = body_mask2d(frame_u8, body_thresh, body_min_px)
+        P, N = extract_support_vectors_bodymasked(feat, mask2d, body, thr_hi, thr_lo)
+        if P.shape[1] > 0:
+            pos.append(P)
+        if N.shape[1] > 0:
+            neg.append(N)
+
+    def _cat(bags):
+        return torch.cat(bags, dim=1) if bags else torch.zeros((C, 0), device=device)
+
+    return _cat(pos), _cat(neg)
+
+
+def score_query_frames(seg, supp_slices: list, query_frames: list,
+                        thr_hi: float = 0.7, thr_lo: float = 0.3,
                         body_thresh: float = 10.0, body_min_px: int = 50,
                         score_thresh: float = 0.0, margin_px: float = 0.0) -> list:
     """seg: MedSAM2Segmenter (only seg.embed_frame is used).
-    supp_frame_u8/supp_mask2d: support key slice + its GT mask.
+    supp_slices: [(frame_u8, mask2d)] support slices + their GT masks.
     query_frames: list[(frame_idx, frame_u8)] candidates.
 
     One box per candidate frame, from that frame's similarity blob. No query GT read.
     returns: [(score, frame_idx, box_xyxy)] in query_frames order.
     """
-    supp_feat = seg.embed_frame(supp_frame_u8)
-    supp_body = body_mask2d(supp_frame_u8, body_thresh, body_min_px)
-    Pos_n, Neg_n = extract_support_vectors_bodymasked(supp_feat, supp_mask2d, supp_body,
-                                                       thr_hi, thr_lo)
+    Pos_n, Neg_n = build_support_bag(seg, supp_slices, thr_hi, thr_lo,
+                                     body_thresh, body_min_px)
 
     cands = []
     for fidx, frame_u8 in query_frames:
@@ -174,8 +206,8 @@ def pick_anchors(cands: list, n_anchors: int = 1, min_gap: int = 3) -> list:
     return picked
 
 
-def support_prompt_for_query_dense_bodymasked_bbox(seg, supp_frame_u8: np.ndarray,
-                                                    supp_mask2d: np.ndarray, query_frames: list,
+def support_prompt_for_query_dense_bodymasked_bbox(seg, supp_slices: list,
+                                                    query_frames: list,
                                                     thr_hi: float = 0.7, thr_lo: float = 0.3,
                                                     body_thresh: float = 10.0,
                                                     body_min_px: int = 50,
@@ -185,14 +217,13 @@ def support_prompt_for_query_dense_bodymasked_bbox(seg, supp_frame_u8: np.ndarra
 
     returns: (frame_idx, box_xyxy)
     """
-    cands = score_query_frames(seg, supp_frame_u8, supp_mask2d, query_frames, thr_hi,
+    cands = score_query_frames(seg, supp_slices, query_frames, thr_hi,
                                 thr_lo, body_thresh, body_min_px, score_thresh, margin_px)
     _, fidx, box = pick_anchors(cands, n_anchors=1)[0]
     return fidx, box
 
 
-def support_anchors_dense_bodymasked_bbox(seg, supp_frame_u8: np.ndarray,
-                                           supp_mask2d: np.ndarray, query_frames: list,
+def support_anchors_dense_bodymasked_bbox(seg, supp_slices: list, query_frames: list,
                                            n_anchors: int = 1, min_gap: int = 3,
                                            thr_hi: float = 0.7, thr_lo: float = 0.3,
                                            body_thresh: float = 10.0,
@@ -206,14 +237,14 @@ def support_anchors_dense_bodymasked_bbox(seg, supp_frame_u8: np.ndarray,
 
     returns: {frame_idx -> box_xyxy float32}, ready for MedSAM2Segmenter.segment_volume.
     """
-    cands = score_query_frames(seg, supp_frame_u8, supp_mask2d, query_frames, thr_hi,
+    cands = score_query_frames(seg, supp_slices, query_frames, thr_hi,
                                 thr_lo, body_thresh, body_min_px, score_thresh, margin_px)
     return {fidx: np.asarray(box, dtype=np.float32)
             for _, fidx, box in pick_anchors(cands, n_anchors, min_gap)}
 
 
-def support_prompt_for_query_dense_bodymasked_bbox_consensus(seg, supp_frame_u8: np.ndarray,
-                                                              supp_mask2d: np.ndarray, query_frames: list,
+def support_prompt_for_query_dense_bodymasked_bbox_consensus(seg, supp_slices: list,
+                                                              query_frames: list,
                                                               thr_hi: float = 0.7, thr_lo: float = 0.3,
                                                               body_thresh: float = 10.0,
                                                               body_min_px: int = 50,
@@ -230,7 +261,7 @@ def support_prompt_for_query_dense_bodymasked_bbox_consensus(seg, supp_frame_u8:
     """
     candidates = [(score, fidx, box, ((box[0] + box[2]) / 2.0, (box[1] + box[3]) / 2.0))
                   for score, fidx, box in
-                  score_query_frames(seg, supp_frame_u8, supp_mask2d, query_frames, thr_hi,
+                  score_query_frames(seg, supp_slices, query_frames, thr_hi,
                                      thr_lo, body_thresh, body_min_px, score_thresh, margin_px)]
     candidates.sort(key=lambda c: -c[0])
     top = candidates[:max(1, min(consensus_k, len(candidates)))]

@@ -12,6 +12,8 @@ prompt derived from a random support scan's mask, PerSAM-style SAM2-embedding
 matching, no query GT read -- dense bag-of-vectors + body mask + similarity-blob
 bbox, see models/support_prompt.py:support_anchors_dense_bodymasked_bbox). --n_anchors > 1
 re-anchors that box on several slices, so propagation restarts before it decays.
+--support_slices > 1 (B1) builds the Pos/Neg bag from several slices of the same support
+volume instead of its key slice alone -- still 1-shot, richer bag.
 
 Normalization is MedSAM2's (uint8+512+ImageNet), not the baseline's z-score --
 see models/medsam2_adapter.py.
@@ -30,7 +32,8 @@ import yaml
 from data.dataloader.dataset import get_fold_ids
 from eval_common import Scores, aggregate_and_print
 from models.medsam2_adapter import MedSAM2Segmenter, volume_to_uint8
-from models.support_prompt import key_slice, support_anchors_dense_bodymasked_bbox
+from models.support_prompt import (key_slice, pick_support_slices,
+                                   support_anchors_dense_bodymasked_bbox)
 
 
 def _read_nii(path: str) -> np.ndarray:
@@ -68,7 +71,8 @@ def evaluate(cfg: dict, checkpoint: str, model_cfg: str,
              device: str, save_dir: str | None, save_topk: int = 1,
              seed: int = 42, refine_iters: int = 0,
              query_slice: str = 'auto', n_anchors: int = 1,
-             anchor_min_gap: int = 3) -> dict:
+             anchor_min_gap: int = 3, support_slices: int = 1,
+             support_min_gap: int = 3) -> dict:
     data_cfg    = cfg['data']
     data_dir    = data_cfg['data_dir']
     n_folds     = data_cfg['n_folds']
@@ -142,9 +146,9 @@ def evaluate(cfg: dict, checkpoint: str, model_cfg: str,
                 supp_sid = rng.choice(pool)
                 supp_img, supp_lbl = _load_raw(query_data_dir, supp_sid)
                 supp_fg = (supp_lbl == label_val).astype(np.uint8)
-                supp_z = key_slice(supp_fg)
-                supp_frame_u8 = volume_to_uint8(supp_img)[supp_z]
-                supp_mask2d = supp_fg[supp_z].astype(bool)
+                supp_vol_u8 = volume_to_uint8(supp_img)
+                supp_zs = pick_support_slices(supp_fg, support_slices, support_min_gap)
+                supp = [(supp_vol_u8[z], supp_fg[z].astype(bool)) for z in supp_zs]
 
                 if query_slice == 'key':
                     # Operator-in-the-loop proxy: fix the start slice to the query's
@@ -160,7 +164,7 @@ def evaluate(cfg: dict, checkpoint: str, model_cfg: str,
                 else:
                     query_frames = [(int(z) - z0, vol_u8[int(z) - z0]) for z in fg_idx]
                 boxes = support_anchors_dense_bodymasked_bbox(
-                    seg, supp_frame_u8, supp_mask2d, query_frames,
+                    seg, supp, query_frames,
                     n_anchors=n_anchors, min_gap=anchor_min_gap)
                 seg_crop = seg.segment_volume(vol_u8, boxes, refine_iters=refine_iters)
             else:
@@ -261,6 +265,12 @@ if __name__ == '__main__':
                              'the N best-scoring slices instead of 1; 1 = previous behavior')
     parser.add_argument('--anchor_min_gap',  type=int, default=3,
                         help='min z-distance between anchors (--n_anchors > 1)')
+    parser.add_argument('--support_slices',  type=int, default=1,
+                        help='(prompt_mode=support_bbox) B1: build the Pos/Neg bag from the K '
+                             'best support slices instead of the key slice alone; 1 = previous '
+                             'behavior. Same support volume, so still 1-shot')
+    parser.add_argument('--support_min_gap', type=int, default=3,
+                        help='min z-distance between support slices (--support_slices > 1)')
     parser.add_argument('--save_dir',        type=str, default=None,
                         help='where to write scores.csv/summary.csv and best/worst volumes')
     parser.add_argument('--save_topk',       type=int, default=1,
@@ -289,4 +299,6 @@ if __name__ == '__main__':
         query_slice     = args.query_slice,
         n_anchors       = args.n_anchors,
         anchor_min_gap  = args.anchor_min_gap,
+        support_slices  = args.support_slices,
+        support_min_gap = args.support_min_gap,
     )

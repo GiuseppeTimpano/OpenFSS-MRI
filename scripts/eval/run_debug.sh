@@ -9,6 +9,8 @@
 #   oracle       vis, GT box on the key slice: isolates SAM2   -> results/debug_vis/oracle_key/
 #   oracle_perslice  vis, GT box on every slice: no propagation -> results/debug_vis/oracle_perslice/
 #   anchors      B4 sweep: 1/2/4/8 box anchors, all 8 labels     -> results/anchors/n<N>/
+#   bag          B1 vis: K support slices, R_SA+R_GR only        -> results/debug_vis/bag_k<K>/
+#   bag_eval     B1 sweep: K=1/3/5, all 8 labels                 -> results/bag/k<K>/
 #   support      vis, box from matching (R_SA, R_GR)            -> results/debug_vis/<label>_auto/
 #   allsupp      vis, 1 R_SA query vs EVERY support (variance)  -> results/debug_vis/R_SA_HV010_allsupp/
 #   dice [dir]   reprint the table of a past run; no dir => every run under results/
@@ -82,6 +84,30 @@ anchors)      # B4: re-anchor the support box on N slices. n=1 must reproduce al
   done
   ;;
 
+bag)          # B1: does a K-slice support bag sharpen the similarity map? Look at the PNGs
+  for K in 1 3 5; do        # middle panel = score map; k1 must reproduce results/debug_vis/*_auto
+    OUT="results/debug_vis/bag_k$K"
+    $VIS --box_source support --test_labels 7 8 --query_slice auto \
+         --support_slices "$K" --out_dir "$OUT"
+  done
+  for K in 1 3 5; do
+    echo; echo "########## support_slices=$K ##########"
+    $TRIAGE "results/debug_vis/bag_k$K"
+  done
+  echo "=== compare the middle panel across bag_k1/k3/k5 for the same scan"
+  ;;
+
+bag_eval)     # B1 full sweep, only worth running if `bag` shows a sharper map. k=1 == all_muscles
+  for K in 1 3 5; do
+    $EVAL --prompt_mode support_bbox --refine_iters 1 --support_slices "$K" \
+          --save_dir "results/bag/k$K" --save_topk 1
+  done
+  for K in 1 3 5; do
+    echo; echo "########## support_slices=$K ##########"
+    $TRIAGE "results/bag/k$K"
+  done
+  ;;
+
 support)      # the two thin muscles that fail (R_SA=7, R_GR=8)
   for L in 7 8; do
     NAME=$([ "$L" = 7 ] && echo R_SA || echo R_GR)
@@ -117,6 +143,6 @@ dice)         # reprint a past run: reads scores.csv, does not touch the model
   ;;
 
 *)
-  sed -n '2,16p' "$0"; exit 1
+  sed -n '2,18p' "$0"; exit 1
   ;;
 esac
