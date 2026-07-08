@@ -10,6 +10,7 @@
 #   oracle_perslice  vis, GT box on every slice: no propagation -> results/debug_vis/oracle_perslice/
 #   anchors      B4 sweep: 1/2/4/8 box anchors, all 8 labels     -> results/anchors/n<N>/
 #   bag          B1 vis: K support slices, R_SA+R_GR only        -> results/debug_vis/bag_k<K>/
+#   bag_key      B1 vis with slice frozen (query_slice=key)      -> results/debug_vis/bag_key_k<K>/
 #   bag_eval     B1 sweep: K=1/3/5, all 8 labels                 -> results/bag/k<K>/
 #   support      vis, box from matching (R_SA, R_GR)            -> results/debug_vis/<label>_auto/
 #   allsupp      vis, 1 R_SA query vs EVERY support (variance)  -> results/debug_vis/R_SA_HV010_allsupp/
@@ -95,6 +96,19 @@ bag)          # B1: does a K-slice support bag sharpen the similarity map? Look 
     $TRIAGE "results/debug_vis/bag_k$K"
   done
   echo "=== compare the middle panel across bag_k1/k3/k5 for the same scan"
+  ;;
+
+bag_key)      # B1 with the slice FROZEN (query_slice=key): box always on the same slice for
+  for K in 1 3 5; do        # every K, so the ONLY variable is the bag. Isolates box quality
+    OUT="results/debug_vis/bag_key_k$K"    # from slice selection (which bag also changes).
+    $VIS --box_source support --test_labels 7 8 --query_slice key \
+         --support_slices "$K" --out_dir "$OUT"
+  done
+  for K in 1 3 5; do
+    echo; echo "########## support_slices=$K (slice frozen) ##########"
+    $TRIAGE "results/debug_vis/bag_key_k$K"
+  done
+  echo "=== boxiou rising with K here = B1 works, slice-selection is the separate problem"
   ;;
 
 bag_eval)     # B1 full sweep, only worth running if `bag` shows a sharper map. k=1 == all_muscles
