@@ -215,7 +215,8 @@ def cmd_vis(args) -> None:
 
             if args.box_source == 'oracle':
                 mode = 'key' if args.query_slice == 'key' else 'perslice'
-                boxes = _build_boxes(fg_crop, fg_idx, z0, mode, args.margin)
+                # full volume + absolute fg_idx, as in evaluate(); keys come out local
+                boxes = _build_boxes(q_fg, fg_idx, z0, mode, args.margin)
                 seg_crop = seg.segment_volume(vol_u8, boxes, refine_iters=args.refine_iters)
                 pred_full = np.zeros_like(q_fg)
                 pred_full[z0:z1 + 1] = seg_crop
