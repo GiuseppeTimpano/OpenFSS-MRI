@@ -227,11 +227,11 @@ def _upsample(map2d: np.ndarray, hw) -> np.ndarray:
     return F.interpolate(t, size=hw, mode='bilinear', align_corners=False)[0, 0].numpy()
 
 
-def _draw_box(ax, box, lw=2.5):
+def _draw_box(ax, box, lw=2.5, color='cyan'):
     from matplotlib.patches import Rectangle
     x0, y0, x1, y1 = box
     ax.add_patch(Rectangle((x0, y0), x1 - x0, y1 - y0, fill=False,
-                           edgecolor='cyan', linewidth=lw))
+                           edgecolor=color, linewidth=lw))
 
 
 def _render(out_png, panels: list, titles: list):
@@ -433,6 +433,46 @@ def cmd_vis(args) -> None:
 # same seed, same support pairing, same query slice -> only the matching rule changes.
 
 
+TYPE_COLORS = {'QF': 'tab:red', 'HS': 'tab:blue', 'SA': 'tab:green', 'GR': 'tab:orange'}
+
+
+def _winner_map(score_maps: dict, hw: tuple) -> tuple:
+    """Which type wins each pixel, and by how much. Cells no type wins (BG rival on top)
+    are left as -1. This is the panel that shows who steals from whom."""
+    names = sorted(score_maps)
+    stack = np.stack([_upsample(score_maps[c], hw) for c in names])
+    best = stack.max(0)
+    win = np.where(best > 0.0, stack.argmax(0), -1)
+    return win, best, names
+
+
+def _draw_winner(ax, frame_u8, win, names, boxes, target: str):
+    """Winner map + every class box (target thick white, rivals thin, BG left grey)."""
+    from matplotlib.colors import ListedColormap, to_rgba
+    ax.imshow(frame_u8, cmap='gray')
+    cmap = ListedColormap([to_rgba(TYPE_COLORS.get(n, 'magenta')) for n in names])
+    ax.imshow(np.ma.masked_less(win, 0), cmap=cmap, vmin=0, vmax=len(names) - 1, alpha=0.45)
+    for name, (_score, box) in boxes.items():
+        is_target = name == target
+        _draw_box(ax, box, 2.6 if is_target else 1.0,
+                  'white' if is_target else TYPE_COLORS.get(name.split('_', 1)[1], 'magenta'))
+
+
+def _render_support(out_dir: str, supp_sid: str, supp_slices: list, supp_zs: list) -> None:
+    """One panel per bag slice, each type contoured in its colour: shows exactly which
+    pixels feed which bag. Written once per support, not once per class."""
+    def panel(frame_u8, cls_masks):
+        def draw(ax, f=frame_u8, cm=cls_masks):
+            ax.imshow(f, cmap='gray')
+            for t, m in cm.items():
+                ax.contour(m, colors=[TYPE_COLORS.get(t, 'magenta')], linewidths=1.5)
+        return draw
+
+    panels = [panel(f, cm) for f, cm in supp_slices]
+    titles = [f'z={z}  ' + ' '.join(sorted(cm)) for z, (_f, cm) in zip(supp_zs, supp_slices)]
+    _render(os.path.join(out_dir, f'_support_{supp_sid}.png'), panels, titles)
+
+
 def _muscle_types(label_names: list) -> dict:
     """{'QF': (1, 5), ...} — the L and R label ids of each muscle type."""
     types = defaultdict(dict)
@@ -523,12 +563,13 @@ def cmd_mcvis(args) -> None:
 
             if supp_sid not in bag_cache:
                 supp_img, supp_lbl = _load_raw(args.target_data_dir, supp_sid)
+                supp_vol_u8 = volume_to_uint8(supp_img)
                 supp_slices, supp_zs = _support_bag_slices(
-                    volume_to_uint8(supp_img), supp_lbl, types,
-                    args.support_slices, args.support_min_gap)
+                    supp_vol_u8, supp_lbl, types, args.support_slices, args.support_min_gap)
                 bag_cache[supp_sid] = (build_multiclass_bags(seg, supp_slices, THR_HI, THR_LO,
                                                              BODY_THRESH, BODY_MIN_PX),
                                        _left_is_low_x(supp_lbl, types), supp_zs)
+                _render_support(args.out_dir, supp_sid, supp_slices, supp_zs)
             bags, low_x, supp_zs = bag_cache[supp_sid]
 
             z0, z1 = int(fg_idx.min()), int(fg_idx.max())
@@ -541,10 +582,30 @@ def cmd_mcvis(args) -> None:
                 SCORE_THRESH, MARGIN_PX)
             gt2d = q_fg[z0 + frame_idx].astype(bool)
 
-            if label_name not in boxes:                  # class claimed no cell on this leg
+            win, best, names = _winner_map(score_maps, frame_u8.shape)
+            score_up = _upsample(score_maps[mtype], frame_u8.shape)
+            owned = float((win == names.index(mtype)).mean())   # frame share this type claims
+
+            def w(ax, f=frame_u8, wn=win, nm=names, bx=boxes, t=label_name, g=gt2d):
+                _draw_winner(ax, f, wn, nm, bx, t)
+                ax.contour(g, colors='yellow', linewidths=1.5)
+
+            def sc(ax, f=frame_u8, s=score_up, g=gt2d):
+                ax.imshow(f, cmap='gray'); ax.imshow(s, cmap='jet', alpha=0.45)
+                ax.contour(g, colors='yellow', linewidths=1.5)
+
+            legend = ' '.join(f'{n}={TYPE_COLORS.get(n, "?").replace("tab:", "")}'
+                              for n in names)
+            t_win = f'winner  supp={supp_sid} z={supp_zs}\n{legend}'
+            t_sc = f'score[{mtype}] - max(rivals)   claims {owned:.1%} of frame'
+
+            if label_name not in boxes:      # every cell of this leg lost to a rival
                 csv_rows.append({'class': label_name, 'label': label_val, 'scan': qsid,
                                  'dice': 0.0, 'iou': 0.0, 'boxiou': 0.0})
-                print(f'[{label_name}] {qsid}: support={supp_sid} NO BOX (lost to a rival)')
+                out = os.path.join(args.out_dir, f'{label_name}_{qsid}_NOBOX.png')
+                _render(out, [w, sc], [t_win, t_sc])
+                print(f'[{label_name}] {qsid}: support={supp_sid} NO BOX (lost to a rival) '
+                      f'-> {os.path.basename(out)}')
                 continue
 
             conf, box = boxes[label_name]
@@ -557,13 +618,7 @@ def cmd_mcvis(args) -> None:
             boxiou = _box_iou(tuple(box), _gt_bbox(gt2d))
             csv_rows.append({'class': label_name, 'label': label_val, 'scan': qsid,
                              'dice': d, 'iou': i, 'boxiou': boxiou})
-
-            score_up = _upsample(score_maps[mtype], frame_u8.shape)
             pred2d = seg_crop[frame_idx].astype(bool)
-
-            def m0(ax, f=frame_u8, s=score_up, g=gt2d, b=box):
-                ax.imshow(f, cmap='gray'); ax.imshow(s, cmap='jet', alpha=0.45)
-                ax.contour(g, colors='yellow', linewidths=1.5); _draw_box(ax, b)
 
             def m1(ax, f=frame_u8, g=gt2d, pr=pred2d, b=box):
                 ax.imshow(f, cmap='gray'); ax.contour(g, colors='yellow', linewidths=1.5)
@@ -571,11 +626,11 @@ def cmd_mcvis(args) -> None:
 
             out = os.path.join(args.out_dir,
                                f'{label_name}_{qsid}_dice{d:.3f}_boxiou{boxiou:.2f}.png')
-            _render(out, [m0, m1],
-                    [f'score[{mtype}] vs rivals  supp={supp_sid} bag z={supp_zs}',
-                     f'{qsid} [{label_name}] side={side}  Dice(vol)={d:.3f}'])
+            _render(out, [w, sc, m1], [t_win, t_sc,
+                    f'{qsid} [{label_name}] side={side}  Dice(vol)={d:.3f} boxiou={boxiou:.2f}'])
             print(f'[{label_name}] {qsid}: support={supp_sid} Dice={d:.4f} '
-                  f'boxiou={boxiou:.3f} conf={conf:.3f} -> {os.path.basename(out)}')
+                  f'boxiou={boxiou:.3f} conf={conf:.3f} claims={owned:.1%} '
+                  f'-> {os.path.basename(out)}')
 
     if not csv_rows:
         print('No scans scored — nothing written.')
