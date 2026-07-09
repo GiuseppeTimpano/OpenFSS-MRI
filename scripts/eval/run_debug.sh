@@ -13,6 +13,7 @@
 #   bag_key      B1 vis with slice frozen (query_slice=key)      -> results/debug_vis/bag_key_k<K>/
 #   bag_eval     B1 sweep: K=1/3/5, all 8 labels                 -> results/bag/k<K>/
 #   mc           B2 vis: cross-class competition, slice frozen    -> results/debug_vis/mc_k3/
+#   mc_topk      B2 sweep: sim_topk 1/5/10, K=3, slice frozen      -> results/debug_vis/mc_k3_topk<T>/
 #   support      vis, box from matching (R_SA, R_GR)            -> results/debug_vis/<label>_auto/
 #   allsupp      vis, 1 R_SA query vs EVERY support (variance)  -> results/debug_vis/R_SA_HV010_allsupp/
 #   dice [dir]   reprint the table of a past run; no dir => every run under results/
@@ -132,6 +133,18 @@ mc)           # B2: cross-class competition instead of the binary pos/neg bag. S
   echo; echo "########## reference: bag_key_k3 (binary bag, same slice) ##########"
   [ -d results/debug_vis/bag_key_k3 ] && $TRIAGE results/debug_vis/bag_key_k3
   echo "=== SA/GR boxiou up and QF/HS not collapsing = B2 works, wire it into eval_medsam2.py"
+  ;;
+
+mc_topk)      # does top-k-mean similarity stop QF/HS bags stealing SA/GR pixels? topk=1 == mc_k3
+  for T in 1 5 10; do
+    OUT="results/debug_vis/mc_k3_topk$T"
+    $MCVIS --support_slices 3 --sim_topk "$T" --out_dir "$OUT"
+  done
+  for T in 1 5 10; do
+    echo; echo "########## sim_topk=$T ##########"
+    $TRIAGE "results/debug_vis/mc_k3_topk$T"
+  done
+  echo "=== SA/GR boxiou rising without QF/HS dropping = order-statistics bias confirmed and fixed"
   ;;
 
 support)      # the two thin muscles that fail (R_SA=7, R_GR=8)

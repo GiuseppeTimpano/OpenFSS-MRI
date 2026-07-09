@@ -195,7 +195,7 @@ def _box_iou(a, b) -> float:
     return float(inter / ua) if ua > 0 else 0.0
 
 
-def _predict_box_support(seg, supp_slices, query_frames, n_anchors=1, min_gap=3):
+def _predict_box_support(seg, supp_slices, query_frames, n_anchors=1, min_gap=3, sim_topk=1):
     """Mirrors support_anchors_dense_bodymasked_bbox but keeps the intermediates
     (does not modify support_prompt.py). Returns (boxes, frame_idx, box, score,
     pos_map, neg_map, frame_u8): the anchor dict for segment_volume, then the
@@ -208,7 +208,7 @@ def _predict_box_support(seg, supp_slices, query_frames, n_anchors=1, min_gap=3)
     cands = []
     for fidx, frame_u8 in query_frames:
         feat = seg.embed_frame(frame_u8)
-        pos_map, neg_map = dense_similarity_maps(feat, Pos_n, Neg_n)
+        pos_map, neg_map = dense_similarity_maps(feat, Pos_n, Neg_n, sim_topk)
         q_body = body_mask2d(frame_u8, BODY_THRESH, BODY_MIN_PX)
         box = bbox_from_similarity_blob(pos_map, neg_map, q_body, frame_u8.shape,
                                         SCORE_THRESH, MARGIN_PX)
@@ -366,7 +366,7 @@ def cmd_vis(args) -> None:
                 supp_mask2d = supp_fg[supp_z].astype(bool)
 
                 boxes, frame_idx, box, conf, pos_map, neg_map, q_frame_u8 = _predict_box_support(
-                    seg, supp, query_frames, args.n_anchors, args.anchor_min_gap)
+                    seg, supp, query_frames, args.n_anchors, args.anchor_min_gap, args.sim_topk)
                 seg_crop = seg.segment_volume(vol_u8, boxes, refine_iters=args.refine_iters)
                 pred_full = np.zeros_like(q_fg)
                 pred_full[z0:z1 + 1] = seg_crop
@@ -584,7 +584,7 @@ def cmd_mcvis(args) -> None:
 
             boxes, score_maps = multiclass_boxes_for_frame(
                 seg, bags, frame_u8, low_x, BODY_THRESH, BODY_MIN_PX,
-                SCORE_THRESH, MARGIN_PX)
+                SCORE_THRESH, MARGIN_PX, args.sim_topk)
             gt2d = q_fg[z0 + frame_idx].astype(bool)
 
             win, best, names = _winner_map(score_maps, frame_u8.shape)
@@ -693,6 +693,9 @@ def main() -> None:
                    help='box_source=support: B1, build the Pos/Neg bag from K support slices')
     v.add_argument('--support_min_gap', type=int, default=3,
                    help='min z-distance between support slices (--support_slices > 1)')
+    v.add_argument('--sim_topk', type=int, default=1,
+                   help='average the top-K bag similarities per cell instead of the plain max; '
+                        '1 = previous behavior')
     v.add_argument('--refine_iters', type=int, default=1)
     v.add_argument('--seed', type=int, default=42, help='must match the eval to reproduce pairings')
     v.add_argument('--only', nargs='+', default=None, help='limit to these query sids')
@@ -711,6 +714,9 @@ def main() -> None:
     m.add_argument('--support_slices', type=int, default=3,
                    help='K slices per muscle type in the support bags (B1)')
     m.add_argument('--support_min_gap', type=int, default=3)
+    m.add_argument('--sim_topk', type=int, default=1,
+                   help='average the top-K bag similarities per cell instead of the plain max; '
+                        '1 = previous behavior. Caps bag-size order-statistics bias')
     m.add_argument('--refine_iters', type=int, default=1)
     m.add_argument('--seed', type=int, default=42, help='must match the eval to reproduce pairings')
     m.add_argument('--only', nargs='+', default=None)
