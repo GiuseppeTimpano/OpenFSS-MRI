@@ -6,6 +6,9 @@ Debug tool for the MedSAM2 eval on MRI_muscle. Two subcommands:
                                eval_medsam2.py or vis, since both write the same schema.
   vis --box_source oracle      box = query GT bbox, no matching -> isolates SAM2 itself.
   vis --box_source support     box from support matching (prompt_mode=support_bbox).
+  mcvis                        B2: box from cross-class competition, frozen slice. Same
+                               seed/pairing/slice as `vis --box_source support
+                               --query_slice key`, so boxiou is directly comparable.
 
 Filename encodes dice, and boxiou (2D box-vs-GT IoU on the prompt slice) for support:
 boxiou~0 = mislocation (matching problem); boxiou high + low dice = SAM2 problem.
@@ -424,6 +427,168 @@ def cmd_vis(args) -> None:
           f'  triage: python3 scripts/eval/debug_medsam2.py triage {args.out_dir}')
 
 
+# ============================== mcvis (B2: multiclass matching) ==============================
+# Same frozen-slice protocol as `vis --query_slice key --box_source support`, but the box
+# comes from cross-class competition instead of the binary pos/neg bag. Directly comparable:
+# same seed, same support pairing, same query slice -> only the matching rule changes.
+
+
+def _muscle_types(label_names: list) -> dict:
+    """{'QF': (1, 5), ...} — the L and R label ids of each muscle type."""
+    types = defaultdict(dict)
+    for lv, name in enumerate(label_names):
+        if lv == 0 or '_' not in name:
+            continue
+        side, mtype = name.split('_', 1)
+        types[mtype][side] = lv
+    return {t: v for t, v in types.items() if len(v) == 2}
+
+
+def _left_is_low_x(lbl: np.ndarray, types: dict) -> bool:
+    """Scanner side convention, read off the support GT (never the query)."""
+    lx = [np.where(lbl == v['L'])[2].mean() for v in types.values() if (lbl == v['L']).any()]
+    rx = [np.where(lbl == v['R'])[2].mean() for v in types.values() if (lbl == v['R']).any()]
+    return mean(lx) < mean(rx)
+
+
+def _support_bag_slices(supp_vol_u8, supp_lbl, types, k, min_gap):
+    """Union over types of their K best slices; each kept slice carries every type's mask
+    (L+R pooled). One embed per slice, all bags filled from it."""
+    from models.support_prompt import pick_support_slices
+
+    zs = set()
+    for v in types.values():
+        fg = ((supp_lbl == v['L']) | (supp_lbl == v['R'])).astype(np.uint8)
+        if fg.any():
+            zs |= set(pick_support_slices(fg, k, min_gap))
+
+    out = []
+    for z in sorted(zs):
+        masks = {t: ((supp_lbl[z] == v['L']) | (supp_lbl[z] == v['R']))
+                 for t, v in types.items()}
+        out.append((supp_vol_u8[z], {t: m for t, m in masks.items() if m.any()}))
+    return out, sorted(zs)
+
+
+def cmd_mcvis(args) -> None:
+    import matplotlib
+    matplotlib.use('Agg')
+    import torch
+    import yaml
+    from models.medsam2_adapter import MedSAM2Segmenter, volume_to_uint8
+    from models.support_prompt import build_multiclass_bags, key_slice, multiclass_boxes_for_frame
+    from eval_medsam2 import _read_nii, _load_raw
+
+    device = args.device or ('cuda' if torch.cuda.is_available() else 'cpu')
+    with open(args.config) as f:
+        cfg = yaml.safe_load(f)
+    label_names = cfg['data']['label_names']
+    types = _muscle_types(label_names)
+    test_labels = args.test_labels or list(range(1, len(label_names)))
+
+    paths = sorted(glob.glob(os.path.join(args.target_data_dir, 'image_*.nii.gz')))
+    all_sids = [os.path.basename(p).replace('image_', '').replace('.nii.gz', '')
+                for p in paths if not os.path.basename(p).startswith('image_P')]
+    keep = set(all_sids if not args.only else [s for s in all_sids if s in set(args.only)])
+    if not keep:
+        raise ValueError('No query scans found (check --only / --target_data_dir)')
+
+    os.makedirs(args.out_dir, exist_ok=True)
+    seg = MedSAM2Segmenter(args.medsam2_ckpt, args.sam2_cfg, device=device)
+    bag_cache: dict = {}          # support sid -> (bags, left_is_low_x, slice zs)
+    csv_rows: list[dict] = []
+
+    for label_val in test_labels:
+        label_name = label_names[label_val]
+        side, mtype = label_name.split('_', 1)
+
+        support_fg_idx = {}
+        for sid in all_sids:
+            lbl = _read_nii(os.path.join(args.target_data_dir, f'label_{sid}.nii.gz'))
+            if np.where((lbl == label_val).any(axis=(1, 2)))[0].size:
+                support_fg_idx[sid] = True
+        rng = random.Random(args.seed + label_val)
+
+        for qsid in all_sids:   # iterate all: keeps the rng sequence == evaluate()'s
+            q_img, q_lbl = _load_raw(args.target_data_dir, qsid)
+            q_fg = (q_lbl == label_val).astype(np.uint8)
+            fg_idx = np.where(q_fg.any(axis=(1, 2)))[0]
+
+            pool = [s for s in support_fg_idx if s != qsid]
+            if len(fg_idx) == 0 or not pool:
+                continue
+            supp_sid = rng.choice(pool)
+            if qsid not in keep:
+                continue
+
+            if supp_sid not in bag_cache:
+                supp_img, supp_lbl = _load_raw(args.target_data_dir, supp_sid)
+                supp_slices, supp_zs = _support_bag_slices(
+                    volume_to_uint8(supp_img), supp_lbl, types,
+                    args.support_slices, args.support_min_gap)
+                bag_cache[supp_sid] = (build_multiclass_bags(seg, supp_slices, THR_HI, THR_LO,
+                                                             BODY_THRESH, BODY_MIN_PX),
+                                       _left_is_low_x(supp_lbl, types), supp_zs)
+            bags, low_x, supp_zs = bag_cache[supp_sid]
+
+            z0, z1 = int(fg_idx.min()), int(fg_idx.max())
+            vol_u8 = volume_to_uint8(q_img)[z0:z1 + 1]
+            frame_idx = key_slice(q_fg) - z0             # frozen slice, as in bag_key
+            frame_u8 = vol_u8[frame_idx]
+
+            boxes, score_maps = multiclass_boxes_for_frame(
+                seg, bags, frame_u8, low_x, BODY_THRESH, BODY_MIN_PX,
+                SCORE_THRESH, MARGIN_PX)
+            gt2d = q_fg[z0 + frame_idx].astype(bool)
+
+            if label_name not in boxes:                  # class claimed no cell on this leg
+                csv_rows.append({'class': label_name, 'label': label_val, 'scan': qsid,
+                                 'dice': 0.0, 'iou': 0.0, 'boxiou': 0.0})
+                print(f'[{label_name}] {qsid}: support={supp_sid} NO BOX (lost to a rival)')
+                continue
+
+            conf, box = boxes[label_name]
+            seg_crop = seg.segment_volume(vol_u8, {frame_idx: np.asarray(box, np.float32)},
+                                          refine_iters=args.refine_iters)
+            pred_full = np.zeros_like(q_fg)
+            pred_full[z0:z1 + 1] = seg_crop
+            pb, gb = pred_full[fg_idx].astype(bool), q_fg[fg_idx].astype(bool)
+            d, i = _dice(pb, gb), _iou(pb, gb)
+            boxiou = _box_iou(tuple(box), _gt_bbox(gt2d))
+            csv_rows.append({'class': label_name, 'label': label_val, 'scan': qsid,
+                             'dice': d, 'iou': i, 'boxiou': boxiou})
+
+            score_up = _upsample(score_maps[mtype], frame_u8.shape)
+            pred2d = seg_crop[frame_idx].astype(bool)
+
+            def m0(ax, f=frame_u8, s=score_up, g=gt2d, b=box):
+                ax.imshow(f, cmap='gray'); ax.imshow(s, cmap='jet', alpha=0.45)
+                ax.contour(g, colors='yellow', linewidths=1.5); _draw_box(ax, b)
+
+            def m1(ax, f=frame_u8, g=gt2d, pr=pred2d, b=box):
+                ax.imshow(f, cmap='gray'); ax.contour(g, colors='yellow', linewidths=1.5)
+                ax.contour(pr, colors='red', linewidths=1.5); _draw_box(ax, b, 2.0)
+
+            out = os.path.join(args.out_dir,
+                               f'{label_name}_{qsid}_dice{d:.3f}_boxiou{boxiou:.2f}.png')
+            _render(out, [m0, m1],
+                    [f'score[{mtype}] vs rivals  supp={supp_sid} bag z={supp_zs}',
+                     f'{qsid} [{label_name}] side={side}  Dice(vol)={d:.3f}'])
+            print(f'[{label_name}] {qsid}: support={supp_sid} Dice={d:.4f} '
+                  f'boxiou={boxiou:.3f} conf={conf:.3f} -> {os.path.basename(out)}')
+
+    if not csv_rows:
+        print('No scans scored — nothing written.')
+        return
+    csv_path = os.path.join(args.out_dir, 'scores.csv')
+    with open(csv_path, 'w', newline='') as f:
+        w = csv.DictWriter(f, fieldnames=CSV_FIELDS + ['boxiou'])
+        w.writeheader()
+        w.writerows(csv_rows)
+    print(f'\nPer-scan scores -> {csv_path}\n'
+          f'  triage: python3 scripts/eval/debug_medsam2.py triage {args.out_dir}')
+
+
 # ============================== CLI ==============================
 
 
@@ -469,6 +634,22 @@ def main() -> None:
     v.add_argument('--device', default=None)
     v.add_argument('--out_dir', required=True)
     v.set_defaults(func=cmd_vis)
+
+    m = sub.add_parser('mcvis', help='B2: box from cross-class competition (frozen slice)')
+    m.add_argument('--config', required=True)
+    m.add_argument('--medsam2_ckpt', required=True)
+    m.add_argument('--sam2_cfg', required=True)
+    m.add_argument('--target_data_dir', required=True)
+    m.add_argument('--test_labels', type=int, nargs='+', default=None)
+    m.add_argument('--support_slices', type=int, default=3,
+                   help='K slices per muscle type in the support bags (B1)')
+    m.add_argument('--support_min_gap', type=int, default=3)
+    m.add_argument('--refine_iters', type=int, default=1)
+    m.add_argument('--seed', type=int, default=42, help='must match the eval to reproduce pairings')
+    m.add_argument('--only', nargs='+', default=None)
+    m.add_argument('--device', default=None)
+    m.add_argument('--out_dir', required=True)
+    m.set_defaults(func=cmd_mcvis)
 
     args = ap.parse_args()
     args.func(args)

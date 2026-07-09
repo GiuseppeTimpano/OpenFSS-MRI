@@ -5,6 +5,8 @@ encoder. Used by scripts/eval/eval_medsam2.py (prompt_mode=support_bbox).
 Point-prompt variants were removed once box prompting superseded them (R_HS, 20 HV scans:
 point Dice 0.3673 vs box 0.6370). See git history.
 """
+from collections import defaultdict
+
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -274,3 +276,137 @@ def support_prompt_for_query_dense_bodymasked_bbox_consensus(seg, supp_slices: l
 
     winner = min(top, key=dist_to_median)
     return winner[1], winner[2]
+
+
+# ================================ B2: multiclass matching ================================
+# The binary Neg bag is one max over the whole body (thousands of columns), so neg_map is
+# nearly constant and score = pos - neg degenerates to pos: nothing ever says "that is GR,
+# not SA". Here every muscle TYPE gets its own bag and they compete cell by cell.
+# Types, not the 8 labels: L_QF and R_QF are indistinguishable in feature space, so making
+# them rivals cancels both scores. Side is recovered spatially (the two legs are already
+# two connected components of the body mask).
+
+BG_KEY = 'BG'
+
+
+def _to_grid(mask2d: np.ndarray, h: int, w: int, device=None) -> torch.Tensor:
+    t = torch.from_numpy(mask2d.astype(np.float32))[None, None]
+    g = F.interpolate(t, size=(h, w), mode='bilinear', align_corners=False)[0, 0]
+    return g.to(device) if device is not None else g
+
+
+def build_multiclass_bags(seg, supp_slices: list, thr_hi: float = 0.7, thr_lo: float = 0.3,
+                          body_thresh: float = 10.0, body_min_px: int = 50) -> dict:
+    """supp_slices: [(frame_u8, {cls: mask2d})], cls = muscle type (L+R pooled).
+    One L2-normalized bag per type + a BG bag (body minus every type: bone, fat, skin).
+    Returns {cls: [C,N]}, BG_KEY included."""
+    bags = defaultdict(list)
+    for frame_u8, cls_masks in supp_slices:
+        feat = seg.embed_frame(frame_u8)
+        C, h, w = feat.shape
+        flat = feat.reshape(C, h * w)
+        body = _to_grid(body_mask2d(frame_u8, body_thresh, body_min_px), h, w, feat.device)
+        is_bg = body.reshape(-1) > 0.5
+
+        for cls, m2d in cls_masks.items():
+            m = _to_grid(m2d, h, w, feat.device).reshape(-1)
+            idx = (m > thr_hi).nonzero(as_tuple=True)[0]
+            if idx.numel():
+                bags[cls].append(F.normalize(flat[:, idx], dim=0))
+            is_bg &= (m < thr_lo)
+
+        idx = is_bg.nonzero(as_tuple=True)[0]
+        if idx.numel():
+            bags[BG_KEY].append(F.normalize(flat[:, idx], dim=0))
+
+    return {c: torch.cat(v, dim=1) for c, v in bags.items()}
+
+
+def multiclass_score_maps(feat_query: torch.Tensor, bags: dict) -> dict:
+    """score_c(x) = pos_c(x) - max over the rival bags (other types AND BG). The rival is
+    an explicit balanced bag, not a saturated max over the whole body, so the contrast
+    actually discriminates. Returns {cls: [h,w]} for the muscle types only."""
+    C, h, w = feat_query.shape
+    Qn = F.normalize(feat_query.reshape(C, h * w), dim=0)
+    pos = {c: (B.t() @ Qn).max(dim=0).values.reshape(h, w)
+           for c, B in bags.items() if B.shape[1] > 0}
+
+    out = {}
+    for c in pos:
+        if c == BG_KEY:
+            continue
+        rivals = torch.stack([p for k, p in pos.items() if k != c])
+        out[c] = (pos[c] - rivals.max(dim=0).values).cpu().numpy()
+    return out
+
+
+def side_masks(body2d: np.ndarray, left_is_low_x: bool) -> dict:
+    """The two legs are the two largest components of the body mask. Falls back to the
+    whole body when they touch. Returns {'L': mask, 'R': mask}."""
+    from skimage.measure import label as cc_label
+
+    lab = cc_label(body2d)
+    sizes = np.bincount(lab.flat)
+    sizes[0] = 0
+    comps = [c for c in np.argsort(sizes)[::-1][:2] if sizes[c] > 0]
+    if len(comps) < 2:
+        return {'L': body2d.copy(), 'R': body2d.copy()}
+
+    lo, hi = sorted(comps, key=lambda c: np.where(lab == c)[1].mean())
+    l, r = (lo, hi) if left_is_low_x else (hi, lo)
+    return {'L': lab == l, 'R': lab == r}
+
+
+def _box_from_blob(blob: np.ndarray, score: np.ndarray, img_hw: tuple,
+                   margin_px: float = 0.0) -> tuple:
+    """Connected component of blob containing its best-scoring cell -> box in (H,W) px."""
+    from skimage.measure import label as cc_label
+
+    h, w = score.shape
+    H, W = img_hw
+    lab = cc_label(blob)
+    seed = np.unravel_index(np.argmax(np.where(blob, score, -np.inf)), score.shape)
+    sel = (lab == lab[seed]) if lab[seed] else blob
+
+    ys, xs = np.where(sel)
+    x0, x1 = float(xs.min()) / w * W, float(xs.max() + 1) / w * W
+    y0, y1 = float(ys.min()) / h * H, float(ys.max() + 1) / h * H
+    return (max(0.0, x0 - margin_px), max(0.0, y0 - margin_px),
+            min(float(W), x1 + margin_px), min(float(H), y1 + margin_px))
+
+
+def multiclass_boxes(score_maps: dict, query_body2d: np.ndarray, img_hw: tuple,
+                     left_is_low_x: bool, score_thresh: float = 0.0,
+                     margin_px: float = 0.0) -> dict:
+    """Winner-take-all per cell across the types, then one box per (side, type): the cells
+    that type c wins, intersected with that leg. Two types can no longer claim the same
+    pixels, and a confident false match on bone marrow dies because BG wins there.
+    Returns {'<side>_<type>': (score, box_xyxy)}."""
+    names = sorted(score_maps)
+    stack = np.stack([score_maps[c] for c in names])   # [K,h,w]
+    win, best = stack.argmax(0), stack.max(0)
+    h, w = best.shape
+
+    out = {}
+    for si, smask in side_masks(query_body2d, left_is_low_x).items():
+        leg = _to_grid(smask, h, w).numpy() > 0.5
+        for ci, c in enumerate(names):
+            blob = (win == ci) & (best > score_thresh) & leg
+            if not blob.any():
+                continue
+            out[f'{si}_{c}'] = (float(best[blob].max()),
+                                _box_from_blob(blob, best, img_hw, margin_px))
+    return out
+
+
+def multiclass_boxes_for_frame(seg, bags: dict, frame_u8: np.ndarray, left_is_low_x: bool,
+                               body_thresh: float = 10.0, body_min_px: int = 50,
+                               score_thresh: float = 0.0, margin_px: float = 0.0) -> tuple:
+    """One query frame -> all 8 boxes at once. returns ({'<side>_<type>': (score, box)},
+    score_maps) -- the maps come back for the debug overlay."""
+    feat = seg.embed_frame(frame_u8)
+    score_maps = multiclass_score_maps(feat, bags)
+    body = body_mask2d(frame_u8, body_thresh, body_min_px)
+    boxes = multiclass_boxes(score_maps, body, frame_u8.shape, left_is_low_x,
+                             score_thresh, margin_px)
+    return boxes, score_maps

@@ -12,6 +12,7 @@
 #   bag          B1 vis: K support slices, R_SA+R_GR only        -> results/debug_vis/bag_k<K>/
 #   bag_key      B1 vis with slice frozen (query_slice=key)      -> results/debug_vis/bag_key_k<K>/
 #   bag_eval     B1 sweep: K=1/3/5, all 8 labels                 -> results/bag/k<K>/
+#   mc           B2 vis: cross-class competition, slice frozen    -> results/debug_vis/mc_k3/
 #   support      vis, box from matching (R_SA, R_GR)            -> results/debug_vis/<label>_auto/
 #   allsupp      vis, 1 R_SA query vs EVERY support (variance)  -> results/debug_vis/R_SA_HV010_allsupp/
 #   dice [dir]   reprint the table of a past run; no dir => every run under results/
@@ -33,6 +34,8 @@ EVAL="python3 scripts/eval/eval_medsam2.py --config $EVAL_CFG --medsam2_ckpt $CK
       --sam2_cfg $CFG --target_data_dir $DATA --device $DEV"
 VIS="python3 scripts/eval/debug_medsam2.py vis --config $EVAL_CFG --medsam2_ckpt $CKPT
      --sam2_cfg $CFG --target_data_dir $DATA --device $DEV --refine_iters 1"
+MCVIS="python3 scripts/eval/debug_medsam2.py mcvis --config $EVAL_CFG --medsam2_ckpt $CKPT
+       --sam2_cfg $CFG --target_data_dir $DATA --device $DEV --refine_iters 1"
 TRIAGE="python3 scripts/eval/debug_medsam2.py triage"
 
 case "${1:-}" in
@@ -122,6 +125,15 @@ bag_eval)     # B1 full sweep, only worth running if `bag` shows a sharper map. 
   done
   ;;
 
+mc)           # B2: cross-class competition instead of the binary pos/neg bag. Slice frozen,
+  OUT=results/debug_vis/mc_k3    # same seed/pairing as bag_key_k3 -> boxiou compares directly
+  $MCVIS --support_slices 3 --out_dir $OUT
+  $TRIAGE $OUT
+  echo; echo "########## reference: bag_key_k3 (binary bag, same slice) ##########"
+  [ -d results/debug_vis/bag_key_k3 ] && $TRIAGE results/debug_vis/bag_key_k3
+  echo "=== SA/GR boxiou up and QF/HS not collapsing = B2 works, wire it into eval_medsam2.py"
+  ;;
+
 support)      # the two thin muscles that fail (R_SA=7, R_GR=8)
   for L in 7 8; do
     NAME=$([ "$L" = 7 ] && echo R_SA || echo R_GR)
@@ -157,6 +169,6 @@ dice)         # reprint a past run: reads scores.csv, does not touch the model
   ;;
 
 *)
-  sed -n '2,18p' "$0"; exit 1
+  sed -n '2,19p' "$0"; exit 1
   ;;
 esac
