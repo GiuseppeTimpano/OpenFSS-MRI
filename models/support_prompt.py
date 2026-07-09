@@ -340,21 +340,53 @@ def multiclass_score_maps(feat_query: torch.Tensor, bags: dict) -> dict:
     return out
 
 
-def side_masks(body2d: np.ndarray, left_is_low_x: bool) -> dict:
-    """The two legs are the two largest components of the body mask. Falls back to the
-    whole body when they touch. Returns {'L': mask, 'R': mask}."""
+def _split_at_midline(body2d: np.ndarray) -> tuple:
+    """Cut the body in two at the column with the fewest body pixels, searched around the
+    centroid: on an axial thigh that column is the gap between the two legs. Used when the
+    legs touch, where a connected-component split would return one blob."""
+    cols = body2d.sum(axis=0).astype(np.float64)
+    w = body2d.shape[1]
+    cx = int(np.average(np.arange(w), weights=cols)) if cols.sum() else w // 2
+
+    lo, hi = max(1, cx - w // 6), min(w - 1, cx + w // 6 + 1)
+    cut = lo + int(np.argmin(cols[lo:hi])) if hi > lo else cx
+
+    left, right = body2d.copy(), body2d.copy()
+    left[:, cut:] = False
+    right[:, :cut] = False
+    return left, right
+
+
+def _two_legs_cc(body2d: np.ndarray, min_leg_ratio: float = 0.2):
+    """The two legs as connected components, ordered by x. None when they touch (one
+    component) or when the second component is too small to be a leg (a coil, a marker)."""
     from skimage.measure import label as cc_label
 
     lab = cc_label(body2d)
     sizes = np.bincount(lab.flat)
     sizes[0] = 0
     comps = [c for c in np.argsort(sizes)[::-1][:2] if sizes[c] > 0]
-    if len(comps) < 2:
-        return {'L': body2d.copy(), 'R': body2d.copy()}
+    if len(comps) < 2 or sizes[comps[1]] < min_leg_ratio * sizes[comps[0]]:
+        return None
 
-    lo, hi = sorted(comps, key=lambda c: np.where(lab == c)[1].mean())
-    l, r = (lo, hi) if left_is_low_x else (hi, lo)
-    return {'L': lab == l, 'R': lab == r}
+    a, b = sorted(comps, key=lambda c: np.where(lab == c)[1].mean())
+    return lab == a, lab == b
+
+
+def legs_are_separate(body2d: np.ndarray, min_leg_ratio: float = 0.2) -> bool:
+    """True when the CC split is trustworthy. False = side_masks used the midline cut."""
+    return _two_legs_cc(body2d, min_leg_ratio) is not None
+
+
+def side_masks(body2d: np.ndarray, left_is_low_x: bool,
+               min_leg_ratio: float = 0.2) -> dict:
+    """Split the body mask into the two legs. Two comparable connected components = the two
+    legs; otherwise fall back to a midline cut -- never to the whole body for both sides,
+    which would hand L and R the same box. Returns {'L': mask, 'R': mask}."""
+    legs = _two_legs_cc(body2d, min_leg_ratio)
+    lo_m, hi_m = legs if legs is not None else _split_at_midline(body2d)
+    l, r = (lo_m, hi_m) if left_is_low_x else (hi_m, lo_m)
+    return {'L': l, 'R': r}
 
 
 def _box_from_blob(blob: np.ndarray, score: np.ndarray, img_hw: tuple,

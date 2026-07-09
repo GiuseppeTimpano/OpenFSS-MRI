@@ -446,12 +446,16 @@ def _winner_map(score_maps: dict, hw: tuple) -> tuple:
     return win, best, names
 
 
-def _draw_winner(ax, frame_u8, win, names, boxes, target: str):
-    """Winner map + every class box (target thick white, rivals thin, BG left grey)."""
+def _draw_winner(ax, frame_u8, win, names, boxes, target: str, leg=None):
+    """Winner map + every class box (target thick white, rivals thin, BG left grey).
+    `leg` = the target side mask, contoured: a straight vertical edge means the legs touched
+    and the midline cut fired, which is where contralateral confusion comes from."""
     from matplotlib.colors import ListedColormap, to_rgba
     ax.imshow(frame_u8, cmap='gray')
     cmap = ListedColormap([to_rgba(TYPE_COLORS.get(n, 'magenta')) for n in names])
     ax.imshow(np.ma.masked_less(win, 0), cmap=cmap, vmin=0, vmax=len(names) - 1, alpha=0.45)
+    if leg is not None:
+        ax.contour(leg, colors='white', linewidths=0.8, linestyles='dashed')
     for name, (_score, box) in boxes.items():
         is_target = name == target
         _draw_box(ax, box, 2.6 if is_target else 1.0,
@@ -516,7 +520,8 @@ def cmd_mcvis(args) -> None:
     import torch
     import yaml
     from models.medsam2_adapter import MedSAM2Segmenter, volume_to_uint8
-    from models.support_prompt import build_multiclass_bags, key_slice, multiclass_boxes_for_frame
+    from models.support_prompt import (body_mask2d, build_multiclass_bags, key_slice,
+                                       legs_are_separate, multiclass_boxes_for_frame, side_masks)
     from eval_medsam2 import _read_nii, _load_raw
 
     device = args.device or ('cuda' if torch.cuda.is_available() else 'cpu')
@@ -586,8 +591,12 @@ def cmd_mcvis(args) -> None:
             score_up = _upsample(score_maps[mtype], frame_u8.shape)
             owned = float((win == names.index(mtype)).mean())   # frame share this type claims
 
-            def w(ax, f=frame_u8, wn=win, nm=names, bx=boxes, t=label_name, g=gt2d):
-                _draw_winner(ax, f, wn, nm, bx, t)
+            body2d = body_mask2d(frame_u8, BODY_THRESH, BODY_MIN_PX)
+            leg2d = side_masks(body2d, low_x)[side]
+            split = 'cc' if legs_are_separate(body2d) else 'MIDLINE'
+
+            def w(ax, f=frame_u8, wn=win, nm=names, bx=boxes, t=label_name, g=gt2d, lg=leg2d):
+                _draw_winner(ax, f, wn, nm, bx, t, lg)
                 ax.contour(g, colors='yellow', linewidths=1.5)
 
             def sc(ax, f=frame_u8, s=score_up, g=gt2d):
@@ -596,16 +605,16 @@ def cmd_mcvis(args) -> None:
 
             legend = ' '.join(f'{n}={TYPE_COLORS.get(n, "?").replace("tab:", "")}'
                               for n in names)
-            t_win = f'winner  supp={supp_sid} z={supp_zs}\n{legend}'
+            t_win = f'winner  supp={supp_sid} z={supp_zs}  split={split}\n{legend}'
             t_sc = f'score[{mtype}] - max(rivals)   claims {owned:.1%} of frame'
 
             if label_name not in boxes:      # every cell of this leg lost to a rival
                 csv_rows.append({'class': label_name, 'label': label_val, 'scan': qsid,
-                                 'dice': 0.0, 'iou': 0.0, 'boxiou': 0.0})
+                                 'dice': 0.0, 'iou': 0.0, 'boxiou': 0.0, 'split': split})
                 out = os.path.join(args.out_dir, f'{label_name}_{qsid}_NOBOX.png')
                 _render(out, [w, sc], [t_win, t_sc])
                 print(f'[{label_name}] {qsid}: support={supp_sid} NO BOX (lost to a rival) '
-                      f'-> {os.path.basename(out)}')
+                      f'split={split} -> {os.path.basename(out)}')
                 continue
 
             conf, box = boxes[label_name]
@@ -617,7 +626,7 @@ def cmd_mcvis(args) -> None:
             d, i = _dice(pb, gb), _iou(pb, gb)
             boxiou = _box_iou(tuple(box), _gt_bbox(gt2d))
             csv_rows.append({'class': label_name, 'label': label_val, 'scan': qsid,
-                             'dice': d, 'iou': i, 'boxiou': boxiou})
+                             'dice': d, 'iou': i, 'boxiou': boxiou, 'split': split})
             pred2d = seg_crop[frame_idx].astype(bool)
 
             def m1(ax, f=frame_u8, g=gt2d, pr=pred2d, b=box):
@@ -630,17 +639,20 @@ def cmd_mcvis(args) -> None:
                     f'{qsid} [{label_name}] side={side}  Dice(vol)={d:.3f} boxiou={boxiou:.2f}'])
             print(f'[{label_name}] {qsid}: support={supp_sid} Dice={d:.4f} '
                   f'boxiou={boxiou:.3f} conf={conf:.3f} claims={owned:.1%} '
-                  f'-> {os.path.basename(out)}')
+                  f'split={split} -> {os.path.basename(out)}')
 
     if not csv_rows:
         print('No scans scored — nothing written.')
         return
     csv_path = os.path.join(args.out_dir, 'scores.csv')
     with open(csv_path, 'w', newline='') as f:
-        w = csv.DictWriter(f, fieldnames=CSV_FIELDS + ['boxiou'])
+        w = csv.DictWriter(f, fieldnames=CSV_FIELDS + ['boxiou', 'split'])
         w.writeheader()
         w.writerows(csv_rows)
+
+    n_mid = sum(r['split'] == 'MIDLINE' for r in csv_rows)
     print(f'\nPer-scan scores -> {csv_path}\n'
+          f'  leg split: {len(csv_rows) - n_mid} cc, {n_mid} midline (touching legs)\n'
           f'  triage: python3 scripts/eval/debug_medsam2.py triage {args.out_dir}')
 
 
