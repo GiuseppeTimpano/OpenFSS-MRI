@@ -21,6 +21,7 @@ utils/felzenszwalb_3d/build/
 data/datasets/CHAOS/
 data/datasets/AMOS/
 data/datasets/MRI_muscle
+data/datasets/MRI_muscle_2
 
 evaluation_util/
 weights/
