@@ -134,6 +134,14 @@ mc)           # B2: cross-class competition instead of the binary pos/neg bag. S
   echo "=== SA/GR boxiou up and QF/HS not collapsing = B2 works, wire it into eval_medsam2.py"
   ;;
 
+mc_nocc)      # ablation: same as mc, but _box_from_blob reverted to pre-fix seed-only CC
+  OUT=results/debug_vis/mc_k3_nocc
+  $MCVIS --support_slices 3 --out_dir $OUT --cc_mode seed_only
+  $TRIAGE $OUT
+  echo; echo "########## reference: mc_k3 (dilate_largest, current fix) ##########"
+  [ -d results/debug_vis/mc_k3 ] && $TRIAGE results/debug_vis/mc_k3
+  ;;
+
 support)      # the two thin muscles that fail (R_SA=7, R_GR=8)
   for L in 7 8; do
     NAME=$([ "$L" = 7 ] && echo R_SA || echo R_GR)
