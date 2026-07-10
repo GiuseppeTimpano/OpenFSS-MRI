@@ -1,0 +1,6 @@
+# MRI_muscle_2 dataset (figshare single-leg thigh) — zero-shot MedSAM2 eval config.
+
+data:
+  data_dir: data/datasets/MRI_muscle_2/processed/WATER
+  n_folds: 5
+  label_names: [BG, QF, HS, SA, GR, AD, GLUT]

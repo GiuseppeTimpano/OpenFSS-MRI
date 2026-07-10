@@ -82,23 +82,20 @@ def extract_support_vectors_bodymasked(feat: torch.Tensor, mask2d: np.ndarray,
 
 
 def dense_similarity_maps(feat_query: torch.Tensor, Pos_n: torch.Tensor,
-                           Neg_n: torch.Tensor, sim_topk: int = 1) -> tuple:
-    """Per query cell, top-k mean cosine similarity against the whole positive bag and,
-    separately, the whole negative bag (nearest-neighbor matching, softened by averaging the
-    k best matches instead of taking the single best). Returns (pos_map, neg_map) [h,w]; an
-    empty bag yields an all -1 map. sim_topk=1 reproduces plain max exactly (topk(1).mean ==
-    max)."""
+                           Neg_n: torch.Tensor) -> tuple:
+    """Per query cell, max cosine similarity against the whole positive bag and, separately,
+    the whole negative bag (nearest-neighbor matching). Returns (pos_map, neg_map) [h,w]; an
+    empty bag yields an all -1 map."""
     C, h, w = feat_query.shape
     Q_n = F.normalize(feat_query.reshape(C, h * w), dim=0)  # [C,M]
 
-    def _topk_mean_sim(Bag_n):
+    def _max_sim(Bag_n):
         if Bag_n.shape[1] == 0:
             return -np.ones((h, w), dtype=np.float32)
         sim = Bag_n.t() @ Q_n                 # [N,M]
-        k = min(sim_topk, sim.shape[0])
-        return sim.topk(k, dim=0).values.mean(dim=0).reshape(h, w).cpu().numpy()
+        return sim.max(dim=0).values.reshape(h, w).cpu().numpy()
 
-    return _topk_mean_sim(Pos_n), _topk_mean_sim(Neg_n)
+    return _max_sim(Pos_n), _max_sim(Neg_n)
 
 
 def bbox_from_similarity_blob(pos_map: np.ndarray, neg_map: np.ndarray,
@@ -174,8 +171,7 @@ def build_support_bag(seg, supp_slices: list, thr_hi: float = 0.7, thr_lo: float
 def score_query_frames(seg, supp_slices: list, query_frames: list,
                         thr_hi: float = 0.7, thr_lo: float = 0.3,
                         body_thresh: float = 10.0, body_min_px: int = 50,
-                        score_thresh: float = 0.0, margin_px: float = 0.0,
-                        sim_topk: int = 1) -> list:
+                        score_thresh: float = 0.0, margin_px: float = 0.0) -> list:
     """seg: MedSAM2Segmenter (only seg.embed_frame is used).
     supp_slices: [(frame_u8, mask2d)] support slices + their GT masks.
     query_frames: list[(frame_idx, frame_u8)] candidates.
@@ -189,7 +185,7 @@ def score_query_frames(seg, supp_slices: list, query_frames: list,
     cands = []
     for fidx, frame_u8 in query_frames:
         feat = seg.embed_frame(frame_u8)
-        pos_map, neg_map = dense_similarity_maps(feat, Pos_n, Neg_n, sim_topk)
+        pos_map, neg_map = dense_similarity_maps(feat, Pos_n, Neg_n)
         q_body = body_mask2d(frame_u8, body_thresh, body_min_px)
         box = bbox_from_similarity_blob(pos_map, neg_map, q_body, frame_u8.shape,
                                         score_thresh, margin_px)
@@ -218,15 +214,13 @@ def support_prompt_for_query_dense_bodymasked_bbox(seg, supp_slices: list,
                                                     body_thresh: float = 10.0,
                                                     body_min_px: int = 50,
                                                     score_thresh: float = 0.0,
-                                                    margin_px: float = 0.0,
-                                                    sim_topk: int = 1) -> tuple:
+                                                    margin_px: float = 0.0) -> tuple:
     """Single-prompt case: the query frame with the highest max(pos_map - neg_map).
 
     returns: (frame_idx, box_xyxy)
     """
     cands = score_query_frames(seg, supp_slices, query_frames, thr_hi,
-                                thr_lo, body_thresh, body_min_px, score_thresh, margin_px,
-                                sim_topk)
+                                thr_lo, body_thresh, body_min_px, score_thresh, margin_px)
     _, fidx, box = pick_anchors(cands, n_anchors=1)[0]
     return fidx, box
 
@@ -237,8 +231,7 @@ def support_anchors_dense_bodymasked_bbox(seg, supp_slices: list, query_frames: 
                                            body_thresh: float = 10.0,
                                            body_min_px: int = 50,
                                            score_thresh: float = 0.0,
-                                           margin_px: float = 0.0,
-                                           sim_topk: int = 1) -> dict:
+                                           margin_px: float = 0.0) -> dict:
     """Multi-prompt (B4): re-anchor the box on up to n_anchors slices instead of one.
     SAM2 then propagates from every anchor, so a bad box no longer sinks the whole volume
     and memory attention is refreshed before the object is lost. Boxes for all candidate
@@ -247,8 +240,7 @@ def support_anchors_dense_bodymasked_bbox(seg, supp_slices: list, query_frames: 
     returns: {frame_idx -> box_xyxy float32}, ready for MedSAM2Segmenter.segment_volume.
     """
     cands = score_query_frames(seg, supp_slices, query_frames, thr_hi,
-                                thr_lo, body_thresh, body_min_px, score_thresh, margin_px,
-                                sim_topk)
+                                thr_lo, body_thresh, body_min_px, score_thresh, margin_px)
     return {fidx: np.asarray(box, dtype=np.float32)
             for _, fidx, box in pick_anchors(cands, n_anchors, min_gap)}
 
@@ -260,8 +252,7 @@ def support_prompt_for_query_dense_bodymasked_bbox_consensus(seg, supp_slices: l
                                                               body_min_px: int = 50,
                                                               score_thresh: float = 0.0,
                                                               margin_px: float = 0.0,
-                                                              consensus_k: int = 5,
-                                                              sim_topk: int = 1) -> tuple:
+                                                              consensus_k: int = 5) -> tuple:
     """Same as ..._bbox, but instead of the winner-take-all frame (global argmax score,
     occasionally won by a confident false match on bone marrow), picks among the top
     consensus_k frames the one whose box center is closest to their median center -- a
@@ -273,8 +264,7 @@ def support_prompt_for_query_dense_bodymasked_bbox_consensus(seg, supp_slices: l
     candidates = [(score, fidx, box, ((box[0] + box[2]) / 2.0, (box[1] + box[3]) / 2.0))
                   for score, fidx, box in
                   score_query_frames(seg, supp_slices, query_frames, thr_hi,
-                                     thr_lo, body_thresh, body_min_px, score_thresh, margin_px,
-                                     sim_topk)]
+                                     thr_lo, body_thresh, body_min_px, score_thresh, margin_px)]
     candidates.sort(key=lambda c: -c[0])
     top = candidates[:max(1, min(consensus_k, len(candidates)))]
     med_cx = float(np.median([c[3][0] for c in top]))
@@ -332,25 +322,18 @@ def build_multiclass_bags(seg, supp_slices: list, thr_hi: float = 0.7, thr_lo: f
     return {c: torch.cat(v, dim=1) for c, v in bags.items()}
 
 
-def multiclass_score_maps(feat_query: torch.Tensor, bags: dict, sim_topk: int = 1) -> dict:
+def multiclass_score_maps(feat_query: torch.Tensor, bags: dict) -> dict:
     """score_c(x) = pos_c(x) - max over the rival bags (other types AND BG). The rival is
     an explicit balanced bag, not a saturated max over the whole body, so the contrast
-    actually discriminates. Returns {cls: [h,w]} for the muscle types only.
-
-    pos_c(x) is the top-k mean similarity against bag c, not the plain max: with a plain max,
-    a bigger bag (e.g. QF/HS, many more foreground cells above thr_hi than SA/GR) wins more
-    often on order-statistics alone (max of N similarities grows with N), independent of true
-    relevance -- this is what let big-muscle bags steal thin-muscle pixels. Averaging a fixed
-    k caps that bias. sim_topk=1 reproduces plain max exactly."""
+    actually discriminates. Returns {cls: [h,w]} for the muscle types only."""
     C, h, w = feat_query.shape
     Qn = F.normalize(feat_query.reshape(C, h * w), dim=0)
 
-    def _topk_mean(B):
+    def _max_sim(B):
         sim = B.t() @ Qn                      # [N,M]
-        k = min(sim_topk, sim.shape[0])
-        return sim.topk(k, dim=0).values.mean(dim=0).reshape(h, w)
+        return sim.max(dim=0).values.reshape(h, w)
 
-    pos = {c: _topk_mean(B) for c, B in bags.items() if B.shape[1] > 0}
+    pos = {c: _max_sim(B) for c, B in bags.items() if B.shape[1] > 0}
 
     out = {}
     for c in pos:
@@ -454,12 +437,11 @@ def multiclass_boxes(score_maps: dict, query_body2d: np.ndarray, img_hw: tuple,
 
 def multiclass_boxes_for_frame(seg, bags: dict, frame_u8: np.ndarray, left_is_low_x: bool,
                                body_thresh: float = 10.0, body_min_px: int = 50,
-                               score_thresh: float = 0.0, margin_px: float = 0.0,
-                               sim_topk: int = 1) -> tuple:
+                               score_thresh: float = 0.0, margin_px: float = 0.0) -> tuple:
     """One query frame -> all 8 boxes at once. returns ({'<side>_<type>': (score, box)},
     score_maps) -- the maps come back for the debug overlay."""
     feat = seg.embed_frame(frame_u8)
-    score_maps = multiclass_score_maps(feat, bags, sim_topk)
+    score_maps = multiclass_score_maps(feat, bags)
     body = body_mask2d(frame_u8, body_thresh, body_min_px)
     boxes = multiclass_boxes(score_maps, body, frame_u8.shape, left_is_low_x,
                              score_thresh, margin_px)

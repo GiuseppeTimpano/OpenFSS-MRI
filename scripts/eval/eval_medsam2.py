@@ -72,7 +72,7 @@ def evaluate(cfg: dict, checkpoint: str, model_cfg: str,
              seed: int = 42, refine_iters: int = 0,
              query_slice: str = 'auto', n_anchors: int = 1,
              anchor_min_gap: int = 3, support_slices: int = 1,
-             support_min_gap: int = 3, sim_topk: int = 1) -> dict:
+             support_min_gap: int = 3) -> dict:
     data_cfg    = cfg['data']
     data_dir    = data_cfg['data_dir']
     n_folds     = data_cfg['n_folds']
@@ -165,7 +165,7 @@ def evaluate(cfg: dict, checkpoint: str, model_cfg: str,
                     query_frames = [(int(z) - z0, vol_u8[int(z) - z0]) for z in fg_idx]
                 boxes = support_anchors_dense_bodymasked_bbox(
                     seg, supp, query_frames,
-                    n_anchors=n_anchors, min_gap=anchor_min_gap, sim_topk=sim_topk)
+                    n_anchors=n_anchors, min_gap=anchor_min_gap)
                 seg_crop = seg.segment_volume(vol_u8, boxes, refine_iters=refine_iters)
             else:
                 boxes = _build_boxes(q_fg, fg_idx, z0, prompt_mode, margin)
@@ -271,11 +271,6 @@ if __name__ == '__main__':
                              'behavior. Same support volume, so still 1-shot')
     parser.add_argument('--support_min_gap', type=int, default=3,
                         help='min z-distance between support slices (--support_slices > 1)')
-    parser.add_argument('--sim_topk',        type=int, default=1,
-                        help='average the top-K bag similarities per query cell instead of the '
-                             'plain max; 1 = previous behavior. Caps the order-statistics bias '
-                             'that lets a bigger bag (e.g. QF/HS) win pixels over a smaller one '
-                             '(e.g. SA/GR) on sample count alone')
     parser.add_argument('--save_dir',        type=str, default=None,
                         help='where to write scores.csv/summary.csv and best/worst volumes')
     parser.add_argument('--save_topk',       type=int, default=1,
@@ -306,5 +301,4 @@ if __name__ == '__main__':
         anchor_min_gap  = args.anchor_min_gap,
         support_slices  = args.support_slices,
         support_min_gap = args.support_min_gap,
-        sim_topk        = args.sim_topk,
     )
