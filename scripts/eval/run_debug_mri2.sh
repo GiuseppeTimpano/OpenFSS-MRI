@@ -14,10 +14,8 @@
 #   bag          B1 vis: K support slices, SA+GR only            -> results/mri_muscle_2/debug_vis/bag_k<K>/
 #   bag_key      B1 vis with slice frozen (query_slice=key)      -> results/mri_muscle_2/debug_vis/bag_key_k<K>/
 #   bag_eval     B1 sweep: K=1/3/5, all 6 labels                 -> results/mri_muscle_2/bag/k<K>/
-#   mc           B2 vis: cross-class competition -- NOT YET SUPPORTED on single-leg data.
-#                multiclass_boxes()/side_masks() in models/support_prompt.py assume two legs
-#                and would midline-cut this single leg into fake L/R halves. Needs a single-leg
-#                patch before running. Exits with an error here instead of silently corrupting.
+#   mc           B2 vis: cross-class competition, single-leg mode (--single_leg)
+#                -> results/mri_muscle_2/debug_vis/mc_k3/
 #   support      vis, box from matching (SA, GR)                -> results/mri_muscle_2/debug_vis/<label>_auto/
 #   allsupp      vis, 1 SA query vs EVERY support (variance)    -> results/mri_muscle_2/debug_vis/SA_allsupp/
 #   dice [dir]   reprint the table of a past run; no dir => every run under results/mri_muscle_2/
@@ -39,6 +37,8 @@ EVAL="python3 scripts/eval/eval_medsam2.py --config $EVAL_CFG --medsam2_ckpt $CK
       --sam2_cfg $CFG --target_data_dir $DATA --device $DEV"
 VIS="python3 scripts/eval/debug_medsam2.py vis --config $EVAL_CFG --medsam2_ckpt $CKPT
      --sam2_cfg $CFG --target_data_dir $DATA --device $DEV --refine_iters 1"
+MCVIS="python3 scripts/eval/debug_medsam2.py mcvis --config $EVAL_CFG --medsam2_ckpt $CKPT
+       --sam2_cfg $CFG --target_data_dir $DATA --device $DEV --refine_iters 1 --single_leg"
 TRIAGE="python3 scripts/eval/debug_medsam2.py triage"
 
 case "${1:-}" in
@@ -128,12 +128,12 @@ bag_eval)     # B1 full sweep, only worth running if `bag` shows a sharper map. 
   done
   ;;
 
-mc)
-  echo "mc: not supported yet on MRI_muscle_2." >&2
-  echo "multiclass_boxes()/side_masks() (models/support_prompt.py:380-435) assume a two-leg" >&2
-  echo "body mask and would midline-cut this single leg into fake L/R halves." >&2
-  echo "Needs a single-leg patch before this recipe can run here." >&2
-  exit 1
+mc)           # B2: cross-class competition, single-leg mode (whole body = one group, no L/R)
+  OUT=results/mri_muscle_2/debug_vis/mc_k3    # same seed/pairing as bag_key_k3 -> boxiou compares directly
+  $MCVIS --support_slices 3 --out_dir $OUT
+  $TRIAGE $OUT
+  echo; echo "########## reference: bag_key_k3 (binary bag, same slice) ##########"
+  [ -d results/mri_muscle_2/debug_vis/bag_key_k3 ] && $TRIAGE results/mri_muscle_2/debug_vis/bag_key_k3
   ;;
 
 support)      # the two thin muscles that fail (SA=3, GR=4)

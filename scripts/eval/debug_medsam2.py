@@ -433,7 +433,8 @@ def cmd_vis(args) -> None:
 # same seed, same support pairing, same query slice -> only the matching rule changes.
 
 
-TYPE_COLORS = {'QF': 'tab:red', 'HS': 'tab:blue', 'SA': 'tab:green', 'GR': 'tab:orange'}
+TYPE_COLORS = {'QF': 'tab:red', 'HS': 'tab:blue', 'SA': 'tab:green', 'GR': 'tab:orange',
+              'AD': 'tab:purple', 'GLUT': 'tab:brown'}
 
 
 def _winner_map(score_maps: dict, hw: tuple) -> tuple:
@@ -459,7 +460,7 @@ def _draw_winner(ax, frame_u8, win, names, boxes, target: str, leg=None):
     for name, (_score, box) in boxes.items():
         is_target = name == target
         _draw_box(ax, box, 2.6 if is_target else 1.0,
-                  'white' if is_target else TYPE_COLORS.get(name.split('_', 1)[1], 'magenta'))
+                  'white' if is_target else TYPE_COLORS.get(name.split('_', 1)[-1], 'magenta'))
 
 
 def _render_support(out_dir: str, supp_sid: str, supp_slices: list, supp_zs: list) -> None:
@@ -488,6 +489,11 @@ def _muscle_types(label_names: list) -> dict:
     return {t: v for t, v in types.items() if len(v) == 2}
 
 
+def _muscle_types_single(label_names: list) -> dict:
+    """{'QF': 1, ...} -- single-leg datasets, one label id per type (no L/R to pool)."""
+    return {name: lv for lv, name in enumerate(label_names) if lv != 0}
+
+
 def _left_is_low_x(lbl: np.ndarray, types: dict) -> bool:
     """Scanner side convention, read off the support GT (never the query)."""
     lx = [np.where(lbl == v['L'])[2].mean() for v in types.values() if (lbl == v['L']).any()]
@@ -514,6 +520,23 @@ def _support_bag_slices(supp_vol_u8, supp_lbl, types, k, min_gap):
     return out, sorted(zs)
 
 
+def _support_bag_slices_single(supp_vol_u8, supp_lbl, types, k, min_gap):
+    """Single-leg version of _support_bag_slices: one label id per type, no L+R pooling."""
+    from models.support_prompt import pick_support_slices
+
+    zs = set()
+    for lv in types.values():
+        fg = (supp_lbl == lv).astype(np.uint8)
+        if fg.any():
+            zs |= set(pick_support_slices(fg, k, min_gap))
+
+    out = []
+    for z in sorted(zs):
+        masks = {t: (supp_lbl[z] == lv) for t, lv in types.items()}
+        out.append((supp_vol_u8[z], {t: m for t, m in masks.items() if m.any()}))
+    return out, sorted(zs)
+
+
 def cmd_mcvis(args) -> None:
     import matplotlib
     matplotlib.use('Agg')
@@ -528,7 +551,7 @@ def cmd_mcvis(args) -> None:
     with open(args.config) as f:
         cfg = yaml.safe_load(f)
     label_names = cfg['data']['label_names']
-    types = _muscle_types(label_names)
+    types = _muscle_types_single(label_names) if args.single_leg else _muscle_types(label_names)
     test_labels = args.test_labels or list(range(1, len(label_names)))
 
     paths = sorted(glob.glob(os.path.join(args.target_data_dir, 'image_*.nii.gz')))
@@ -545,7 +568,7 @@ def cmd_mcvis(args) -> None:
 
     for label_val in test_labels:
         label_name = label_names[label_val]
-        side, mtype = label_name.split('_', 1)
+        side, mtype = (None, label_name) if args.single_leg else label_name.split('_', 1)
 
         support_fg_idx = {}
         for sid in all_sids:
@@ -569,11 +592,13 @@ def cmd_mcvis(args) -> None:
             if supp_sid not in bag_cache:
                 supp_img, supp_lbl = _load_raw(args.target_data_dir, supp_sid)
                 supp_vol_u8 = volume_to_uint8(supp_img)
-                supp_slices, supp_zs = _support_bag_slices(
+                bag_slices_fn = _support_bag_slices_single if args.single_leg else _support_bag_slices
+                supp_slices, supp_zs = bag_slices_fn(
                     supp_vol_u8, supp_lbl, types, args.support_slices, args.support_min_gap)
+                low_x = None if args.single_leg else _left_is_low_x(supp_lbl, types)
                 bag_cache[supp_sid] = (build_multiclass_bags(seg, supp_slices, THR_HI, THR_LO,
                                                              BODY_THRESH, BODY_MIN_PX),
-                                       _left_is_low_x(supp_lbl, types), supp_zs)
+                                       low_x, supp_zs)
                 _render_support(args.out_dir, supp_sid, supp_slices, supp_zs)
             bags, low_x, supp_zs = bag_cache[supp_sid]
 
@@ -584,7 +609,7 @@ def cmd_mcvis(args) -> None:
 
             boxes, score_maps = multiclass_boxes_for_frame(
                 seg, bags, frame_u8, low_x, BODY_THRESH, BODY_MIN_PX,
-                SCORE_THRESH, MARGIN_PX)
+                SCORE_THRESH, MARGIN_PX, single_leg=args.single_leg)
             gt2d = q_fg[z0 + frame_idx].astype(bool)
 
             win, best, names = _winner_map(score_maps, frame_u8.shape)
@@ -592,8 +617,11 @@ def cmd_mcvis(args) -> None:
             owned = float((win == names.index(mtype)).mean())   # frame share this type claims
 
             body2d = body_mask2d(frame_u8, BODY_THRESH, BODY_MIN_PX)
-            leg2d = side_masks(body2d, low_x)[side]
-            split = 'cc' if legs_are_separate(body2d) else 'MIDLINE'
+            if args.single_leg:
+                leg2d, split = body2d, 'n/a'    # no side to split -- whole body is the group
+            else:
+                leg2d = side_masks(body2d, low_x)[side]
+                split = 'cc' if legs_are_separate(body2d) else 'MIDLINE'
 
             def w(ax, f=frame_u8, wn=win, nm=names, bx=boxes, t=label_name, g=gt2d, lg=leg2d):
                 _draw_winner(ax, f, wn, nm, bx, t, lg)
@@ -650,9 +678,12 @@ def cmd_mcvis(args) -> None:
         w.writeheader()
         w.writerows(csv_rows)
 
-    n_mid = sum(r['split'] == 'MIDLINE' for r in csv_rows)
-    print(f'\nPer-scan scores -> {csv_path}\n'
-          f'  leg split: {len(csv_rows) - n_mid} cc, {n_mid} midline (touching legs)\n'
+    if args.single_leg:
+        split_line = '  single_leg: no L/R split (whole body mask used as one group)\n'
+    else:
+        n_mid = sum(r['split'] == 'MIDLINE' for r in csv_rows)
+        split_line = f'  leg split: {len(csv_rows) - n_mid} cc, {n_mid} midline (touching legs)\n'
+    print(f'\nPer-scan scores -> {csv_path}\n{split_line}'
           f'  triage: python3 scripts/eval/debug_medsam2.py triage {args.out_dir}')
 
 
@@ -716,6 +747,9 @@ def main() -> None:
     m.add_argument('--only', nargs='+', default=None)
     m.add_argument('--device', default=None)
     m.add_argument('--out_dir', required=True)
+    m.add_argument('--single_leg', action='store_true',
+                   help='dataset has one leg per volume (no L/R): label_names are bare '
+                        'type names, no side split of the body mask')
     m.set_defaults(func=cmd_mcvis)
 
     args = ap.parse_args()

@@ -412,37 +412,46 @@ def _box_from_blob(blob: np.ndarray, score: np.ndarray, img_hw: tuple,
 
 
 def multiclass_boxes(score_maps: dict, query_body2d: np.ndarray, img_hw: tuple,
-                     left_is_low_x: bool, score_thresh: float = 0.0,
-                     margin_px: float = 0.0) -> dict:
+                     left_is_low_x: bool | None = None, score_thresh: float = 0.0,
+                     margin_px: float = 0.0, single_leg: bool = False) -> dict:
     """Winner-take-all per cell across the types, then one box per (side, type): the cells
     that type c wins, intersected with that leg. Two types can no longer claim the same
     pixels, and a confident false match on bone marrow dies because BG wins there.
-    Returns {'<side>_<type>': (score, box_xyxy)}."""
+    Returns {'<side>_<type>': (score, box_xyxy)}.
+
+    single_leg=True: one leg per volume (no L/R split) -- the whole body mask is used as
+    the single group and keys are bare type names (no side prefix)."""
     names = sorted(score_maps)
     stack = np.stack([score_maps[c] for c in names])   # [K,h,w]
     win, best = stack.argmax(0), stack.max(0)
     h, w = best.shape
 
+    sides = {'': query_body2d} if single_leg else side_masks(query_body2d, left_is_low_x)
+
     out = {}
-    for si, smask in side_masks(query_body2d, left_is_low_x).items():
+    for si, smask in sides.items():
         leg = _to_grid(smask, h, w).numpy() > 0.5
         for ci, c in enumerate(names):
             blob = (win == ci) & (best > score_thresh) & leg
             if not blob.any():
                 continue
-            out[f'{si}_{c}'] = (float(best[blob].max()),
-                                _box_from_blob(blob, best, img_hw, margin_px))
+            key = c if single_leg else f'{si}_{c}'
+            out[key] = (float(best[blob].max()),
+                       _box_from_blob(blob, best, img_hw, margin_px))
     return out
 
 
-def multiclass_boxes_for_frame(seg, bags: dict, frame_u8: np.ndarray, left_is_low_x: bool,
+def multiclass_boxes_for_frame(seg, bags: dict, frame_u8: np.ndarray,
+                               left_is_low_x: bool | None = None,
                                body_thresh: float = 10.0, body_min_px: int = 50,
-                               score_thresh: float = 0.0, margin_px: float = 0.0) -> tuple:
-    """One query frame -> all 8 boxes at once. returns ({'<side>_<type>': (score, box)},
-    score_maps) -- the maps come back for the debug overlay."""
+                               score_thresh: float = 0.0, margin_px: float = 0.0,
+                               single_leg: bool = False) -> tuple:
+    """One query frame -> all boxes at once. returns ({'<side>_<type>': (score, box)}
+    or {'<type>': (score, box)} when single_leg, score_maps) -- the maps come back for
+    the debug overlay."""
     feat = seg.embed_frame(frame_u8)
     score_maps = multiclass_score_maps(feat, bags)
     body = body_mask2d(frame_u8, body_thresh, body_min_px)
     boxes = multiclass_boxes(score_maps, body, frame_u8.shape, left_is_low_x,
-                             score_thresh, margin_px)
+                             score_thresh, margin_px, single_leg=single_leg)
     return boxes, score_maps
