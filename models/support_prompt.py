@@ -421,6 +421,22 @@ def _box_from_blob(blob: np.ndarray, score: np.ndarray, img_hw: tuple,
             min(float(W), x1 + margin_px), min(float(H), y1 + margin_px))
 
 
+def _largest_cc(mask2d: np.ndarray) -> np.ndarray:
+    """Largest connected component of mask2d. single_leg datasets: the raw query frame's
+    FOV sometimes still shows BOTH legs even though only one is annotated -- without this,
+    the single_leg group in multiclass_boxes is the whole frame, so a type winning even a
+    few noise cells on the other, unannotated leg drags the box all the way across the
+    midline to include it."""
+    from skimage.measure import label as cc_label
+
+    lab = cc_label(mask2d)
+    if lab.max() == 0:
+        return mask2d
+    sizes = np.bincount(lab.ravel())
+    sizes[0] = 0
+    return lab == sizes.argmax()
+
+
 def multiclass_boxes(score_maps: dict, query_body2d: np.ndarray, img_hw: tuple,
                      left_is_low_x: bool | None = None, score_thresh: float = 0.0,
                      margin_px: float = 0.0, single_leg: bool = False) -> dict:
@@ -436,7 +452,7 @@ def multiclass_boxes(score_maps: dict, query_body2d: np.ndarray, img_hw: tuple,
     win, best = stack.argmax(0), stack.max(0)
     h, w = best.shape
 
-    sides = {'': query_body2d} if single_leg else side_masks(query_body2d, left_is_low_x)
+    sides = {'': _largest_cc(query_body2d)} if single_leg else side_masks(query_body2d, left_is_low_x)
 
     out = {}
     for si, smask in sides.items():
