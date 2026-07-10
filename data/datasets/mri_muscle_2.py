@@ -20,6 +20,7 @@ import SimpleITK as sitk
 
 from data.offline_preprocessing import (
     center_crop_2d,
+    crop_to_label_bbox_2d,
     intensity_clip_upper,
     n4_bias_field_correction,
     z_volume_norm,
@@ -79,6 +80,7 @@ def preprocess_mri_muscle_2(
     out_dir: Path,
     echo: str = "Water",
     crop_size: int = 0,
+    leg_margin_px: int = 40,
 ) -> None:
     """Convert raw MRI_muscle_2 Thigh layout into standard image_/label_ NIfTI files."""
     raw_dir = Path(raw_dir)
@@ -91,6 +93,11 @@ def preprocess_mri_muscle_2(
         img = sitk.ReadImage(str(thigh_dir / f"{echo}.nii.gz"))
         lbl = sitk.ReadImage(str(thigh_dir / "mask_muscles.nii.gz"))
         lbl = remap_labels(lbl)
+
+        # raw FOV often still shows both legs though only one is annotated -- crop to
+        # the annotated leg's own bbox (+margin) before any stats-dependent step below,
+        # so N4/z-norm aren't skewed by the other, unannotated leg's intensities.
+        img, lbl = crop_to_label_bbox_2d(img, lbl, margin_px=leg_margin_px)
 
         img = n4_bias_field_correction(img)
         img = intensity_clip_upper(img)
@@ -155,9 +162,13 @@ if __name__ == "__main__":
     parser.add_argument("--echo", type=str, default="Water", choices=["Water", "Fat", "In_phase", "Opp_phase"])
     parser.add_argument("--crop_size", type=int, default=0,
                         help="Center crop size in-plane (0 = disable). Default 0.")
+    parser.add_argument("--leg_margin_px", type=int, default=40,
+                        help="Margin (px) around the annotated leg's GT bbox when cropping "
+                             "out the other, unannotated leg. Default 40.")
     args = parser.parse_args()
 
-    preprocess_mri_muscle_2(args.raw_dir, args.out_dir, echo=args.echo, crop_size=args.crop_size)
+    preprocess_mri_muscle_2(args.raw_dir, args.out_dir, echo=args.echo, crop_size=args.crop_size,
+                            leg_margin_px=args.leg_margin_px)
 
     echo_dir = args.out_dir / "WATER"
     build_mri_muscle_2_classmap(echo_dir, MRI_MUSCLE_2_LABEL_NAMES, min_pixels_list=[1, 100])

@@ -394,25 +394,36 @@ def side_masks(body2d: np.ndarray, left_is_low_x: bool,
 
 
 def _box_from_blob(blob: np.ndarray, score: np.ndarray, img_hw: tuple,
-                   margin_px: float = 0.0, min_cc_px: int = 2) -> tuple:
-    """Union of every connected component of blob with area >= min_cc_px -> box in (H,W) px.
+                   margin_px: float = 0.0, dilate_iters: int = 1) -> tuple:
+    """Largest connected component of blob (dilated by dilate_iters cells first, to merge
+    an anatomical region's own separate coarse-grid pieces -- e.g. HS's 3 heads, sitting a
+    cell or two apart at this resolution -- without a distant noise speck a few cells away
+    also merging in) -> box in (H,W) px.
 
     blob is computed on the coarse feature grid (e.g. 32x32), not image pixels: a single
     anatomical region often splits into several grid-cells-wide CCs that only look merged
-    after upsampling for display (diagonal-only touching cells, or a multi-part muscle like
-    HS's 3 heads). Keeping only the CC of the single best-scoring cell (old behavior) then
-    silently drops the rest of the true region -> box too small / off to one side. Keeping
-    every CC (minus 1-2px specks, which are noise) recovers the full extent."""
+    after upsampling for display. The old single-seed-CC selection then silently dropped
+    the rest of the true region (box too small / off to one side); the naive "keep every
+    CC" fix over-corrected -- a lone stray winning cell anywhere in the frame, however far
+    from the real region, then ballooned the box to include it (e.g. QF_06: a couple of
+    QF-won cells near the AD region dragged the box across half the leg). Dilating first
+    merges only genuinely nearby pieces; the box itself is still cropped back to the real
+    (undilated) blob pixels, so dilation never inflates it directly."""
+    from scipy.ndimage import binary_dilation
     from skimage.measure import label as cc_label
 
     h, w = score.shape
     H, W = img_hw
-    lab = cc_label(blob)
-    n = lab.max()
-    sizes = np.bincount(lab.ravel())  # sizes[0] = background, ignored below
-    sel = np.isin(lab, [i for i in range(1, n + 1) if sizes[i] >= min_cc_px])
-    if not sel.any():
+    grown = binary_dilation(blob, iterations=dilate_iters) if dilate_iters > 0 else blob
+    lab = cc_label(grown)
+    if lab.max() == 0:
         sel = blob
+    else:
+        sizes = np.bincount(lab.ravel())
+        sizes[0] = 0
+        sel = (lab == sizes.argmax()) & blob
+        if not sel.any():
+            sel = blob
 
     ys, xs = np.where(sel)
     x0, x1 = float(xs.min()) / w * W, float(xs.max() + 1) / w * W

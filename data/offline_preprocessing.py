@@ -111,6 +111,38 @@ def center_crop_2d(image_itk: sitk.Image, crop_size: int = 256, padval: float = 
     return result
 
 
+def crop_to_label_bbox_2d(image_itk: sitk.Image, label_itk: sitk.Image,
+                          margin_px: int = 40) -> tuple:
+    """Crop image+label to the in-plane bbox of label_itk's nonzero voxels (union over
+    all Z), + margin_px on each side. Same crop window applied to every slice.
+
+    For single-leg-per-volume datasets whose raw FOV still shows both legs while only
+    one is annotated: the label itself unambiguously marks which leg is real, so this
+    removes the other, unannotated leg once offline -- no runtime heuristic (leg size,
+    position) can do this reliably, since the annotated leg is not always the bigger
+    one in frame."""
+    img_arr = sitk.GetArrayFromImage(image_itk)  # [Z, Y, X]
+    lbl_arr = sitk.GetArrayFromImage(label_itk)
+
+    mask2d = (lbl_arr > 0).any(axis=0)  # [Y, X]
+    ys, xs = np.where(mask2d)
+    y0 = max(0, int(ys.min()) - margin_px)
+    y1 = min(img_arr.shape[1], int(ys.max()) + 1 + margin_px)
+    x0 = max(0, int(xs.min()) - margin_px)
+    x1 = min(img_arr.shape[2], int(xs.max()) + 1 + margin_px)
+
+    def _wrap(arr, ref):
+        out = sitk.GetImageFromArray(arr)
+        out.SetSpacing(ref.GetSpacing())
+        out.SetOrigin(ref.GetOrigin())
+        out.SetDirection(ref.GetDirection())
+        return out
+
+    cropped_img = _wrap(img_arr[:, y0:y1, x0:x1], image_itk)
+    cropped_lbl = _wrap(lbl_arr[:, y0:y1, x0:x1], label_itk)
+    return cropped_img, cropped_lbl
+
+
 def build_gt_classmap(label_dir: str,
                       label_names: list,
                       min_pixels_list: list,
