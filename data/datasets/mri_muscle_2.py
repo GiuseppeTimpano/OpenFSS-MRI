@@ -93,11 +93,14 @@ def preprocess_mri_muscle_2(
         img = sitk.ReadImage(str(thigh_dir / f"{echo}.nii.gz"))
         lbl = sitk.ReadImage(str(thigh_dir / "mask_muscles.nii.gz"))
         lbl = remap_labels(lbl)
+        whole_muscle_sat = sitk.ReadImage(str(thigh_dir / "mask_whole_muscle_SAT.nii.gz"))
 
-        # raw FOV often still shows both legs though only one is annotated -- crop to
-        # the annotated leg's own bbox (+margin) before any stats-dependent step below,
-        # so N4/z-norm aren't skewed by the other, unannotated leg's intensities.
-        img, lbl = crop_to_label_bbox_2d(img, lbl, margin_px=leg_margin_px)
+        # raw FOV often still shows both legs though only one is annotated. mask_muscles
+        # is only 13 discrete muscle blobs (gaps between them near the leg boundary), so
+        # crop to mask_whole_muscle_SAT's bbox instead -- it's a filled muscle+fat
+        # silhouette of the whole annotated leg, a tighter and more robust bound.
+        img, lbl = crop_to_label_bbox_2d(img, lbl, bbox_source_itk=whole_muscle_sat,
+                                         margin_px=leg_margin_px)
 
         img = n4_bias_field_correction(img)
         img = intensity_clip_upper(img)

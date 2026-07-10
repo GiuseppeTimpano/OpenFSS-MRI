@@ -609,7 +609,7 @@ def cmd_mcvis(args) -> None:
 
             boxes, score_maps = multiclass_boxes_for_frame(
                 seg, bags, frame_u8, low_x, BODY_THRESH, BODY_MIN_PX,
-                SCORE_THRESH, MARGIN_PX, single_leg=args.single_leg)
+                SCORE_THRESH, MARGIN_PX, single_leg=args.single_leg, cc_mode=args.cc_mode)
             gt2d = q_fg[z0 + frame_idx].astype(bool)
 
             win, best, names = _winner_map(score_maps, frame_u8.shape)
@@ -750,6 +750,10 @@ def main() -> None:
     m.add_argument('--single_leg', action='store_true',
                    help='dataset has one leg per volume (no L/R): label_names are bare '
                         'type names, no side split of the body mask')
+    m.add_argument('--cc_mode', choices=['dilate_largest', 'union', 'seed_only'],
+                   default='dilate_largest',
+                   help='_box_from_blob CC selection: dilate_largest = current fix, '
+                        'union = superseded first fix, seed_only = pre-fix ablation baseline')
     m.set_defaults(func=cmd_mcvis)
 
     args = ap.parse_args()

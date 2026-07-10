@@ -394,36 +394,56 @@ def side_masks(body2d: np.ndarray, left_is_low_x: bool,
 
 
 def _box_from_blob(blob: np.ndarray, score: np.ndarray, img_hw: tuple,
-                   margin_px: float = 0.0, dilate_iters: int = 1) -> tuple:
-    """Largest connected component of blob (dilated by dilate_iters cells first, to merge
-    an anatomical region's own separate coarse-grid pieces -- e.g. HS's 3 heads, sitting a
-    cell or two apart at this resolution -- without a distant noise speck a few cells away
-    also merging in) -> box in (H,W) px.
+                   margin_px: float = 0.0, dilate_iters: int = 1,
+                   cc_mode: str = 'dilate_largest', min_cc_px: int = 2) -> tuple:
+    """blob -> box in (H,W) px. cc_mode picks which cells of blob feed the box:
+
+    - 'dilate_largest' (default, current fix): dilate blob by dilate_iters cells first (to
+      merge an anatomical region's own separate coarse-grid pieces -- e.g. HS's 3 heads,
+      sitting a cell or two apart at this resolution -- without a distant noise speck a few
+      cells away also merging in), take the largest CC of the dilated mask, crop back to
+      blob pixels. Dilation never inflates the box directly since selection is intersected
+      with the undilated blob.
+    - 'union' (superseded first fix): union of every CC with area >= min_cc_px, no dilation.
+      Over-corrects: a lone stray winning cell far from the real region (e.g. QF_06: a
+      couple of QF-won cells near the AD region) balloons the box across the whole leg.
+    - 'seed_only' (pre-fix / ablation baseline): CC containing only the single best-scoring
+      cell. Silently drops the rest of a multi-part region (box too small / off to one
+      side) -- kept here only to reproduce the original bug for A/B comparison.
 
     blob is computed on the coarse feature grid (e.g. 32x32), not image pixels: a single
     anatomical region often splits into several grid-cells-wide CCs that only look merged
-    after upsampling for display. The old single-seed-CC selection then silently dropped
-    the rest of the true region (box too small / off to one side); the naive "keep every
-    CC" fix over-corrected -- a lone stray winning cell anywhere in the frame, however far
-    from the real region, then ballooned the box to include it (e.g. QF_06: a couple of
-    QF-won cells near the AD region dragged the box across half the leg). Dilating first
-    merges only genuinely nearby pieces; the box itself is still cropped back to the real
-    (undilated) blob pixels, so dilation never inflates it directly."""
-    from scipy.ndimage import binary_dilation
+    after upsampling for display."""
     from skimage.measure import label as cc_label
 
     h, w = score.shape
     H, W = img_hw
-    grown = binary_dilation(blob, iterations=dilate_iters) if dilate_iters > 0 else blob
-    lab = cc_label(grown)
-    if lab.max() == 0:
-        sel = blob
-    else:
+
+    if cc_mode == 'seed_only':
+        lab = cc_label(blob)
+        seed = np.unravel_index(np.argmax(np.where(blob, score, -np.inf)), score.shape)
+        sel = (lab == lab[seed]) if lab[seed] else blob
+    elif cc_mode == 'union':
+        lab = cc_label(blob)
+        n = lab.max()
         sizes = np.bincount(lab.ravel())
-        sizes[0] = 0
-        sel = (lab == sizes.argmax()) & blob
+        sel = np.isin(lab, [i for i in range(1, n + 1) if sizes[i] >= min_cc_px])
         if not sel.any():
             sel = blob
+    elif cc_mode == 'dilate_largest':
+        from scipy.ndimage import binary_dilation
+        grown = binary_dilation(blob, iterations=dilate_iters) if dilate_iters > 0 else blob
+        lab = cc_label(grown)
+        if lab.max() == 0:
+            sel = blob
+        else:
+            sizes = np.bincount(lab.ravel())
+            sizes[0] = 0
+            sel = (lab == sizes.argmax()) & blob
+            if not sel.any():
+                sel = blob
+    else:
+        raise ValueError(f'unknown cc_mode: {cc_mode!r}')
 
     ys, xs = np.where(sel)
     x0, x1 = float(xs.min()) / w * W, float(xs.max() + 1) / w * W
@@ -450,7 +470,8 @@ def _largest_cc(mask2d: np.ndarray) -> np.ndarray:
 
 def multiclass_boxes(score_maps: dict, query_body2d: np.ndarray, img_hw: tuple,
                      left_is_low_x: bool | None = None, score_thresh: float = 0.0,
-                     margin_px: float = 0.0, single_leg: bool = False) -> dict:
+                     margin_px: float = 0.0, single_leg: bool = False,
+                     cc_mode: str = 'dilate_largest') -> dict:
     """Winner-take-all per cell across the types, then one box per (side, type): the cells
     that type c wins, intersected with that leg. Two types can no longer claim the same
     pixels, and a confident false match on bone marrow dies because BG wins there.
@@ -474,7 +495,7 @@ def multiclass_boxes(score_maps: dict, query_body2d: np.ndarray, img_hw: tuple,
                 continue
             key = c if single_leg else f'{si}_{c}'
             out[key] = (float(best[blob].max()),
-                       _box_from_blob(blob, best, img_hw, margin_px))
+                       _box_from_blob(blob, best, img_hw, margin_px, cc_mode=cc_mode))
     return out
 
 
@@ -482,7 +503,8 @@ def multiclass_boxes_for_frame(seg, bags: dict, frame_u8: np.ndarray,
                                left_is_low_x: bool | None = None,
                                body_thresh: float = 10.0, body_min_px: int = 50,
                                score_thresh: float = 0.0, margin_px: float = 0.0,
-                               single_leg: bool = False) -> tuple:
+                               single_leg: bool = False,
+                               cc_mode: str = 'dilate_largest') -> tuple:
     """One query frame -> all boxes at once. returns ({'<side>_<type>': (score, box)}
     or {'<type>': (score, box)} when single_leg, score_maps) -- the maps come back for
     the debug overlay."""
@@ -490,5 +512,5 @@ def multiclass_boxes_for_frame(seg, bags: dict, frame_u8: np.ndarray,
     score_maps = multiclass_score_maps(feat, bags)
     body = body_mask2d(frame_u8, body_thresh, body_min_px)
     boxes = multiclass_boxes(score_maps, body, frame_u8.shape, left_is_low_x,
-                             score_thresh, margin_px, single_leg=single_leg)
+                             score_thresh, margin_px, single_leg=single_leg, cc_mode=cc_mode)
     return boxes, score_maps

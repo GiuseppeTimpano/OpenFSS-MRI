@@ -16,6 +16,8 @@
 #   bag_eval     B1 sweep: K=1/3/5, all 6 labels                 -> results/mri_muscle_2/bag/k<K>/
 #   mc           B2 vis: cross-class competition, single-leg mode (--single_leg)
 #                -> results/mri_muscle_2/debug_vis/mc_k3/
+#   mc_nocc      same as mc, seed-only CC (pre-fix ablation), leg-crop stays on
+#                -> results/mri_muscle_2/debug_vis/mc_k3_nocc/
 #   support      vis, box from matching (SA, GR)                -> results/mri_muscle_2/debug_vis/<label>_auto/
 #   allsupp      vis, 1 SA query vs EVERY support (variance)    -> results/mri_muscle_2/debug_vis/SA_allsupp/
 #   dice [dir]   reprint the table of a past run; no dir => every run under results/mri_muscle_2/
@@ -134,6 +136,15 @@ mc)           # B2: cross-class competition, single-leg mode (whole body = one g
   $TRIAGE $OUT
   echo; echo "########## reference: bag_key_k3 (binary bag, same slice) ##########"
   [ -d results/mri_muscle_2/debug_vis/bag_key_k3 ] && $TRIAGE results/mri_muscle_2/debug_vis/bag_key_k3
+  ;;
+
+mc_nocc)      # ablation: same as mc, but _box_from_blob reverted to pre-fix seed-only CC
+              # (single-leg crop from fix v3 stays ON -- isolates the CC fix alone)
+  OUT=results/mri_muscle_2/debug_vis/mc_k3_nocc
+  $MCVIS --support_slices 3 --out_dir $OUT --cc_mode seed_only
+  $TRIAGE $OUT
+  echo; echo "########## reference: mc_k3 (dilate_largest, current fix) ##########"
+  [ -d results/mri_muscle_2/debug_vis/mc_k3 ] && $TRIAGE results/mri_muscle_2/debug_vis/mc_k3
   ;;
 
 support)      # the two thin muscles that fail (SA=3, GR=4)

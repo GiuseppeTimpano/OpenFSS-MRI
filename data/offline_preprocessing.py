@@ -112,19 +112,33 @@ def center_crop_2d(image_itk: sitk.Image, crop_size: int = 256, padval: float = 
 
 
 def crop_to_label_bbox_2d(image_itk: sitk.Image, label_itk: sitk.Image,
-                          margin_px: int = 40) -> tuple:
-    """Crop image+label to the in-plane bbox of label_itk's nonzero voxels (union over
-    all Z), + margin_px on each side. Same crop window applied to every slice.
+                          bbox_source_itk: sitk.Image = None,
+                          margin_px: int = 40,
+                          mask_background: bool = True) -> tuple:
+    """Crop image+label to the in-plane bbox of bbox_source_itk's nonzero voxels (union
+    over all Z, default: label_itk itself), + margin_px on each side. Same crop window
+    applied to every slice.
 
     For single-leg-per-volume datasets whose raw FOV still shows both legs while only
-    one is annotated: the label itself unambiguously marks which leg is real, so this
+    one is annotated: bbox_source unambiguously marks which leg is real, so this
     removes the other, unannotated leg once offline -- no runtime heuristic (leg size,
     position) can do this reliably, since the annotated leg is not always the bigger
-    one in frame."""
+    one in frame. Pass the dataset's whole-muscle+SAT mask as bbox_source when
+    available: it's a filled silhouette of the whole annotated leg, so its bbox is
+    tighter/more robust than one derived from a handful of discrete muscle blobs
+    (label_itk), which can leave gaps near the leg's true boundary.
+
+    A rectangular bbox alone does not guarantee the other, unannotated leg is fully
+    excluded -- it can still fall inside the margin, or overlap the crop window when
+    both legs sit close together. If mask_background (default True) and bbox_source_itk
+    is given, every image voxel outside bbox_source's own per-voxel mask (not just its
+    2D bbox) is zeroed after cropping -- i.e. only pixels that are muscle or SAT/fat
+    survive, per-slice, not only within the bbox rectangle."""
     img_arr = sitk.GetArrayFromImage(image_itk)  # [Z, Y, X]
     lbl_arr = sitk.GetArrayFromImage(label_itk)
+    src_arr = sitk.GetArrayFromImage(bbox_source_itk) if bbox_source_itk is not None else lbl_arr
 
-    mask2d = (lbl_arr > 0).any(axis=0)  # [Y, X]
+    mask2d = (src_arr > 0).any(axis=0)  # [Y, X]
     ys, xs = np.where(mask2d)
     y0 = max(0, int(ys.min()) - margin_px)
     y1 = min(img_arr.shape[1], int(ys.max()) + 1 + margin_px)
@@ -138,8 +152,16 @@ def crop_to_label_bbox_2d(image_itk: sitk.Image, label_itk: sitk.Image,
         out.SetDirection(ref.GetDirection())
         return out
 
-    cropped_img = _wrap(img_arr[:, y0:y1, x0:x1], image_itk)
-    cropped_lbl = _wrap(lbl_arr[:, y0:y1, x0:x1], label_itk)
+    cropped_img_arr = img_arr[:, y0:y1, x0:x1]
+    cropped_lbl_arr = lbl_arr[:, y0:y1, x0:x1]
+
+    if mask_background and bbox_source_itk is not None:
+        cropped_src_arr = src_arr[:, y0:y1, x0:x1]
+        cropped_img_arr = cropped_img_arr.copy()
+        cropped_img_arr[cropped_src_arr == 0] = 0
+
+    cropped_img = _wrap(cropped_img_arr, image_itk)
+    cropped_lbl = _wrap(cropped_lbl_arr, label_itk)
     return cropped_img, cropped_lbl
 
 
