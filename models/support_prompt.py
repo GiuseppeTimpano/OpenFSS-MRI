@@ -394,15 +394,25 @@ def side_masks(body2d: np.ndarray, left_is_low_x: bool,
 
 
 def _box_from_blob(blob: np.ndarray, score: np.ndarray, img_hw: tuple,
-                   margin_px: float = 0.0) -> tuple:
-    """Connected component of blob containing its best-scoring cell -> box in (H,W) px."""
+                   margin_px: float = 0.0, min_cc_px: int = 2) -> tuple:
+    """Union of every connected component of blob with area >= min_cc_px -> box in (H,W) px.
+
+    blob is computed on the coarse feature grid (e.g. 32x32), not image pixels: a single
+    anatomical region often splits into several grid-cells-wide CCs that only look merged
+    after upsampling for display (diagonal-only touching cells, or a multi-part muscle like
+    HS's 3 heads). Keeping only the CC of the single best-scoring cell (old behavior) then
+    silently drops the rest of the true region -> box too small / off to one side. Keeping
+    every CC (minus 1-2px specks, which are noise) recovers the full extent."""
     from skimage.measure import label as cc_label
 
     h, w = score.shape
     H, W = img_hw
     lab = cc_label(blob)
-    seed = np.unravel_index(np.argmax(np.where(blob, score, -np.inf)), score.shape)
-    sel = (lab == lab[seed]) if lab[seed] else blob
+    n = lab.max()
+    sizes = np.bincount(lab.ravel())  # sizes[0] = background, ignored below
+    sel = np.isin(lab, [i for i in range(1, n + 1) if sizes[i] >= min_cc_px])
+    if not sel.any():
+        sel = blob
 
     ys, xs = np.where(sel)
     x0, x1 = float(xs.min()) / w * W, float(xs.max() + 1) / w * W
