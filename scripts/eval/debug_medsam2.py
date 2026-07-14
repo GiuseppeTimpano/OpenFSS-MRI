@@ -478,63 +478,8 @@ def _render_support(out_dir: str, supp_sid: str, supp_slices: list, supp_zs: lis
     _render(os.path.join(out_dir, f'_support_{supp_sid}.png'), panels, titles)
 
 
-def _muscle_types(label_names: list) -> dict:
-    """{'QF': (1, 5), ...} — the L and R label ids of each muscle type."""
-    types = defaultdict(dict)
-    for lv, name in enumerate(label_names):
-        if lv == 0 or '_' not in name:
-            continue
-        side, mtype = name.split('_', 1)
-        types[mtype][side] = lv
-    return {t: v for t, v in types.items() if len(v) == 2}
-
-
-def _muscle_types_single(label_names: list) -> dict:
-    """{'QF': 1, ...} -- single-leg datasets, one label id per type (no L/R to pool)."""
-    return {name: lv for lv, name in enumerate(label_names) if lv != 0}
-
-
-def _left_is_low_x(lbl: np.ndarray, types: dict) -> bool:
-    """Scanner side convention, read off the support GT (never the query)."""
-    lx = [np.where(lbl == v['L'])[2].mean() for v in types.values() if (lbl == v['L']).any()]
-    rx = [np.where(lbl == v['R'])[2].mean() for v in types.values() if (lbl == v['R']).any()]
-    return mean(lx) < mean(rx)
-
-
-def _support_bag_slices(supp_vol_u8, supp_lbl, types, k, min_gap):
-    """Union over types of their K best slices; each kept slice carries every type's mask
-    (L+R pooled). One embed per slice, all bags filled from it."""
-    from models.support_prompt import pick_support_slices
-
-    zs = set()
-    for v in types.values():
-        fg = ((supp_lbl == v['L']) | (supp_lbl == v['R'])).astype(np.uint8)
-        if fg.any():
-            zs |= set(pick_support_slices(fg, k, min_gap))
-
-    out = []
-    for z in sorted(zs):
-        masks = {t: ((supp_lbl[z] == v['L']) | (supp_lbl[z] == v['R']))
-                 for t, v in types.items()}
-        out.append((supp_vol_u8[z], {t: m for t, m in masks.items() if m.any()}))
-    return out, sorted(zs)
-
-
-def _support_bag_slices_single(supp_vol_u8, supp_lbl, types, k, min_gap):
-    """Single-leg version of _support_bag_slices: one label id per type, no L+R pooling."""
-    from models.support_prompt import pick_support_slices
-
-    zs = set()
-    for lv in types.values():
-        fg = (supp_lbl == lv).astype(np.uint8)
-        if fg.any():
-            zs |= set(pick_support_slices(fg, k, min_gap))
-
-    out = []
-    for z in sorted(zs):
-        masks = {t: (supp_lbl[z] == lv) for t, lv in types.items()}
-        out.append((supp_vol_u8[z], {t: m for t, m in masks.items() if m.any()}))
-    return out, sorted(zs)
+# _muscle_types / _muscle_types_single / _left_is_low_x / _support_bag_slices(_single) moved
+# to models/support_prompt.py (shared with eval_medsam2.py's prompt_mode=support_multiclass).
 
 
 def cmd_mcvis(args) -> None:
@@ -544,14 +489,16 @@ def cmd_mcvis(args) -> None:
     import yaml
     from models.medsam2_adapter import MedSAM2Segmenter, volume_to_uint8
     from models.support_prompt import (body_mask2d, build_multiclass_bags, key_slice,
-                                       legs_are_separate, multiclass_boxes_for_frame, side_masks)
+                                       left_is_low_x, legs_are_separate, multiclass_boxes_for_frame,
+                                       muscle_types, muscle_types_single, side_masks,
+                                       support_bag_slices, support_bag_slices_single)
     from eval_medsam2 import _read_nii, _load_raw
 
     device = args.device or ('cuda' if torch.cuda.is_available() else 'cpu')
     with open(args.config) as f:
         cfg = yaml.safe_load(f)
     label_names = cfg['data']['label_names']
-    types = _muscle_types_single(label_names) if args.single_leg else _muscle_types(label_names)
+    types = muscle_types_single(label_names) if args.single_leg else muscle_types(label_names)
     test_labels = args.test_labels or list(range(1, len(label_names)))
 
     paths = sorted(glob.glob(os.path.join(args.target_data_dir, 'image_*.nii.gz')))
@@ -592,10 +539,10 @@ def cmd_mcvis(args) -> None:
             if supp_sid not in bag_cache:
                 supp_img, supp_lbl = _load_raw(args.target_data_dir, supp_sid)
                 supp_vol_u8 = volume_to_uint8(supp_img)
-                bag_slices_fn = _support_bag_slices_single if args.single_leg else _support_bag_slices
+                bag_slices_fn = support_bag_slices_single if args.single_leg else support_bag_slices
                 supp_slices, supp_zs = bag_slices_fn(
                     supp_vol_u8, supp_lbl, types, args.support_slices, args.support_min_gap)
-                low_x = None if args.single_leg else _left_is_low_x(supp_lbl, types)
+                low_x = None if args.single_leg else left_is_low_x(supp_lbl, types)
                 bag_cache[supp_sid] = (build_multiclass_bags(seg, supp_slices, THR_HI, THR_LO,
                                                              BODY_THRESH, BODY_MIN_PX),
                                        low_x, supp_zs)

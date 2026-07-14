@@ -6,6 +6,7 @@ Point-prompt variants were removed once box prompting superseded them (R_HS, 20 
 point Dice 0.3673 vs box 0.6370). See git history.
 """
 from collections import defaultdict
+from statistics import mean
 
 import numpy as np
 import torch
@@ -514,3 +515,68 @@ def multiclass_boxes_for_frame(seg, bags: dict, frame_u8: np.ndarray,
     boxes = multiclass_boxes(score_maps, body, frame_u8.shape, left_is_low_x,
                              score_thresh, margin_px, single_leg=single_leg, cc_mode=cc_mode)
     return boxes, score_maps
+
+
+# ============================ B2 support: bilateral bookkeeping ============================
+# Moved here from scripts/eval/debug_medsam2.py (cmd_mcvis) so both the debug-vis tool and
+# a full propagation-based eval (eval_medsam2.py, prompt_mode=support_multiclass) share one
+# implementation instead of two copies drifting apart.
+
+
+def muscle_types(label_names: list) -> dict:
+    """{'QF': {'L': 1, 'R': 5}, ...} -- the L and R label ids of each muscle type.
+    Requires the '<side>_<type>' naming convention; types missing one side are dropped."""
+    types = defaultdict(dict)
+    for lv, name in enumerate(label_names):
+        if lv == 0 or '_' not in name:
+            continue
+        side, mtype = name.split('_', 1)
+        types[mtype][side] = lv
+    return {t: v for t, v in types.items() if len(v) == 2}
+
+
+def muscle_types_single(label_names: list) -> dict:
+    """{'QF': 1, ...} -- single-leg datasets, one label id per type (no L/R to pool)."""
+    return {name: lv for lv, name in enumerate(label_names) if lv != 0}
+
+
+def left_is_low_x(lbl: np.ndarray, types: dict) -> bool:
+    """Scanner side convention, read off the support GT (never the query)."""
+    lx = [np.where(lbl == v['L'])[2].mean() for v in types.values() if (lbl == v['L']).any()]
+    rx = [np.where(lbl == v['R'])[2].mean() for v in types.values() if (lbl == v['R']).any()]
+    return mean(lx) < mean(rx)
+
+
+def support_bag_slices(supp_vol_u8: np.ndarray, supp_lbl: np.ndarray, types: dict,
+                       k: int, min_gap: int) -> tuple:
+    """Union over types of their K best slices; each kept slice carries every type's mask
+    (L+R pooled). One embed per slice, all bags filled from it. Returns (slices, zs) where
+    slices = [(frame_u8, {cls: mask2d})], ready for build_multiclass_bags."""
+    zs = set()
+    for v in types.values():
+        fg = ((supp_lbl == v['L']) | (supp_lbl == v['R'])).astype(np.uint8)
+        if fg.any():
+            zs |= set(pick_support_slices(fg, k, min_gap))
+
+    out = []
+    for z in sorted(zs):
+        masks = {t: ((supp_lbl[z] == v['L']) | (supp_lbl[z] == v['R']))
+                 for t, v in types.items()}
+        out.append((supp_vol_u8[z], {t: m for t, m in masks.items() if m.any()}))
+    return out, sorted(zs)
+
+
+def support_bag_slices_single(supp_vol_u8: np.ndarray, supp_lbl: np.ndarray, types: dict,
+                              k: int, min_gap: int) -> tuple:
+    """Single-leg version of support_bag_slices: one label id per type, no L+R pooling."""
+    zs = set()
+    for lv in types.values():
+        fg = (supp_lbl == lv).astype(np.uint8)
+        if fg.any():
+            zs |= set(pick_support_slices(fg, k, min_gap))
+
+    out = []
+    for z in sorted(zs):
+        masks = {t: (supp_lbl[z] == lv) for t, lv in types.items()}
+        out.append((supp_vol_u8[z], {t: m for t, m in masks.items() if m.any()}))
+    return out, sorted(zs)

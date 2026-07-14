@@ -10,10 +10,16 @@ prompt_mode: perslice (default, oracle box every FG slice) | key (one box on
 largest-area slice + propagation, MedSAM2's native usage) | support_bbox (box
 prompt derived from a random support scan's mask, PerSAM-style SAM2-embedding
 matching, no query GT read -- dense bag-of-vectors + body mask + similarity-blob
-bbox, see models/support_prompt.py:support_anchors_dense_bodymasked_bbox). --n_anchors > 1
-re-anchors that box on several slices, so propagation restarts before it decays.
---support_slices > 1 (B1) builds the Pos/Neg bag from several slices of the same support
-volume instead of its key slice alone -- still 1-shot, richer bag.
+bbox, see models/support_prompt.py:support_anchors_dense_bodymasked_bbox) |
+support_multiclass (B2: same support-derived box, but every muscle TYPE gets its
+own bag and they compete cell-by-cell on the query's key slice, see
+models/support_prompt.py:build_multiclass_bags/multiclass_boxes_for_frame -- this
+is the full propagation + aggregated-Dice wiring of the technique previously only
+available as a single-frame diagnostic in debug_medsam2.py cmd_mcvis). --n_anchors > 1
+re-anchors that box on several slices, so propagation restarts before it decays
+(support_bbox only). --support_slices > 1 (B1) builds the Pos/Neg (or multiclass)
+bag from several slices of the same support volume instead of its key slice alone
+-- still 1-shot, richer bag.
 
 Normalization is MedSAM2's (uint8+512+ImageNet), not the baseline's z-score --
 see models/medsam2_adapter.py.
@@ -32,8 +38,11 @@ import yaml
 from data.dataloader.dataset import get_fold_ids
 from eval_common import Scores, aggregate_and_print
 from models.medsam2_adapter import MedSAM2Segmenter, volume_to_uint8
-from models.support_prompt import (key_slice, pick_support_slices,
-                                   support_anchors_dense_bodymasked_bbox)
+from models.support_prompt import (build_multiclass_bags, key_slice, left_is_low_x,
+                                   multiclass_boxes_for_frame, muscle_types,
+                                   muscle_types_single, pick_support_slices,
+                                   support_anchors_dense_bodymasked_bbox,
+                                   support_bag_slices, support_bag_slices_single)
 
 
 def _read_nii(path: str) -> np.ndarray:
@@ -72,13 +81,22 @@ def evaluate(cfg: dict, checkpoint: str, model_cfg: str,
              seed: int = 42, refine_iters: int = 0,
              query_slice: str = 'auto', n_anchors: int = 1,
              anchor_min_gap: int = 3, support_slices: int = 1,
-             support_min_gap: int = 3) -> dict:
+             support_min_gap: int = 3, single_leg: bool = False,
+             cc_mode: str = 'dilate_largest') -> dict:
     data_cfg    = cfg['data']
     data_dir    = data_cfg['data_dir']
     n_folds     = data_cfg['n_folds']
     label_names = data_cfg['label_names']
     if eval_labels is None:
         eval_labels = list(range(1, len(label_names)))
+
+    types = None
+    if prompt_mode == 'support_multiclass':
+        types = muscle_types_single(label_names) if single_leg else muscle_types(label_names)
+        # {supp_sid -> (bags, left_is_low_x)}; spans every class since the multiclass bag
+        # already covers every type -- only rebuilt when a class's random pairing draws a
+        # support scan not seen yet for ANY class.
+        mc_bag_cache: dict = {}
 
     query_data_dir = target_data_dir or data_dir
     if target_data_dir:
@@ -118,7 +136,7 @@ def evaluate(cfg: dict, checkpoint: str, model_cfg: str,
 
         support_fg_idx: dict[str, np.ndarray] = {}
         rng = None
-        if prompt_mode == 'support_bbox':
+        if prompt_mode in ('support_bbox', 'support_multiclass'):
             rng = random.Random(seed + label_val)
             for sid in query_sids:
                 lbl = _read_nii(os.path.join(query_data_dir, f'label_{sid}.nii.gz'))
@@ -167,6 +185,39 @@ def evaluate(cfg: dict, checkpoint: str, model_cfg: str,
                     seg, supp, query_frames,
                     n_anchors=n_anchors, min_gap=anchor_min_gap)
                 seg_crop = seg.segment_volume(vol_u8, boxes, refine_iters=refine_iters)
+            elif prompt_mode == 'support_multiclass':
+                pool = [s for s in support_fg_idx if s != qsid]
+                if not pool:
+                    print(f'  [SKIP] query {qsid} has no support scan available for {label_name}')
+                    continue
+                supp_sid = rng.choice(pool)
+
+                if supp_sid not in mc_bag_cache:
+                    supp_img, supp_lbl = _load_raw(query_data_dir, supp_sid)
+                    supp_vol_u8 = volume_to_uint8(supp_img)
+                    bag_fn = support_bag_slices_single if single_leg else support_bag_slices
+                    supp_slices, _ = bag_fn(supp_vol_u8, supp_lbl, types,
+                                            support_slices, support_min_gap)
+                    low_x = None if single_leg else left_is_low_x(supp_lbl, types)
+                    bags = build_multiclass_bags(seg, supp_slices)
+                    mc_bag_cache[supp_sid] = (bags, low_x)
+                bags, low_x = mc_bag_cache[supp_sid]
+
+                # frozen key-slice seed (operator-in-the-loop proxy, same as debug_medsam2.py
+                # cmd_mcvis) -- multiclass_boxes_for_frame scores one frame at a time, so
+                # there is no query_slice=auto sweep here yet.
+                frame_idx = key_slice(q_fg) - z0   # local index into the cropped vol_u8
+                boxes_by_name, _ = multiclass_boxes_for_frame(
+                    seg, bags, vol_u8[frame_idx], low_x,
+                    single_leg=single_leg, cc_mode=cc_mode)
+                if label_name not in boxes_by_name:
+                    print(f'  [NO BOX] {qsid}: {label_name} lost to a rival on the key slice')
+                    seg_crop = np.zeros_like(vol_u8, dtype=q_fg.dtype)
+                else:
+                    _, box = boxes_by_name[label_name]
+                    seg_crop = seg.segment_volume(
+                        vol_u8, {frame_idx: np.asarray(box, dtype=np.float32)},
+                        refine_iters=refine_iters)
             else:
                 boxes = _build_boxes(q_fg, fg_idx, z0, prompt_mode, margin)
                 seg_crop = seg.segment_volume(vol_u8, boxes)        # [z1-z0+1,H,W]
@@ -246,7 +297,7 @@ if __name__ == '__main__':
                         help='only used when --target_data_dir is not given')
     parser.add_argument('--test_label',      type=int, nargs='+', default=None)
     parser.add_argument('--prompt_mode',     type=str, default='perslice',
-                        choices=['perslice', 'key', 'support_bbox'])
+                        choices=['perslice', 'key', 'support_bbox', 'support_multiclass'])
     parser.add_argument('--margin',          type=int, default=3,
                         help='oracle box margin in pixels')
     parser.add_argument('--seed',            type=int, default=42,
@@ -271,6 +322,15 @@ if __name__ == '__main__':
                              'behavior. Same support volume, so still 1-shot')
     parser.add_argument('--support_min_gap', type=int, default=3,
                         help='min z-distance between support slices (--support_slices > 1)')
+    parser.add_argument('--single_leg',      action='store_true',
+                        help='(prompt_mode=support_multiclass) dataset has one leg per '
+                             'volume (no L/R): label_names are bare type names, no side '
+                             'split of the body mask')
+    parser.add_argument('--cc_mode',         type=str, default='dilate_largest',
+                        choices=['dilate_largest', 'union', 'seed_only'],
+                        help='(prompt_mode=support_multiclass) _box_from_blob CC selection: '
+                             'dilate_largest = current fix, union = superseded first fix, '
+                             'seed_only = pre-fix ablation baseline')
     parser.add_argument('--save_dir',        type=str, default=None,
                         help='where to write scores.csv/summary.csv and best/worst volumes')
     parser.add_argument('--save_topk',       type=int, default=1,
@@ -301,4 +361,6 @@ if __name__ == '__main__':
         anchor_min_gap  = args.anchor_min_gap,
         support_slices  = args.support_slices,
         support_min_gap = args.support_min_gap,
+        single_leg      = args.single_leg,
+        cc_mode         = args.cc_mode,
     )
