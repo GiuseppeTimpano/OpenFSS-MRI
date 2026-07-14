@@ -556,7 +556,8 @@ def cmd_mcvis(args) -> None:
 
             boxes, score_maps = multiclass_boxes_for_frame(
                 seg, bags, frame_u8, low_x, BODY_THRESH, BODY_MIN_PX,
-                SCORE_THRESH, MARGIN_PX, single_leg=args.single_leg, cc_mode=args.cc_mode)
+                SCORE_THRESH, MARGIN_PX, single_leg=args.single_leg, cc_mode=args.cc_mode,
+                neg_points=args.neg_points, max_neg_points=args.max_neg_points)
             gt2d = q_fg[z0 + frame_idx].astype(bool)
 
             win, best, names = _winner_map(score_maps, frame_u8.shape)
@@ -592,9 +593,15 @@ def cmd_mcvis(args) -> None:
                       f'split={split} -> {os.path.basename(out)}')
                 continue
 
-            conf, box = boxes[label_name]
-            seg_crop = seg.segment_volume(vol_u8, {frame_idx: np.asarray(box, np.float32)},
-                                          refine_iters=args.refine_iters)
+            if args.neg_points:
+                conf, box, npts = boxes[label_name]
+            else:
+                conf, box = boxes[label_name]
+                npts = []
+            seg_crop = seg.segment_volume(
+                vol_u8, {frame_idx: np.asarray(box, np.float32)},
+                refine_iters=args.refine_iters,
+                neg_points={frame_idx: npts} if npts else None)
             pred_full = np.zeros_like(q_fg)
             pred_full[z0:z1 + 1] = seg_crop
             pb, gb = pred_full[fg_idx].astype(bool), q_fg[fg_idx].astype(bool)
@@ -604,9 +611,12 @@ def cmd_mcvis(args) -> None:
                              'dice': d, 'iou': i, 'boxiou': boxiou, 'split': split})
             pred2d = seg_crop[frame_idx].astype(bool)
 
-            def m1(ax, f=frame_u8, g=gt2d, pr=pred2d, b=box):
+            def m1(ax, f=frame_u8, g=gt2d, pr=pred2d, b=box, p=npts):
                 ax.imshow(f, cmap='gray'); ax.contour(g, colors='yellow', linewidths=1.5)
                 ax.contour(pr, colors='red', linewidths=1.5); _draw_box(ax, b, 2.0)
+                if p:
+                    xs, ys = zip(*p)
+                    ax.scatter(xs, ys, c='magenta', marker='x', s=60, linewidths=2)
 
             out = os.path.join(args.out_dir,
                                f'{label_name}_{qsid}_dice{d:.3f}_boxiou{boxiou:.2f}.png')
@@ -701,6 +711,12 @@ def main() -> None:
                    default='dilate_largest',
                    help='_box_from_blob CC selection: dilate_largest = current fix, '
                         'union = superseded first fix, seed_only = pre-fix ablation baseline')
+    m.add_argument('--neg_points', action='store_true',
+                   help='box+neg-points hybrid: add negative clicks on rival-won cells '
+                        'inside the box (magenta x in the rendered PNG), to push SAM2 off '
+                        'neighboring muscle an elongated box also covers (e.g. soleus)')
+    m.add_argument('--max_neg_points', type=int, default=3,
+                   help='(--neg_points) cap on negative clicks per box')
     m.set_defaults(func=cmd_mcvis)
 
     args = ap.parse_args()
