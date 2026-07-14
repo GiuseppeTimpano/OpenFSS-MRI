@@ -457,7 +457,7 @@ def _draw_winner(ax, frame_u8, win, names, boxes, target: str, leg=None):
     ax.imshow(np.ma.masked_less(win, 0), cmap=cmap, vmin=0, vmax=len(names) - 1, alpha=0.45)
     if leg is not None:
         ax.contour(leg, colors='white', linewidths=0.8, linestyles='dashed')
-    for name, (_score, box) in boxes.items():
+    for name, (_score, box, *_rest) in boxes.items():
         is_target = name == target
         _draw_box(ax, box, 2.6 if is_target else 1.0,
                   'white' if is_target else TYPE_COLORS.get(name.split('_', 1)[-1], 'magenta'))
