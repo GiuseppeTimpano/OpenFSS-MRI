@@ -82,7 +82,8 @@ def evaluate(cfg: dict, checkpoint: str, model_cfg: str,
              query_slice: str = 'auto', n_anchors: int = 1,
              anchor_min_gap: int = 3, support_slices: int = 1,
              support_min_gap: int = 3, single_leg: bool = False,
-             cc_mode: str = 'dilate_largest') -> dict:
+             cc_mode: str = 'dilate_largest', neg_points: bool = False,
+             max_neg_points: int = 3) -> dict:
     data_cfg    = cfg['data']
     data_dir    = data_cfg['data_dir']
     n_folds     = data_cfg['n_folds']
@@ -209,15 +210,22 @@ def evaluate(cfg: dict, checkpoint: str, model_cfg: str,
                 frame_idx = key_slice(q_fg) - z0   # local index into the cropped vol_u8
                 boxes_by_name, _ = multiclass_boxes_for_frame(
                     seg, bags, vol_u8[frame_idx], low_x,
-                    single_leg=single_leg, cc_mode=cc_mode)
+                    single_leg=single_leg, cc_mode=cc_mode,
+                    neg_points=neg_points, max_neg_points=max_neg_points)
                 if label_name not in boxes_by_name:
                     print(f'  [NO BOX] {qsid}: {label_name} lost to a rival on the key slice')
                     seg_crop = np.zeros_like(vol_u8, dtype=q_fg.dtype)
                 else:
-                    _, box = boxes_by_name[label_name]
+                    npts = None
+                    if neg_points:
+                        _, box, pts = boxes_by_name[label_name]
+                        if pts:
+                            npts = {frame_idx: pts}
+                    else:
+                        _, box = boxes_by_name[label_name]
                     seg_crop = seg.segment_volume(
                         vol_u8, {frame_idx: np.asarray(box, dtype=np.float32)},
-                        refine_iters=refine_iters)
+                        refine_iters=refine_iters, neg_points=npts)
             else:
                 boxes = _build_boxes(q_fg, fg_idx, z0, prompt_mode, margin)
                 seg_crop = seg.segment_volume(vol_u8, boxes)        # [z1-z0+1,H,W]
@@ -331,6 +339,13 @@ if __name__ == '__main__':
                         help='(prompt_mode=support_multiclass) _box_from_blob CC selection: '
                              'dilate_largest = current fix, union = superseded first fix, '
                              'seed_only = pre-fix ablation baseline')
+    parser.add_argument('--neg_points',      action='store_true',
+                        help='(prompt_mode=support_multiclass) box+neg-points hybrid: add '
+                             'negative clicks on rival-won cells inside the box, to push '
+                             'SAM2 off neighboring muscle an elongated box also covers '
+                             '(e.g. soleus). Off by default (box-only, previous behavior)')
+    parser.add_argument('--max_neg_points',  type=int, default=3,
+                        help='(--neg_points) cap on negative clicks per box')
     parser.add_argument('--save_dir',        type=str, default=None,
                         help='where to write scores.csv/summary.csv and best/worst volumes')
     parser.add_argument('--save_topk',       type=int, default=1,
@@ -363,4 +378,6 @@ if __name__ == '__main__':
         support_min_gap = args.support_min_gap,
         single_leg      = args.single_leg,
         cc_mode         = args.cc_mode,
+        neg_points      = args.neg_points,
+        max_neg_points  = args.max_neg_points,
     )

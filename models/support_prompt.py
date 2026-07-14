@@ -469,14 +469,42 @@ def _largest_cc(mask2d: np.ndarray) -> np.ndarray:
     return lab == sizes.argmax()
 
 
+def _neg_points_from_rivals(win: np.ndarray, best: np.ndarray, ci: int, blob: np.ndarray,
+                            leg: np.ndarray, img_hw: tuple, score_thresh: float,
+                            max_points: int = 3) -> list:
+    """Cells inside blob's own bbox that a RIVAL type won -- exactly the neighboring
+    tissue an elongated box (e.g. soleus spanning the calf) pulls in alongside the real
+    muscle. Returned as negative-click points in image (x,y) coords, top max_points by
+    rival score, for segment_volume's box+neg-points hybrid (prompt_mode=support_multiclass
+    --neg_points)."""
+    h, w = best.shape
+    H, W = img_hw
+    ys, xs = np.where(blob)
+    y0, y1, x0, x1 = ys.min(), ys.max() + 1, xs.min(), xs.max() + 1
+
+    rival = np.zeros_like(blob)
+    rival[y0:y1, x0:x1] = ((win[y0:y1, x0:x1] != ci) & (best[y0:y1, x0:x1] > score_thresh)
+                           & leg[y0:y1, x0:x1])
+    ry, rx = np.where(rival)
+    if len(ry) == 0:
+        return []
+
+    order = np.argsort(-best[ry, rx])[:max_points]
+    return [((float(rx[i]) + 0.5) / w * W, (float(ry[i]) + 0.5) / h * H) for i in order]
+
+
 def multiclass_boxes(score_maps: dict, query_body2d: np.ndarray, img_hw: tuple,
                      left_is_low_x: bool | None = None, score_thresh: float = 0.0,
                      margin_px: float = 0.0, single_leg: bool = False,
-                     cc_mode: str = 'dilate_largest') -> dict:
+                     cc_mode: str = 'dilate_largest', neg_points: bool = False,
+                     max_neg_points: int = 3) -> dict:
     """Winner-take-all per cell across the types, then one box per (side, type): the cells
     that type c wins, intersected with that leg. Two types can no longer claim the same
     pixels, and a confident false match on bone marrow dies because BG wins there.
-    Returns {'<side>_<type>': (score, box_xyxy)}.
+    Returns {'<side>_<type>': (score, box_xyxy)}, or {'<side>_<type>': (score, box_xyxy,
+    neg_pts)} when neg_points=True -- neg_pts are rival-won cells inside the box, meant as
+    negative clicks alongside the box to push SAM2 off neighboring muscle (elongated
+    shapes like soleus otherwise drag a big axis-aligned box across the neighbor).
 
     single_leg=True: one leg per volume (no L/R split) -- the whole body mask is used as
     the single group and keys are bare type names (no side prefix)."""
@@ -495,8 +523,13 @@ def multiclass_boxes(score_maps: dict, query_body2d: np.ndarray, img_hw: tuple,
             if not blob.any():
                 continue
             key = c if single_leg else f'{si}_{c}'
-            out[key] = (float(best[blob].max()),
-                       _box_from_blob(blob, best, img_hw, margin_px, cc_mode=cc_mode))
+            box = _box_from_blob(blob, best, img_hw, margin_px, cc_mode=cc_mode)
+            if neg_points:
+                pts = _neg_points_from_rivals(win, best, ci, blob, leg, img_hw,
+                                              score_thresh, max_neg_points)
+                out[key] = (float(best[blob].max()), box, pts)
+            else:
+                out[key] = (float(best[blob].max()), box)
     return out
 
 
@@ -505,15 +538,18 @@ def multiclass_boxes_for_frame(seg, bags: dict, frame_u8: np.ndarray,
                                body_thresh: float = 10.0, body_min_px: int = 50,
                                score_thresh: float = 0.0, margin_px: float = 0.0,
                                single_leg: bool = False,
-                               cc_mode: str = 'dilate_largest') -> tuple:
+                               cc_mode: str = 'dilate_largest', neg_points: bool = False,
+                               max_neg_points: int = 3) -> tuple:
     """One query frame -> all boxes at once. returns ({'<side>_<type>': (score, box)}
     or {'<type>': (score, box)} when single_leg, score_maps) -- the maps come back for
-    the debug overlay."""
+    the debug overlay. neg_points=True adds a third tuple element per key (see
+    multiclass_boxes)."""
     feat = seg.embed_frame(frame_u8)
     score_maps = multiclass_score_maps(feat, bags)
     body = body_mask2d(frame_u8, body_thresh, body_min_px)
     boxes = multiclass_boxes(score_maps, body, frame_u8.shape, left_is_low_x,
-                             score_thresh, margin_px, single_leg=single_leg, cc_mode=cc_mode)
+                             score_thresh, margin_px, single_leg=single_leg, cc_mode=cc_mode,
+                             neg_points=neg_points, max_neg_points=max_neg_points)
     return boxes, score_maps
 
 

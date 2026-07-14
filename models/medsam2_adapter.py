@@ -87,7 +87,8 @@ class MedSAM2Segmenter:
     @torch.inference_mode()
     def segment_volume(self, vol_u8: np.ndarray,
                        boxes: dict[int, np.ndarray],
-                       refine_iters: int = 0) -> np.ndarray:
+                       refine_iters: int = 0,
+                       neg_points: dict[int, list] | None = None) -> np.ndarray:
         """
         vol_u8 : [Z,H,W] uint8 [0,255] (already cropped to the propagation range).
         boxes  : {frame_idx -> [x0,y0,x1,y1]} in ORIGINAL (H,W) coords; one or more
@@ -99,12 +100,18 @@ class MedSAM2Segmenter:
                        hit. 0 = no refinement (single box-prompt pass, previous
                        behavior). Same pattern as segment_volume_points' refine_iters,
                        ported to the box-prompt path.
+        neg_points : optional {frame_idx -> [(x,y), ...]} negative clicks added on top
+                     of the box on the same frame (box+neg-points hybrid, models/
+                     support_prompt.py multiclass_boxes(neg_points=True)) -- meant to
+                     push SAM2 off neighboring muscle that an elongated box also covers.
+                     None/missing frame = box-only, previous behavior.
         returns: [Z,H,W] uint8 binary mask.
         """
         Z, H, W = vol_u8.shape
         seg = np.zeros((Z, H, W), dtype=np.uint8)
         if not boxes:
             return seg
+        neg_points = neg_points or {}
 
         img_resized = self._preprocess(vol_u8)
         autocast = (torch.autocast(self.device_type, dtype=torch.bfloat16)
@@ -114,9 +121,13 @@ class MedSAM2Segmenter:
             state = self.predictor.init_state(img_resized, H, W)
             for fidx, box in sorted(boxes.items()):
                 cur_box = tuple(float(v) for v in box)
+                pts = neg_points.get(fidx)
+                pts_arr = np.asarray(pts, dtype=np.float32) if pts else None
+                lbl_arr = np.zeros(len(pts), dtype=np.int32) if pts else None
                 _, _, mask_logits = self.predictor.add_new_points_or_box(
                     inference_state=state, frame_idx=int(fidx), obj_id=1,
-                    box=np.asarray(cur_box, dtype=np.float32))
+                    box=np.asarray(cur_box, dtype=np.float32),
+                    points=pts_arr, labels=lbl_arr)
 
                 for _ in range(refine_iters):
                     mask = (mask_logits[0, 0] > 0.0).cpu().numpy()
@@ -126,7 +137,8 @@ class MedSAM2Segmenter:
                     cur_box = new_box
                     _, _, mask_logits = self.predictor.add_new_points_or_box(
                         inference_state=state, frame_idx=int(fidx), obj_id=1,
-                        box=np.asarray(cur_box, dtype=np.float32))
+                        box=np.asarray(cur_box, dtype=np.float32),
+                        points=pts_arr, labels=lbl_arr)
 
             for reverse in (False, True):
                 for fidx, _oids, logits in self.predictor.propagate_in_video(
