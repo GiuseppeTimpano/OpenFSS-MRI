@@ -22,6 +22,7 @@ data/datasets/CHAOS/
 data/datasets/AMOS/
 data/datasets/MRI_muscle
 data/datasets/MRI_muscle_2
+data/datasets/Muscle_Basel_Data
 
 evaluation_util/
 weights/

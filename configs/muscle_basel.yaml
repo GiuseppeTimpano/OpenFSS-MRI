@@ -1,0 +1,6 @@
+# Muscle_Basel_Data (proprietary calf MRI, 4 scans) — zero-shot MedSAM2 eval config.
+
+data:
+  data_dir: data/datasets/Muscle_Basel_Data/processed
+  n_folds: 4
+  label_names: [BG, L_SOL, L_GM, L_GL, L_TA, L_ELD, L_PER, R_SOL, R_GM, R_GL, R_TA, R_ELD, R_PER]
