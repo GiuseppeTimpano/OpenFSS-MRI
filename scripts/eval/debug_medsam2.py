@@ -510,6 +510,11 @@ def cmd_mcvis(args) -> None:
 
     os.makedirs(args.out_dir, exist_ok=True)
     seg = MedSAM2Segmenter(args.medsam2_ckpt, args.sam2_cfg, device=device)
+    if getattr(args, 'embed_level', -1) != -1:   # A/B resolution probe: route matching to a
+        _lvl = args.embed_level                   # finer FPN level (embed_frame stays untouched)
+        seg.embed_frame = lambda f: seg.embed_frame_ml(f, _lvl)
+        print(f'[embed_level={_lvl}] support matching uses backbone_fpn[{_lvl}] '
+              f'({"128x128" if _lvl == 0 else "64x64" if _lvl == 1 else "32x32"})')
     bag_cache: dict = {}          # support sid -> (bags, left_is_low_x, slice zs)
     csv_rows: list[dict] = []
 
@@ -717,6 +722,12 @@ def main() -> None:
                         'neighboring muscle an elongated box also covers (e.g. soleus)')
     m.add_argument('--max_neg_points', type=int, default=3,
                    help='(--neg_points) cap on negative clicks per box')
+    m.add_argument('--embed_level', type=int, default=-1, choices=[-1, 0, 1, 2],
+                   help='A/B resolution probe: backbone_fpn level for support matching. '
+                        '-1=stride16/32x32 (default, production embed_frame), 1=stride8/64x64, '
+                        '0=stride4/128x128 (finest, lateral-only). Run each level to its own '
+                        '--out_dir and compare boxiou: finer fixes mislocation = Regime A '
+                        '(resolution); still broken = Regime B (textural confusion).')
     m.set_defaults(func=cmd_mcvis)
 
     args = ap.parse_args()

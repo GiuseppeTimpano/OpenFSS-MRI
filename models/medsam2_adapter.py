@@ -85,6 +85,26 @@ class MedSAM2Segmenter:
         return out["backbone_fpn"][-1][0]
 
     @torch.inference_mode()
+    def embed_frame_ml(self, frame_u8: np.ndarray, level: int = -1) -> torch.Tensor:
+        """A/B resolution probe -- multi-LEVEL sibling of embed_frame (which is left untouched
+        and stays the production path). Returns a chosen backbone_fpn level instead of the
+        fixed [-1]. With scalp=1 the kept pyramid is [0]=stride4/128x128, [1]=stride8/64x64,
+        [2]==[-1]=stride16/32x32 (top-down-fused, most semantic == what embed_frame returns).
+        Levels 0/1 are finer but lateral-only (less semantic). Downstream matching
+        (models/support_prompt.py) is grid-agnostic -- reads feat.shape, interpolates masks --
+        so swapping the level needs no other change. level=-1 reproduces embed_frame exactly.
+
+        Not wired into production: debug_medsam2.py mcvis monkeypatches seg.embed_frame onto
+        this when --embed_level != -1, so revert = drop this method + the flag."""
+        img = self._preprocess(frame_u8[None])  # [1,3,IMG_SIZE,IMG_SIZE]
+        autocast = (torch.autocast(self.device_type, dtype=torch.bfloat16)
+                    if self.device_type == "cuda"
+                    else torch.autocast(self.device_type, enabled=False))
+        with autocast:
+            out = self.predictor.forward_image(img)
+        return out["backbone_fpn"][level][0]
+
+    @torch.inference_mode()
     def segment_volume(self, vol_u8: np.ndarray,
                        boxes: dict[int, np.ndarray],
                        refine_iters: int = 0,
