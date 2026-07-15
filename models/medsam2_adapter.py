@@ -102,7 +102,11 @@ class MedSAM2Segmenter:
                     else torch.autocast(self.device_type, enabled=False))
         with autocast:
             out = self.predictor.forward_image(img)
-        return out["backbone_fpn"][level][0]
+        # levels outside fpn_top_down_levels (here: 0,1) skip the top-down interpolate that
+        # casts to float32 in FpnNeck.forward, so they stay bfloat16 -- .numpy() downstream
+        # (models/support_prompt.py) can't handle that dtype. level=-1 already comes out
+        # float32 via that path, so this cast is a no-op there.
+        return out["backbone_fpn"][level][0].float()
 
     @torch.inference_mode()
     def segment_volume(self, vol_u8: np.ndarray,
