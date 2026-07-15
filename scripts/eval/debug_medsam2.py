@@ -488,10 +488,8 @@ def cmd_mcvis(args) -> None:
     import torch
     import yaml
     from models.medsam2_adapter import MedSAM2Segmenter, volume_to_uint8
-    from models.support_prompt import (body_mask2d, build_multiclass_bags,
-                                       build_multiclass_bags_hard, key_slice,
+    from models.support_prompt import (body_mask2d, build_multiclass_bags, key_slice,
                                        left_is_low_x, legs_are_separate, multiclass_boxes_for_frame,
-                                       multiclass_boxes_for_frame_hard,
                                        muscle_types, muscle_types_single,
                                        side_masks, support_bag_slices, support_bag_slices_single)
     from eval_medsam2 import _read_nii, _load_raw
@@ -551,10 +549,8 @@ def cmd_mcvis(args) -> None:
                 supp_slices, supp_zs = bag_slices_fn(
                     supp_vol_u8, supp_lbl, types, args.support_slices, args.support_min_gap)
                 low_x = None if args.single_leg else left_is_low_x(supp_lbl, types)
-                bag_fn = build_multiclass_bags_hard if args.hard_neg else build_multiclass_bags
-                bag_kwargs = {'ring_px': args.hard_neg_ring} if args.hard_neg else {}
-                bag_cache[supp_sid] = (bag_fn(seg, supp_slices, THR_HI, THR_LO,
-                                              BODY_THRESH, BODY_MIN_PX, **bag_kwargs),
+                bag_cache[supp_sid] = (build_multiclass_bags(seg, supp_slices, THR_HI, THR_LO,
+                                                             BODY_THRESH, BODY_MIN_PX),
                                        low_x, supp_zs)
                 _render_support(args.out_dir, supp_sid, supp_slices, supp_zs)
             bags, low_x, supp_zs = bag_cache[supp_sid]
@@ -564,8 +560,7 @@ def cmd_mcvis(args) -> None:
             frame_idx = key_slice(q_fg) - z0             # frozen slice, as in bag_key
             frame_u8 = vol_u8[frame_idx]
 
-            boxes_fn = multiclass_boxes_for_frame_hard if args.hard_neg else multiclass_boxes_for_frame
-            boxes, score_maps = boxes_fn(
+            boxes, score_maps = multiclass_boxes_for_frame(
                 seg, bags, frame_u8, low_x, BODY_THRESH, BODY_MIN_PX,
                 SCORE_THRESH, MARGIN_PX, single_leg=args.single_leg, cc_mode=args.cc_mode,
                 neg_points=args.neg_points, max_neg_points=args.max_neg_points)
@@ -734,17 +729,6 @@ def main() -> None:
                         '0=stride4/128x128 (finest, lateral-only). Run each level to its own '
                         '--out_dir and compare boxiou: finer fixes mislocation = Regime A '
                         '(resolution); still broken = Regime B (textural confusion).')
-    m.add_argument('--hard_neg', action='store_true',
-                   help='B3: build_multiclass_bags_hard / multiclass_boxes_for_frame_hard '
-                        'instead of the plain versions -- each class gets an extra rival bag '
-                        'sampled from a ring just outside its own GT mask (the anatomically '
-                        'adjacent tissue), on top of the normal cross-class rivals. Off by '
-                        'default; plain build_multiclass_bags path is untouched.')
-    m.add_argument('--hard_neg_ring', type=int, default=24,
-                   help='(--hard_neg) ring width in px around each class GT mask sampled '
-                        'into its hard-negative bag -- must exceed one feature grid cell '
-                        '(stride16, so >16px) or the ring gets filtered out entirely by the '
-                        'thr_lo contamination check')
     m.set_defaults(func=cmd_mcvis)
 
     args = ap.parse_args()
