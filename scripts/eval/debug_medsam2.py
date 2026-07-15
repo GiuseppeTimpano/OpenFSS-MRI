@@ -488,9 +488,11 @@ def cmd_mcvis(args) -> None:
     import torch
     import yaml
     from models.medsam2_adapter import MedSAM2Segmenter, volume_to_uint8
-    from models.support_prompt import (body_mask2d, build_multiclass_bags, key_slice,
+    from models.support_prompt import (body_mask2d, build_multiclass_bags,
+                                       build_multiclass_bags_hard, key_slice,
                                        left_is_low_x, legs_are_separate, multiclass_boxes_for_frame,
-                                       muscle_types, muscle_types_single, refine_box_finegrid,
+                                       multiclass_boxes_for_frame_hard,
+                                       muscle_types, muscle_types_single,
                                        side_masks, support_bag_slices, support_bag_slices_single)
     from eval_medsam2 import _read_nii, _load_raw
 
@@ -516,11 +518,6 @@ def cmd_mcvis(args) -> None:
         print(f'[embed_level={_lvl}] support matching uses backbone_fpn[{_lvl}] '
               f'({"128x128" if _lvl == 0 else "64x64" if _lvl == 1 else "32x32"})')
     bag_cache: dict = {}          # support sid -> (bags, left_is_low_x, slice zs)
-    bag_cache_fine: dict = {}     # support sid -> bags at args.refine_level (coarse-to-fine probe)
-
-    class _EmbedAt:                # shim so build_multiclass_bags(seg.embed_frame) can
-        def __init__(self, seg, level): self.seg, self.level = seg, level  # target embed_frame_ml
-        def embed_frame(self, f): return self.seg.embed_frame_ml(f, self.level)
 
     csv_rows: list[dict] = []
 
@@ -554,13 +551,11 @@ def cmd_mcvis(args) -> None:
                 supp_slices, supp_zs = bag_slices_fn(
                     supp_vol_u8, supp_lbl, types, args.support_slices, args.support_min_gap)
                 low_x = None if args.single_leg else left_is_low_x(supp_lbl, types)
-                bag_cache[supp_sid] = (build_multiclass_bags(seg, supp_slices, THR_HI, THR_LO,
-                                                             BODY_THRESH, BODY_MIN_PX),
+                bag_fn = build_multiclass_bags_hard if args.hard_neg else build_multiclass_bags
+                bag_kwargs = {'ring_px': args.hard_neg_ring} if args.hard_neg else {}
+                bag_cache[supp_sid] = (bag_fn(seg, supp_slices, THR_HI, THR_LO,
+                                              BODY_THRESH, BODY_MIN_PX, **bag_kwargs),
                                        low_x, supp_zs)
-                if getattr(args, 'refine_level', -1) != -1:   # coarse-to-fine probe: bags at
-                    bag_cache_fine[supp_sid] = build_multiclass_bags(   # refine_level, SEPARATE
-                        _EmbedAt(seg, args.refine_level), supp_slices,   # from bag_cache (level -1)
-                        THR_HI, THR_LO, BODY_THRESH, BODY_MIN_PX)
                 _render_support(args.out_dir, supp_sid, supp_slices, supp_zs)
             bags, low_x, supp_zs = bag_cache[supp_sid]
 
@@ -569,7 +564,8 @@ def cmd_mcvis(args) -> None:
             frame_idx = key_slice(q_fg) - z0             # frozen slice, as in bag_key
             frame_u8 = vol_u8[frame_idx]
 
-            boxes, score_maps = multiclass_boxes_for_frame(
+            boxes_fn = multiclass_boxes_for_frame_hard if args.hard_neg else multiclass_boxes_for_frame
+            boxes, score_maps = boxes_fn(
                 seg, bags, frame_u8, low_x, BODY_THRESH, BODY_MIN_PX,
                 SCORE_THRESH, MARGIN_PX, single_leg=args.single_leg, cc_mode=args.cc_mode,
                 neg_points=args.neg_points, max_neg_points=args.max_neg_points)
@@ -613,10 +609,6 @@ def cmd_mcvis(args) -> None:
             else:
                 conf, box = boxes[label_name]
                 npts = []
-            if getattr(args, 'refine_level', -1) != -1:   # coarse-to-fine probe: box stays
-                box = refine_box_finegrid(                # from the coarse (level -1) pass,
-                    seg, bag_cache_fine[supp_sid], mtype, frame_u8, box,   # only the boundary
-                    args.refine_level, args.refine_margin, cc_mode=args.cc_mode)  # gets refined
             seg_crop = seg.segment_volume(
                 vol_u8, {frame_idx: np.asarray(box, np.float32)},
                 refine_iters=args.refine_iters,
@@ -742,16 +734,15 @@ def main() -> None:
                         '0=stride4/128x128 (finest, lateral-only). Run each level to its own '
                         '--out_dir and compare boxiou: finer fixes mislocation = Regime A '
                         '(resolution); still broken = Regime B (textural confusion).')
-    m.add_argument('--refine_level', type=int, default=-1, choices=[-1, 0, 1],
-                   help='Coarse-to-fine box refinement (separate from --embed_level): coarse '
-                        'pass (level -1) still picks the muscle type/box as usual, then a '
-                        'second pass re-embeds just that box\'s own crop (+margin) at this '
-                        'finer level and tightens the box boundary (rival = BG only, not '
-                        'other muscle types -- type already trusted). -1=off (default, no '
-                        'second pass). 1=stride8/64x64, 0=stride4/128x128 crop-local grid.')
-    m.add_argument('--refine_margin', type=float, default=0.3,
-                   help='(--refine_level) crop margin around the coarse box, as a fraction '
-                        'of box width/height on each side')
+    m.add_argument('--hard_neg', action='store_true',
+                   help='B3: build_multiclass_bags_hard / multiclass_boxes_for_frame_hard '
+                        'instead of the plain versions -- each class gets an extra rival bag '
+                        'sampled from a ring just outside its own GT mask (the anatomically '
+                        'adjacent tissue), on top of the normal cross-class rivals. Off by '
+                        'default; plain build_multiclass_bags path is untouched.')
+    m.add_argument('--hard_neg_ring', type=int, default=6,
+                   help='(--hard_neg) ring width in px around each class GT mask sampled '
+                        'into its hard-negative bag')
     m.set_defaults(func=cmd_mcvis)
 
     args = ap.parse_args()

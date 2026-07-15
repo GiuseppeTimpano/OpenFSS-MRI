@@ -345,6 +345,111 @@ def multiclass_score_maps(feat_query: torch.Tensor, bags: dict) -> dict:
     return out
 
 
+# ============================ B3: hard-negative rival bags ============================
+# Additive sibling set (build_multiclass_bags / multiclass_score_maps / multiclass_boxes_for_frame
+# above stay UNTOUCHED). Regime B confirmed: mislocation is textural confusion between
+# anatomically adjacent classes, not a resolution problem (--embed_level A/B probe) and not
+# fixable by a local coarse-to-fine box crop (tried, reverted -- grew the box, MedSAM2
+# over-segmented). This is a different angle: the plain BG bag excludes any grid cell whose
+# class-membership is ambiguous (thr_lo cutoff), so pixels right at a class boundary --
+# exactly the confusable tissue -- never enter ANY bag. B3 explicitly samples a ring just
+# outside each class's own GT mask into a per-class hard-negative bag, so scoring that class
+# is forced to discriminate against its real neighbor texture, not just BG/generic rivals.
+
+def build_multiclass_bags_hard(seg, supp_slices: list, thr_hi: float = 0.7, thr_lo: float = 0.3,
+                               body_thresh: float = 10.0, body_min_px: int = 50,
+                               ring_px: int = 6) -> dict:
+    """Same fg/BG bags as build_multiclass_bags, PLUS one hard-negative bag per class under
+    key f'{cls}__hn': features from a ring_px-wide dilation band just outside that class's
+    own GT mask (whatever tissue lands there -- usually the anatomically adjacent muscle).
+    Consumed by multiclass_score_maps_hard, not by multiclass_score_maps."""
+    from scipy.ndimage import binary_dilation
+
+    bags = defaultdict(list)
+    hard = defaultdict(list)
+    for frame_u8, cls_masks in supp_slices:
+        feat = seg.embed_frame(frame_u8)
+        C, h, w = feat.shape
+        flat = feat.reshape(C, h * w)
+        body = _to_grid(body_mask2d(frame_u8, body_thresh, body_min_px), h, w, feat.device)
+        is_bg = body.reshape(-1) > 0.5
+
+        grids = {}
+        for cls, m2d in cls_masks.items():
+            m = _to_grid(m2d, h, w, feat.device).reshape(-1)
+            grids[cls] = m
+            idx = (m > thr_hi).nonzero(as_tuple=True)[0]
+            if idx.numel():
+                bags[cls].append(F.normalize(flat[:, idx], dim=0))
+            is_bg &= (m < thr_lo)
+
+        idx = is_bg.nonzero(as_tuple=True)[0]
+        if idx.numel():
+            bags[BG_KEY].append(F.normalize(flat[:, idx], dim=0))
+
+        for cls, m2d in cls_masks.items():
+            own = m2d > 0.5
+            if not own.any():
+                continue
+            ring = binary_dilation(own, iterations=ring_px) & ~own
+            if not ring.any():
+                continue
+            r = _to_grid(ring.astype(np.float32), h, w, feat.device).reshape(-1) > 0.5
+            r &= (grids[cls] < thr_lo)          # drop cells still ambiguously "this class"
+            idx = r.nonzero(as_tuple=True)[0]
+            if idx.numel():
+                hard[cls].append(F.normalize(flat[:, idx], dim=0))
+
+    out = {c: torch.cat(v, dim=1) for c, v in bags.items()}
+    for c, v in hard.items():
+        out[f'{c}__hn'] = torch.cat(v, dim=1)
+    return out
+
+
+def multiclass_score_maps_hard(feat_query: torch.Tensor, bags: dict) -> dict:
+    """Same as multiclass_score_maps, but each class's rival pool also includes its own
+    per-class hard-negative bag (bags[f'{cls}__hn'], from build_multiclass_bags_hard) --
+    a class's hardneg bag is only a rival for that class, it does not leak into other
+    classes' scoring. Requires bags from build_multiclass_bags_hard."""
+    C, h, w = feat_query.shape
+    Qn = F.normalize(feat_query.reshape(C, h * w), dim=0)
+
+    def _max_sim(B):
+        sim = B.t() @ Qn
+        return sim.max(dim=0).values.reshape(h, w)
+
+    pos = {c: _max_sim(B) for c, B in bags.items() if not c.endswith('__hn') and B.shape[1] > 0}
+    hn = {c[:-len('__hn')]: _max_sim(B) for c, B in bags.items()
+          if c.endswith('__hn') and B.shape[1] > 0}
+
+    out = {}
+    for c in pos:
+        if c == BG_KEY:
+            continue
+        rivals = [p for k, p in pos.items() if k != c]
+        if c in hn:
+            rivals.append(hn[c])
+        out[c] = (pos[c] - torch.stack(rivals).max(dim=0).values).cpu().numpy()
+    return out
+
+
+def multiclass_boxes_for_frame_hard(seg, bags: dict, frame_u8: np.ndarray,
+                                    left_is_low_x: bool, body_thresh: float = 10.0,
+                                    body_min_px: int = 50, score_thresh: float = 0.0,
+                                    margin_px: int = 0, single_leg: bool = False,
+                                    cc_mode: str = 'dilate_largest', neg_points: bool = False,
+                                    max_neg_points: int = 3) -> tuple:
+    """Same as multiclass_boxes_for_frame, but scores via multiclass_score_maps_hard.
+    bags must come from build_multiclass_bags_hard (needs the f'{cls}__hn' entries)."""
+    feat = seg.embed_frame(frame_u8)
+    score_maps = multiclass_score_maps_hard(feat, bags)
+    body = body_mask2d(frame_u8, body_thresh, body_min_px)
+    boxes = multiclass_boxes(score_maps, body, frame_u8.shape, left_is_low_x,
+                             score_thresh, margin_px, single_leg=single_leg, cc_mode=cc_mode,
+                             neg_points=neg_points, max_neg_points=max_neg_points)
+    return boxes, score_maps
+
+
 def _split_at_midline(body2d: np.ndarray) -> tuple:
     """Cut the body in two at the column with the fewest body pixels, searched around the
     centroid: on an axial thigh that column is the gap between the two legs. Used when the
@@ -551,47 +656,6 @@ def multiclass_boxes_for_frame(seg, bags: dict, frame_u8: np.ndarray,
                              score_thresh, margin_px, single_leg=single_leg, cc_mode=cc_mode,
                              neg_points=neg_points, max_neg_points=max_neg_points)
     return boxes, score_maps
-
-
-def refine_box_finegrid(seg, bags_fine: dict, cls: str, frame_u8: np.ndarray, box: tuple,
-                        level: int, margin_frac: float = 0.3, score_thresh: float = 0.0,
-                        cc_mode: str = 'dilate_largest') -> tuple:
-    """Coarse-to-fine box refinement -- second pass, NOT a replacement for multiclass_boxes
-    (level -1, untouched). box already came from that coarse pass and already picked the
-    right muscle type; this reruns matching only inside box's own crop (+margin), re-embedded
-    via seg.embed_frame_ml(level). A smaller physical crop resized to the same 512x512
-    encoder input means more px per grid cell there, WITHOUT re-exposing the whole-frame
-    finer-grid confusion between distant unrelated muscles that plain --embed_level showed
-    (Regime B, confirmed: level 0/1 whole-frame matching gave dice/boxiou 0.000 on many
-    classes, no better than level -1). Rival here is only BG, not other muscle types --
-    type selection is already trusted from the coarse pass, this only tightens the boundary.
-
-    bags_fine must be built at the SAME level (e.g. build_multiclass_bags called with an
-    object whose .embed_frame is seg.embed_frame_ml bound to `level`) -- feature space must
-    match feat_query's level, coarse bags (level -1) are NOT interchangeable here.
-
-    Returns a refined box tuple, or the original box unchanged if the crop finds nothing
-    (empty crop, class missing from bags_fine, or no cell above score_thresh)."""
-    H, W = frame_u8.shape
-    x0, y0, x1, y1 = box
-    mx, my = (x1 - x0) * margin_frac, (y1 - y0) * margin_frac
-    cx0, cy0 = max(0, int(x0 - mx)), max(0, int(y0 - my))
-    cx1, cy1 = min(W, int(x1 + mx) + 1), min(H, int(y1 + my) + 1)
-    crop = frame_u8[cy0:cy1, cx0:cx1]
-    if crop.size == 0 or cls not in bags_fine:
-        return box
-
-    feat = seg.embed_frame_ml(crop, level)
-    sm = multiclass_score_maps(feat, {cls: bags_fine[cls], BG_KEY: bags_fine.get(BG_KEY)})
-    s = sm.get(cls)
-    if s is None:
-        return box
-    blob = s > score_thresh
-    if not blob.any():
-        return box
-
-    fx0, fy0, fx1, fy1 = _box_from_blob(blob, s, (cy1 - cy0, cx1 - cx0), cc_mode=cc_mode)
-    return (fx0 + cx0, fy0 + cy0, fx1 + cx0, fy1 + cy0)
 
 
 # ============================ B2 support: bilateral bookkeeping ============================
