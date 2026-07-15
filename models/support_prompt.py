@@ -553,6 +553,47 @@ def multiclass_boxes_for_frame(seg, bags: dict, frame_u8: np.ndarray,
     return boxes, score_maps
 
 
+def refine_box_finegrid(seg, bags_fine: dict, cls: str, frame_u8: np.ndarray, box: tuple,
+                        level: int, margin_frac: float = 0.3, score_thresh: float = 0.0,
+                        cc_mode: str = 'dilate_largest') -> tuple:
+    """Coarse-to-fine box refinement -- second pass, NOT a replacement for multiclass_boxes
+    (level -1, untouched). box already came from that coarse pass and already picked the
+    right muscle type; this reruns matching only inside box's own crop (+margin), re-embedded
+    via seg.embed_frame_ml(level). A smaller physical crop resized to the same 512x512
+    encoder input means more px per grid cell there, WITHOUT re-exposing the whole-frame
+    finer-grid confusion between distant unrelated muscles that plain --embed_level showed
+    (Regime B, confirmed: level 0/1 whole-frame matching gave dice/boxiou 0.000 on many
+    classes, no better than level -1). Rival here is only BG, not other muscle types --
+    type selection is already trusted from the coarse pass, this only tightens the boundary.
+
+    bags_fine must be built at the SAME level (e.g. build_multiclass_bags called with an
+    object whose .embed_frame is seg.embed_frame_ml bound to `level`) -- feature space must
+    match feat_query's level, coarse bags (level -1) are NOT interchangeable here.
+
+    Returns a refined box tuple, or the original box unchanged if the crop finds nothing
+    (empty crop, class missing from bags_fine, or no cell above score_thresh)."""
+    H, W = frame_u8.shape
+    x0, y0, x1, y1 = box
+    mx, my = (x1 - x0) * margin_frac, (y1 - y0) * margin_frac
+    cx0, cy0 = max(0, int(x0 - mx)), max(0, int(y0 - my))
+    cx1, cy1 = min(W, int(x1 + mx) + 1), min(H, int(y1 + my) + 1)
+    crop = frame_u8[cy0:cy1, cx0:cx1]
+    if crop.size == 0 or cls not in bags_fine:
+        return box
+
+    feat = seg.embed_frame_ml(crop, level)
+    sm = multiclass_score_maps(feat, {cls: bags_fine[cls], BG_KEY: bags_fine.get(BG_KEY)})
+    s = sm.get(cls)
+    if s is None:
+        return box
+    blob = s > score_thresh
+    if not blob.any():
+        return box
+
+    fx0, fy0, fx1, fy1 = _box_from_blob(blob, s, (cy1 - cy0, cx1 - cx0), cc_mode=cc_mode)
+    return (fx0 + cx0, fy0 + cy0, fx1 + cx0, fy1 + cy0)
+
+
 # ============================ B2 support: bilateral bookkeeping ============================
 # Moved here from scripts/eval/debug_medsam2.py (cmd_mcvis) so both the debug-vis tool and
 # a full propagation-based eval (eval_medsam2.py, prompt_mode=support_multiclass) share one

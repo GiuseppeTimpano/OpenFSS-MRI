@@ -490,8 +490,8 @@ def cmd_mcvis(args) -> None:
     from models.medsam2_adapter import MedSAM2Segmenter, volume_to_uint8
     from models.support_prompt import (body_mask2d, build_multiclass_bags, key_slice,
                                        left_is_low_x, legs_are_separate, multiclass_boxes_for_frame,
-                                       muscle_types, muscle_types_single, side_masks,
-                                       support_bag_slices, support_bag_slices_single)
+                                       muscle_types, muscle_types_single, refine_box_finegrid,
+                                       side_masks, support_bag_slices, support_bag_slices_single)
     from eval_medsam2 import _read_nii, _load_raw
 
     device = args.device or ('cuda' if torch.cuda.is_available() else 'cpu')
@@ -516,6 +516,12 @@ def cmd_mcvis(args) -> None:
         print(f'[embed_level={_lvl}] support matching uses backbone_fpn[{_lvl}] '
               f'({"128x128" if _lvl == 0 else "64x64" if _lvl == 1 else "32x32"})')
     bag_cache: dict = {}          # support sid -> (bags, left_is_low_x, slice zs)
+    bag_cache_fine: dict = {}     # support sid -> bags at args.refine_level (coarse-to-fine probe)
+
+    class _EmbedAt:                # shim so build_multiclass_bags(seg.embed_frame) can
+        def __init__(self, seg, level): self.seg, self.level = seg, level  # target embed_frame_ml
+        def embed_frame(self, f): return self.seg.embed_frame_ml(f, self.level)
+
     csv_rows: list[dict] = []
 
     for label_val in test_labels:
@@ -551,6 +557,10 @@ def cmd_mcvis(args) -> None:
                 bag_cache[supp_sid] = (build_multiclass_bags(seg, supp_slices, THR_HI, THR_LO,
                                                              BODY_THRESH, BODY_MIN_PX),
                                        low_x, supp_zs)
+                if getattr(args, 'refine_level', -1) != -1:   # coarse-to-fine probe: bags at
+                    bag_cache_fine[supp_sid] = build_multiclass_bags(   # refine_level, SEPARATE
+                        _EmbedAt(seg, args.refine_level), supp_slices,   # from bag_cache (level -1)
+                        THR_HI, THR_LO, BODY_THRESH, BODY_MIN_PX)
                 _render_support(args.out_dir, supp_sid, supp_slices, supp_zs)
             bags, low_x, supp_zs = bag_cache[supp_sid]
 
@@ -603,6 +613,10 @@ def cmd_mcvis(args) -> None:
             else:
                 conf, box = boxes[label_name]
                 npts = []
+            if getattr(args, 'refine_level', -1) != -1:   # coarse-to-fine probe: box stays
+                box = refine_box_finegrid(                # from the coarse (level -1) pass,
+                    seg, bag_cache_fine[supp_sid], mtype, frame_u8, box,   # only the boundary
+                    args.refine_level, args.refine_margin, cc_mode=args.cc_mode)  # gets refined
             seg_crop = seg.segment_volume(
                 vol_u8, {frame_idx: np.asarray(box, np.float32)},
                 refine_iters=args.refine_iters,
@@ -728,6 +742,16 @@ def main() -> None:
                         '0=stride4/128x128 (finest, lateral-only). Run each level to its own '
                         '--out_dir and compare boxiou: finer fixes mislocation = Regime A '
                         '(resolution); still broken = Regime B (textural confusion).')
+    m.add_argument('--refine_level', type=int, default=-1, choices=[-1, 0, 1],
+                   help='Coarse-to-fine box refinement (separate from --embed_level): coarse '
+                        'pass (level -1) still picks the muscle type/box as usual, then a '
+                        'second pass re-embeds just that box\'s own crop (+margin) at this '
+                        'finer level and tightens the box boundary (rival = BG only, not '
+                        'other muscle types -- type already trusted). -1=off (default, no '
+                        'second pass). 1=stride8/64x64, 0=stride4/128x128 crop-local grid.')
+    m.add_argument('--refine_margin', type=float, default=0.3,
+                   help='(--refine_level) crop margin around the coarse box, as a fraction '
+                        'of box width/height on each side')
     m.set_defaults(func=cmd_mcvis)
 
     args = ap.parse_args()
