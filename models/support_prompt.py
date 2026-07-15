@@ -394,7 +394,7 @@ def build_multiclass_bags_hard(seg, supp_slices: list, thr_hi: float = 0.7, thr_
             ring = binary_dilation(own, iterations=ring_px) & ~own
             if not ring.any():
                 continue
-            r = _to_grid(ring.astype(np.float32), h, w, feat.device).reshape(-1) > 0.5
+            r = _to_grid(ring.astype(np.float32), h, w, feat.device).reshape(-1) > 0.0
             r &= (grids[cls] < thr_lo)          # drop cells still ambiguously "this class"
             idx = r.nonzero(as_tuple=True)[0]
             if idx.numel():
