@@ -358,7 +358,7 @@ def multiclass_score_maps(feat_query: torch.Tensor, bags: dict) -> dict:
 
 def build_multiclass_bags_hard(seg, supp_slices: list, thr_hi: float = 0.7, thr_lo: float = 0.3,
                                body_thresh: float = 10.0, body_min_px: int = 50,
-                               ring_px: int = 6) -> dict:
+                               ring_px: int = 24) -> dict:
     """Same fg/BG bags as build_multiclass_bags, PLUS one hard-negative bag per class under
     key f'{cls}__hn': features from a ring_px-wide dilation band just outside that class's
     own GT mask (whatever tissue lands there -- usually the anatomically adjacent muscle).

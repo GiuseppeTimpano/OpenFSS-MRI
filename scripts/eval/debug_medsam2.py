@@ -740,9 +740,11 @@ def main() -> None:
                         'sampled from a ring just outside its own GT mask (the anatomically '
                         'adjacent tissue), on top of the normal cross-class rivals. Off by '
                         'default; plain build_multiclass_bags path is untouched.')
-    m.add_argument('--hard_neg_ring', type=int, default=6,
+    m.add_argument('--hard_neg_ring', type=int, default=24,
                    help='(--hard_neg) ring width in px around each class GT mask sampled '
-                        'into its hard-negative bag')
+                        'into its hard-negative bag -- must exceed one feature grid cell '
+                        '(stride16, so >16px) or the ring gets filtered out entirely by the '
+                        'thr_lo contamination check')
     m.set_defaults(func=cmd_mcvis)
 
     args = ap.parse_args()
