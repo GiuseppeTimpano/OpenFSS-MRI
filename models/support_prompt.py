@@ -556,12 +556,12 @@ def multiclass_masks_for_frame(seg, bags: dict, frame_u8: np.ndarray,
                                left_is_low_x: bool | None = None,
                                body_thresh: float = 10.0, body_min_px: int = 50,
                                score_thresh: float = 0.0, single_leg: bool = False,
-                               cc_mode: str = 'dilate_largest') -> tuple:
+                               cc_mode: str = 'dilate_largest', score_norm: str = 'none') -> tuple:
     """Mask-prompt sibling of multiclass_boxes_for_frame. One query frame -> all masks
     at once. Returns ({'<side>_<type>': (score, mask)} or {'<type>': (score, mask)}
-    when single_leg, score_maps)."""
+    when single_leg, score_maps). score_norm: see multiclass_score_maps."""
     feat = seg.embed_frame(frame_u8)
-    score_maps = multiclass_score_maps(feat, bags)
+    score_maps = multiclass_score_maps(feat, bags, score_norm=score_norm)
     body = body_mask2d(frame_u8, body_thresh, body_min_px)
     masks = multiclass_masks(score_maps, body, frame_u8.shape, left_is_low_x,
                              score_thresh, single_leg=single_leg, cc_mode=cc_mode)

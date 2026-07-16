@@ -466,6 +466,23 @@ def _draw_winner(ax, frame_u8, win, names, boxes, target: str, leg=None):
                   'white' if is_target else TYPE_COLORS.get(name.split('_', 1)[-1], 'magenta'))
 
 
+def _draw_winner_mask(ax, frame_u8, win, names, masks, target: str, leg=None):
+    """Mask-prompt sibling of _draw_winner: same categorical winner-map fill, but
+    contours the pseudo-label MASK per class instead of drawing a box (target thick,
+    rivals thin). Kept as a separate function (not a flag on _draw_winner) so the
+    box-visualization path stays untouched."""
+    from matplotlib.colors import ListedColormap, to_rgba
+    ax.imshow(frame_u8, cmap='gray')
+    cmap = ListedColormap([to_rgba(TYPE_COLORS.get(n, 'magenta')) for n in names])
+    ax.imshow(np.ma.masked_less(win, 0), cmap=cmap, vmin=0, vmax=len(names) - 1, alpha=0.45)
+    if leg is not None:
+        ax.contour(leg, colors='white', linewidths=0.8, linestyles='dashed')
+    for name, (_score, mask) in masks.items():
+        is_target = name == target
+        color = 'white' if is_target else TYPE_COLORS.get(name.split('_', 1)[-1], 'magenta')
+        ax.contour(mask, colors=[color], linewidths=2.6 if is_target else 1.0)
+
+
 def _render_support(out_dir: str, supp_sid: str, supp_slices: list, supp_zs: list) -> None:
     """One panel per bag slice, each type contoured in its colour: shows exactly which
     pixels feed which bag. Written once per support, not once per class."""
@@ -493,8 +510,9 @@ def cmd_mcvis(args) -> None:
     from models.medsam2_adapter import MedSAM2Segmenter, volume_to_uint8
     from models.support_prompt import (body_mask2d, build_multiclass_bags, key_slice,
                                        left_is_low_x, legs_are_separate, multiclass_boxes_for_frame,
-                                       muscle_types, muscle_types_single,
+                                       multiclass_masks_for_frame, muscle_types, muscle_types_single,
                                        side_masks, support_bag_slices, support_bag_slices_single)
+    from models.medsam2_adapter import mask_to_box
     from eval_medsam2 import _read_nii, _load_raw
 
     device = args.device or ('cuda' if torch.cuda.is_available() else 'cpu')
@@ -563,11 +581,18 @@ def cmd_mcvis(args) -> None:
             frame_idx = key_slice(q_fg) - z0             # frozen slice, as in bag_key
             frame_u8 = vol_u8[frame_idx]
 
-            boxes, score_maps = multiclass_boxes_for_frame(
-                seg, bags, frame_u8, low_x, BODY_THRESH, BODY_MIN_PX,
-                SCORE_THRESH, MARGIN_PX, single_leg=args.single_leg, cc_mode=args.cc_mode,
-                neg_points=args.neg_points, max_neg_points=args.max_neg_points,
-                score_norm=args.score_norm)
+            mask_mode = args.prompt_mode == 'support_multiclass_mask'
+            if mask_mode:
+                prompts, score_maps = multiclass_masks_for_frame(
+                    seg, bags, frame_u8, low_x, BODY_THRESH, BODY_MIN_PX,
+                    SCORE_THRESH, single_leg=args.single_leg, cc_mode=args.cc_mode,
+                    score_norm=args.score_norm)
+            else:
+                prompts, score_maps = multiclass_boxes_for_frame(
+                    seg, bags, frame_u8, low_x, BODY_THRESH, BODY_MIN_PX,
+                    SCORE_THRESH, MARGIN_PX, single_leg=args.single_leg, cc_mode=args.cc_mode,
+                    neg_points=args.neg_points, max_neg_points=args.max_neg_points,
+                    score_norm=args.score_norm)
             gt2d = q_fg[z0 + frame_idx].astype(bool)
 
             win, best, names = _winner_map(score_maps, frame_u8.shape)
@@ -581,8 +606,8 @@ def cmd_mcvis(args) -> None:
                 leg2d = side_masks(body2d, low_x)[side]
                 split = 'cc' if legs_are_separate(body2d) else 'MIDLINE'
 
-            def w(ax, f=frame_u8, wn=win, nm=names, bx=boxes, t=label_name, g=gt2d, lg=leg2d):
-                _draw_winner(ax, f, wn, nm, bx, t, lg)
+            def w(ax, f=frame_u8, wn=win, nm=names, pr=prompts, t=label_name, g=gt2d, lg=leg2d):
+                (_draw_winner_mask if mask_mode else _draw_winner)(ax, f, wn, nm, pr, t, lg)
                 ax.contour(g, colors='yellow', linewidths=1.5)
 
             def sc(ax, f=frame_u8, s=score_up, g=gt2d):
@@ -594,39 +619,56 @@ def cmd_mcvis(args) -> None:
             t_win = f'winner  supp={supp_sid} z={supp_zs}  split={split}\n{legend}'
             t_sc = f'score[{mtype}] - max(rivals)   claims {owned:.1%} of frame'
 
-            if label_name not in boxes:      # every cell of this leg lost to a rival
+            if label_name not in prompts:      # every cell of this leg lost to a rival
                 csv_rows.append({'class': label_name, 'label': label_val, 'scan': qsid,
                                  'dice': 0.0, 'iou': 0.0, 'boxiou': 0.0, 'split': split})
-                out = os.path.join(args.out_dir, f'{label_name}_{qsid}_NOBOX.png')
+                tag = 'NOMASK' if mask_mode else 'NOBOX'
+                out = os.path.join(args.out_dir, f'{label_name}_{qsid}_{tag}.png')
                 _render(out, [w, sc], [t_win, t_sc])
-                print(f'[{label_name}] {qsid}: support={supp_sid} NO BOX (lost to a rival) '
+                print(f'[{label_name}] {qsid}: support={supp_sid} {tag} (lost to a rival) '
                       f'split={split} -> {os.path.basename(out)}')
                 continue
 
-            if args.neg_points:
-                conf, box, npts = boxes[label_name]
-            else:
-                conf, box = boxes[label_name]
+            if mask_mode:
+                conf, prompt_mask = prompts[label_name]
                 npts = []
-            seg_crop = seg.segment_volume(
-                vol_u8, {frame_idx: np.asarray(box, np.float32)},
-                refine_iters=args.refine_iters,
-                neg_points={frame_idx: npts} if npts else None)
+                seg_crop = seg.segment_volume_mask(vol_u8, {frame_idx: prompt_mask})
+                box_for_iou = mask_to_box(prompt_mask)
+            elif args.neg_points:
+                conf, box, npts = prompts[label_name]
+                seg_crop = seg.segment_volume(
+                    vol_u8, {frame_idx: np.asarray(box, np.float32)},
+                    refine_iters=args.refine_iters,
+                    neg_points={frame_idx: npts} if npts else None)
+                box_for_iou = tuple(box)
+            else:
+                conf, box = prompts[label_name]
+                npts = []
+                seg_crop = seg.segment_volume(
+                    vol_u8, {frame_idx: np.asarray(box, np.float32)},
+                    refine_iters=args.refine_iters, neg_points=None)
+                box_for_iou = tuple(box)
             pred_full = np.zeros_like(q_fg)
             pred_full[z0:z1 + 1] = seg_crop
             pb, gb = pred_full[fg_idx].astype(bool), q_fg[fg_idx].astype(bool)
             d, i = _dice(pb, gb), _iou(pb, gb)
-            boxiou = _box_iou(tuple(box), _gt_bbox(gt2d))
+            boxiou = _box_iou(box_for_iou, _gt_bbox(gt2d)) if box_for_iou is not None else 0.0
             csv_rows.append({'class': label_name, 'label': label_val, 'scan': qsid,
                              'dice': d, 'iou': i, 'boxiou': boxiou, 'split': split})
             pred2d = seg_crop[frame_idx].astype(bool)
 
-            def m1(ax, f=frame_u8, g=gt2d, pr=pred2d, b=box, p=npts):
-                ax.imshow(f, cmap='gray'); ax.contour(g, colors='yellow', linewidths=1.5)
-                ax.contour(pr, colors='red', linewidths=1.5); _draw_box(ax, b, 2.0)
-                if p:
-                    xs, ys = zip(*p)
-                    ax.scatter(xs, ys, c='magenta', marker='x', s=60, linewidths=2)
+            if mask_mode:
+                def m1(ax, f=frame_u8, g=gt2d, pr=pred2d, pm=prompt_mask):
+                    ax.imshow(f, cmap='gray'); ax.contour(g, colors='yellow', linewidths=1.5)
+                    ax.contour(pr, colors='red', linewidths=1.5)
+                    ax.contour(pm, colors='cyan', linewidths=2.0)
+            else:
+                def m1(ax, f=frame_u8, g=gt2d, pr=pred2d, b=box, p=npts):
+                    ax.imshow(f, cmap='gray'); ax.contour(g, colors='yellow', linewidths=1.5)
+                    ax.contour(pr, colors='red', linewidths=1.5); _draw_box(ax, b, 2.0)
+                    if p:
+                        xs, ys = zip(*p)
+                        ax.scatter(xs, ys, c='magenta', marker='x', s=60, linewidths=2)
 
             out = os.path.join(args.out_dir,
                                f'{label_name}_{qsid}_dice{d:.3f}_boxiou{boxiou:.2f}.png')
@@ -733,6 +775,13 @@ def main() -> None:
                         'each class onto a comparable scale first (fixes a class losing '
                         'every cell just because its raw margin is systematically smaller, '
                         'not because its location is wrong). See multiclass_score_maps.')
+    m.add_argument('--prompt_mode', choices=['support_multiclass', 'support_multiclass_mask'],
+                   default='support_multiclass',
+                   help='support_multiclass = box from the winner-take-all blob (default, '
+                        'previous behavior); support_multiclass_mask = raw blob fed to SAM2 '
+                        'as a mask prompt instead (models/support_prompt.py multiclass_masks_'
+                        'for_frame, models/medsam2_adapter.py segment_volume_mask). refine_iters '
+                        'and neg_points are box-only and ignored in mask mode.')
     m.add_argument('--embed_level', type=int, default=-1, choices=[-1, 0, 1, 2],
                    help='A/B resolution probe: backbone_fpn level for support matching. '
                         '-1=stride16/32x32 (default, production embed_frame), 1=stride8/64x64, '
