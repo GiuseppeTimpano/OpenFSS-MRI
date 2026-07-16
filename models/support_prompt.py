@@ -477,7 +477,7 @@ def _box_from_blob(blob: np.ndarray, score: np.ndarray, img_hw: tuple,
 
 def _mask_from_blob(blob: np.ndarray, score: np.ndarray, cell_px: float,
                     dilate_iters: int = 1, cc_mode: str = 'dilate_largest',
-                    min_cc_px: int = 2) -> np.ndarray:
+                    min_cc_px: int = 2, min_area_cells: float = 9.0) -> np.ndarray:
     """blob/score are already at FULL image resolution (winner-take-all decided on
     bilinear-upsampled score maps -- same math as debug_medsam2.py's winner-map
     visualization, which is why that panel already looks smooth). This just picks which
@@ -488,7 +488,15 @@ def _mask_from_blob(blob: np.ndarray, score: np.ndarray, cell_px: float,
     revert = delete this + multiclass_masks + segment_volume_mask.
 
     Earlier version did selection on the coarse grid then nearest-upsampled the binary
-    result, which gave blocky/fragmented ("bbox-like") masks -- see git history."""
+    result, which gave blocky/fragmented ("bbox-like") masks -- see git history.
+
+    Pixel-precise winner-take-all sometimes lets a thin/small structure (e.g. GR, SA, GL,
+    PER, TA) lose nearly every pixel to a larger neighboring class, leaving `sel` near-empty
+    -- SAM2 then has nothing to segment from (dice=0). min_area_cells is a floor: if `sel`
+    ends up smaller than that many coarse-grid cells' worth of pixels, fall back to the
+    filled bounding box of the whole blob (same guaranteed-min-area guarantee the box-prompt
+    path always has), so mask-prompt keeps its precision edge in the normal case without the
+    collapse-to-nothing failure mode."""
     from skimage.measure import label as cc_label
 
     dilate_px = max(1, round(dilate_iters * cell_px))
@@ -519,6 +527,13 @@ def _mask_from_blob(blob: np.ndarray, score: np.ndarray, cell_px: float,
                 sel = blob
     else:
         raise ValueError(f'unknown cc_mode: {cc_mode!r}')
+
+    min_area_px = min_area_cells * cell_px * cell_px
+    if sel.sum() < min_area_px:
+        ys, xs = np.where(blob)
+        y0, y1, x0, x1 = ys.min(), ys.max() + 1, xs.min(), xs.max() + 1
+        sel = np.zeros_like(blob)
+        sel[y0:y1, x0:x1] = True
 
     return sel
 
