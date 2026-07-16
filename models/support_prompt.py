@@ -475,6 +475,99 @@ def _box_from_blob(blob: np.ndarray, score: np.ndarray, img_hw: tuple,
             min(float(W), x1 + margin_px), min(float(H), y1 + margin_px))
 
 
+def _mask_from_blob(blob: np.ndarray, score: np.ndarray, img_hw: tuple,
+                    dilate_iters: int = 1, cc_mode: str = 'dilate_largest',
+                    min_cc_px: int = 2) -> np.ndarray:
+    """blob -> full-res bool mask (nearest-neighbor upsample), for SAM2 mask-prompt
+    experiment (pseudo-label ablation, box vs raw similarity-blob mask). Deliberately a
+    standalone copy of _box_from_blob's cell-selection logic (not a shared refactor) so
+    the box-prompt path stays byte-for-byte untouched and this can be reverted by just
+    deleting this function + multiclass_masks + segment_volume_mask.
+
+    blob is computed on the coarse feature grid (e.g. 32x32); nearest-neighbor upsample
+    keeps it blocky/jagged rather than smoothing it -- see multiclass_masks docstring."""
+    from skimage.measure import label as cc_label
+
+    h, w = score.shape
+    H, W = img_hw
+
+    if cc_mode == 'seed_only':
+        lab = cc_label(blob)
+        seed = np.unravel_index(np.argmax(np.where(blob, score, -np.inf)), score.shape)
+        sel = (lab == lab[seed]) if lab[seed] else blob
+    elif cc_mode == 'union':
+        lab = cc_label(blob)
+        n = lab.max()
+        sizes = np.bincount(lab.ravel())
+        sel = np.isin(lab, [i for i in range(1, n + 1) if sizes[i] >= min_cc_px])
+        if not sel.any():
+            sel = blob
+    elif cc_mode == 'dilate_largest':
+        from scipy.ndimage import binary_dilation
+        grown = binary_dilation(blob, iterations=dilate_iters) if dilate_iters > 0 else blob
+        lab = cc_label(grown)
+        if lab.max() == 0:
+            sel = blob
+        else:
+            sizes = np.bincount(lab.ravel())
+            sizes[0] = 0
+            sel = (lab == sizes.argmax()) & blob
+            if not sel.any():
+                sel = blob
+    else:
+        raise ValueError(f'unknown cc_mode: {cc_mode!r}')
+
+    t = torch.from_numpy(sel.astype(np.float32))[None, None]
+    t = F.interpolate(t, size=(H, W), mode="nearest")[0, 0]
+    return t.numpy() > 0.5
+
+
+def multiclass_masks(score_maps: dict, query_body2d: np.ndarray, img_hw: tuple,
+                     left_is_low_x: bool | None = None, score_thresh: float = 0.0,
+                     single_leg: bool = False, cc_mode: str = 'dilate_largest') -> dict:
+    """Mask-prompt sibling of multiclass_boxes: same winner-take-all blob, but returned
+    as a full-res boolean mask (pseudo-label) instead of reduced to an axis-aligned box.
+    Separate function (not a flag on multiclass_boxes) so the box-oracle path is
+    untouched -- revert = delete this + _mask_from_blob + segment_volume_mask.
+
+    Returns {'<side>_<type>': (score, mask_HxW_bool)}, or {'<type>': ...} when single_leg.
+    """
+    names = sorted(score_maps)
+    stack = np.stack([score_maps[c] for c in names])   # [K,h,w]
+    win, best = stack.argmax(0), stack.max(0)
+    h, w = best.shape
+
+    sides = {'': _largest_cc(query_body2d)} if single_leg else side_masks(query_body2d, left_is_low_x)
+
+    out = {}
+    for si, smask in sides.items():
+        leg = _to_grid(smask, h, w).numpy() > 0.5
+        for ci, c in enumerate(names):
+            blob = (win == ci) & (best > score_thresh) & leg
+            if not blob.any():
+                continue
+            key = c if single_leg else f'{si}_{c}'
+            mask = _mask_from_blob(blob, best, img_hw, cc_mode=cc_mode)
+            out[key] = (float(best[blob].max()), mask)
+    return out
+
+
+def multiclass_masks_for_frame(seg, bags: dict, frame_u8: np.ndarray,
+                               left_is_low_x: bool | None = None,
+                               body_thresh: float = 10.0, body_min_px: int = 50,
+                               score_thresh: float = 0.0, single_leg: bool = False,
+                               cc_mode: str = 'dilate_largest') -> tuple:
+    """Mask-prompt sibling of multiclass_boxes_for_frame. One query frame -> all masks
+    at once. Returns ({'<side>_<type>': (score, mask)} or {'<type>': (score, mask)}
+    when single_leg, score_maps)."""
+    feat = seg.embed_frame(frame_u8)
+    score_maps = multiclass_score_maps(feat, bags)
+    body = body_mask2d(frame_u8, body_thresh, body_min_px)
+    masks = multiclass_masks(score_maps, body, frame_u8.shape, left_is_low_x,
+                             score_thresh, single_leg=single_leg, cc_mode=cc_mode)
+    return masks, score_maps
+
+
 def _largest_cc(mask2d: np.ndarray) -> np.ndarray:
     """Largest connected component of mask2d. single_leg datasets: the raw query frame's
     FOV sometimes still shows BOTH legs even though only one is annotated -- without this,

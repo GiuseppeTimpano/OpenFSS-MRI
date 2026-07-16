@@ -434,7 +434,10 @@ def cmd_vis(args) -> None:
 
 
 TYPE_COLORS = {'QF': 'tab:red', 'HS': 'tab:blue', 'SA': 'tab:green', 'GR': 'tab:orange',
-              'AD': 'tab:purple', 'GLUT': 'tab:brown'}
+              'AD': 'tab:purple', 'GLUT': 'tab:brown',
+              'CALF1': 'tab:red', 'CALF2': 'tab:blue', 'CALF3': 'tab:orange',
+              'CALF4': 'tab:green', 'CALF5': 'tab:purple', 'CALF6': 'tab:brown',
+              'CALF7': 'tab:pink', 'CALF8': 'tab:olive', 'CALF9': 'tab:cyan'}
 
 
 def _winner_map(score_maps: dict, hw: tuple) -> tuple:

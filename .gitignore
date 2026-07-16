@@ -39,3 +39,4 @@ graphify-out/
 *.nii.gz
 
 .opencode/
+.codex/

@@ -171,6 +171,44 @@ class MedSAM2Segmenter:
         return seg
 
     @torch.inference_mode()
+    def segment_volume_mask(self, vol_u8: np.ndarray,
+                            masks: dict[int, np.ndarray]) -> np.ndarray:
+        """
+        Mask-prompt variant of segment_volume (pseudo-label ablation, models/
+        support_prompt.py multiclass_masks) -- does NOT touch/replace segment_volume
+        (box-oracle path); added alongside it so the box path stays revertible/
+        comparable. Uses predictor.add_new_mask instead of add_new_points_or_box:
+        the raw winner-take-all similarity blob is fed straight to SAM2 as a binary
+        mask prompt, skipping the box-reduction step entirely.
+
+        vol_u8 : [Z,H,W] uint8 [0,255] (already cropped to the propagation range).
+        masks  : {frame_idx -> [H,W] bool} in ORIGINAL (H,W) coords; one or more
+                 prompted slices. Propagation conditions on all prompted frames.
+        returns: [Z,H,W] uint8 binary mask.
+        """
+        Z, H, W = vol_u8.shape
+        seg = np.zeros((Z, H, W), dtype=np.uint8)
+        if not masks:
+            return seg
+
+        img_resized = self._preprocess(vol_u8)
+        autocast = (torch.autocast(self.device_type, dtype=torch.bfloat16)
+                    if self.device_type == "cuda"
+                    else torch.autocast(self.device_type, enabled=False))
+        with autocast:
+            state = self.predictor.init_state(img_resized, H, W)
+            for fidx, mask in sorted(masks.items()):
+                self.predictor.add_new_mask(
+                    inference_state=state, frame_idx=int(fidx), obj_id=1,
+                    mask=mask)
+
+            for reverse in (False, True):
+                for fidx, _oids, logits in self.predictor.propagate_in_video(
+                        state, reverse=reverse):
+                    seg[fidx][(logits[0] > 0.0).cpu().numpy()[0]] = 1
+        return seg
+
+    @torch.inference_mode()
     def segment_volume_points(self, vol_u8: np.ndarray,
                               points: dict[int, tuple],
                               refine_iters: int = 0) -> np.ndarray:

@@ -15,7 +15,11 @@ support_multiclass (B2: same support-derived box, but every muscle TYPE gets its
 own bag and they compete cell-by-cell on the query's key slice, see
 models/support_prompt.py:build_multiclass_bags/multiclass_boxes_for_frame -- this
 is the full propagation + aggregated-Dice wiring of the technique previously only
-available as a single-frame diagnostic in debug_medsam2.py cmd_mcvis). --n_anchors > 1
+available as a single-frame diagnostic in debug_medsam2.py cmd_mcvis) |
+support_multiclass_mask (mask-prompt ablation of support_multiclass: same bag/
+winner-take-all scoring, but the raw similarity blob is fed to SAM2 as a mask prompt
+instead of being reduced to a box, see models/support_prompt.py:multiclass_masks_for_frame
+and models/medsam2_adapter.py:segment_volume_mask). --n_anchors > 1
 re-anchors that box on several slices, so propagation restarts before it decays
 (support_bbox only). --support_slices > 1 (B1) builds the Pos/Neg (or multiclass)
 bag from several slices of the same support volume instead of its key slice alone
@@ -39,8 +43,8 @@ from data.dataloader.dataset import get_fold_ids
 from eval_common import Scores, aggregate_and_print
 from models.medsam2_adapter import MedSAM2Segmenter, volume_to_uint8
 from models.support_prompt import (build_multiclass_bags, key_slice, left_is_low_x,
-                                   multiclass_boxes_for_frame, muscle_types,
-                                   muscle_types_single, pick_support_slices,
+                                   multiclass_boxes_for_frame, multiclass_masks_for_frame,
+                                   muscle_types, muscle_types_single, pick_support_slices,
                                    support_anchors_dense_bodymasked_bbox,
                                    support_bag_slices, support_bag_slices_single)
 
@@ -92,7 +96,7 @@ def evaluate(cfg: dict, checkpoint: str, model_cfg: str,
         eval_labels = list(range(1, len(label_names)))
 
     types = None
-    if prompt_mode == 'support_multiclass':
+    if prompt_mode in ('support_multiclass', 'support_multiclass_mask'):
         types = muscle_types_single(label_names) if single_leg else muscle_types(label_names)
         # {supp_sid -> (bags, left_is_low_x)}; spans every class since the multiclass bag
         # already covers every type -- only rebuilt when a class's random pairing draws a
@@ -137,7 +141,7 @@ def evaluate(cfg: dict, checkpoint: str, model_cfg: str,
 
         support_fg_idx: dict[str, np.ndarray] = {}
         rng = None
-        if prompt_mode in ('support_bbox', 'support_multiclass'):
+        if prompt_mode in ('support_bbox', 'support_multiclass', 'support_multiclass_mask'):
             rng = random.Random(seed + label_val)
             for sid in query_sids:
                 lbl = _read_nii(os.path.join(query_data_dir, f'label_{sid}.nii.gz'))
@@ -226,6 +230,38 @@ def evaluate(cfg: dict, checkpoint: str, model_cfg: str,
                     seg_crop = seg.segment_volume(
                         vol_u8, {frame_idx: np.asarray(box, dtype=np.float32)},
                         refine_iters=refine_iters, neg_points=npts)
+            elif prompt_mode == 'support_multiclass_mask':
+                # Mask-prompt sibling of support_multiclass: same support bag / winner-take-all
+                # scoring, but the raw similarity blob is fed to SAM2 as a mask prompt instead
+                # of being reduced to an axis-aligned box (models/support_prompt.py
+                # multiclass_masks_for_frame, models/medsam2_adapter.py segment_volume_mask).
+                pool = [s for s in support_fg_idx if s != qsid]
+                if not pool:
+                    print(f'  [SKIP] query {qsid} has no support scan available for {label_name}')
+                    continue
+                supp_sid = rng.choice(pool)
+
+                if supp_sid not in mc_bag_cache:
+                    supp_img, supp_lbl = _load_raw(query_data_dir, supp_sid)
+                    supp_vol_u8 = volume_to_uint8(supp_img)
+                    bag_fn = support_bag_slices_single if single_leg else support_bag_slices
+                    supp_slices, _ = bag_fn(supp_vol_u8, supp_lbl, types,
+                                            support_slices, support_min_gap)
+                    low_x = None if single_leg else left_is_low_x(supp_lbl, types)
+                    bags = build_multiclass_bags(seg, supp_slices)
+                    mc_bag_cache[supp_sid] = (bags, low_x)
+                bags, low_x = mc_bag_cache[supp_sid]
+
+                frame_idx = key_slice(q_fg) - z0   # local index into the cropped vol_u8
+                masks_by_name, _ = multiclass_masks_for_frame(
+                    seg, bags, vol_u8[frame_idx], low_x,
+                    single_leg=single_leg, cc_mode=cc_mode)
+                if label_name not in masks_by_name:
+                    print(f'  [NO MASK] {qsid}: {label_name} lost to a rival on the key slice')
+                    seg_crop = np.zeros_like(vol_u8, dtype=q_fg.dtype)
+                else:
+                    _, mask = masks_by_name[label_name]
+                    seg_crop = seg.segment_volume_mask(vol_u8, {frame_idx: mask})
             else:
                 boxes = _build_boxes(q_fg, fg_idx, z0, prompt_mode, margin)
                 seg_crop = seg.segment_volume(vol_u8, boxes)        # [z1-z0+1,H,W]
@@ -305,7 +341,8 @@ if __name__ == '__main__':
                         help='only used when --target_data_dir is not given')
     parser.add_argument('--test_label',      type=int, nargs='+', default=None)
     parser.add_argument('--prompt_mode',     type=str, default='perslice',
-                        choices=['perslice', 'key', 'support_bbox', 'support_multiclass'])
+                        choices=['perslice', 'key', 'support_bbox', 'support_multiclass',
+                                 'support_multiclass_mask'])
     parser.add_argument('--margin',          type=int, default=3,
                         help='oracle box margin in pixels')
     parser.add_argument('--seed',            type=int, default=42,
