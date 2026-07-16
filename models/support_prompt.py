@@ -475,21 +475,24 @@ def _box_from_blob(blob: np.ndarray, score: np.ndarray, img_hw: tuple,
             min(float(W), x1 + margin_px), min(float(H), y1 + margin_px))
 
 
-def _mask_from_blob(blob: np.ndarray, score: np.ndarray, img_hw: tuple,
+def _mask_from_blob(blob: np.ndarray, score: np.ndarray, cell_px: float,
                     dilate_iters: int = 1, cc_mode: str = 'dilate_largest',
                     min_cc_px: int = 2) -> np.ndarray:
-    """blob -> full-res bool mask (nearest-neighbor upsample), for SAM2 mask-prompt
-    experiment (pseudo-label ablation, box vs raw similarity-blob mask). Deliberately a
-    standalone copy of _box_from_blob's cell-selection logic (not a shared refactor) so
-    the box-prompt path stays byte-for-byte untouched and this can be reverted by just
-    deleting this function + multiclass_masks + segment_volume_mask.
+    """blob/score are already at FULL image resolution (winner-take-all decided on
+    bilinear-upsampled score maps -- same math as debug_medsam2.py's winner-map
+    visualization, which is why that panel already looks smooth). This just picks which
+    pixels of the blob feed the mask prompt (same cc_mode semantics as _box_from_blob),
+    scaled from grid-cell units to pixel units via cell_px (~coarse-grid cell size in
+    full-res pixels). Deliberately a standalone copy of _box_from_blob's cell-selection
+    logic (not a shared refactor) so the box-prompt path stays byte-for-byte untouched --
+    revert = delete this + multiclass_masks + segment_volume_mask.
 
-    blob is computed on the coarse feature grid (e.g. 32x32); nearest-neighbor upsample
-    keeps it blocky/jagged rather than smoothing it -- see multiclass_masks docstring."""
+    Earlier version did selection on the coarse grid then nearest-upsampled the binary
+    result, which gave blocky/fragmented ("bbox-like") masks -- see git history."""
     from skimage.measure import label as cc_label
 
-    h, w = score.shape
-    H, W = img_hw
+    dilate_px = max(1, round(dilate_iters * cell_px))
+    min_px = max(1, round(min_cc_px * cell_px * cell_px))
 
     if cc_mode == 'seed_only':
         lab = cc_label(blob)
@@ -499,12 +502,12 @@ def _mask_from_blob(blob: np.ndarray, score: np.ndarray, img_hw: tuple,
         lab = cc_label(blob)
         n = lab.max()
         sizes = np.bincount(lab.ravel())
-        sel = np.isin(lab, [i for i in range(1, n + 1) if sizes[i] >= min_cc_px])
+        sel = np.isin(lab, [i for i in range(1, n + 1) if sizes[i] >= min_px])
         if not sel.any():
             sel = blob
     elif cc_mode == 'dilate_largest':
         from scipy.ndimage import binary_dilation
-        grown = binary_dilation(blob, iterations=dilate_iters) if dilate_iters > 0 else blob
+        grown = binary_dilation(blob, iterations=dilate_px) if dilate_px > 0 else blob
         lab = cc_label(grown)
         if lab.max() == 0:
             sel = blob
@@ -517,37 +520,42 @@ def _mask_from_blob(blob: np.ndarray, score: np.ndarray, img_hw: tuple,
     else:
         raise ValueError(f'unknown cc_mode: {cc_mode!r}')
 
-    t = torch.from_numpy(sel.astype(np.float32))[None, None]
-    t = F.interpolate(t, size=(H, W), mode="nearest")[0, 0]
-    return t.numpy() > 0.5
+    return sel
 
 
 def multiclass_masks(score_maps: dict, query_body2d: np.ndarray, img_hw: tuple,
                      left_is_low_x: bool | None = None, score_thresh: float = 0.0,
                      single_leg: bool = False, cc_mode: str = 'dilate_largest') -> dict:
-    """Mask-prompt sibling of multiclass_boxes: same winner-take-all blob, but returned
-    as a full-res boolean mask (pseudo-label) instead of reduced to an axis-aligned box.
-    Separate function (not a flag on multiclass_boxes) so the box-oracle path is
-    untouched -- revert = delete this + _mask_from_blob + segment_volume_mask.
+    """Mask-prompt sibling of multiclass_boxes: same winner-take-all competition, but
+    decided on bilinear-upsampled full-res score maps (matching debug_medsam2.py's
+    winner-map visualization) and returned as a full-res boolean mask (pseudo-label)
+    instead of reduced to an axis-aligned box. Separate function (not a flag on
+    multiclass_boxes) so the box-oracle path is untouched -- revert = delete this +
+    _mask_from_blob + segment_volume_mask.
 
     Returns {'<side>_<type>': (score, mask_HxW_bool)}, or {'<type>': ...} when single_leg.
     """
     names = sorted(score_maps)
+    h, w = score_maps[names[0]].shape
+    H, W = img_hw
+    cell_px = ((H / h) + (W / w)) / 2.0
+
     stack = np.stack([score_maps[c] for c in names])   # [K,h,w]
-    win, best = stack.argmax(0), stack.max(0)
-    h, w = best.shape
+    t = torch.from_numpy(stack.astype(np.float32))[None]
+    ups = F.interpolate(t, size=(H, W), mode='bilinear', align_corners=False)[0].numpy()  # [K,H,W]
+    win, best = ups.argmax(0), ups.max(0)
 
     sides = {'': _largest_cc(query_body2d)} if single_leg else side_masks(query_body2d, left_is_low_x)
 
     out = {}
     for si, smask in sides.items():
-        leg = _to_grid(smask, h, w).numpy() > 0.5
+        leg = smask > 0.5   # already full-res -- no coarse-grid downsample needed
         for ci, c in enumerate(names):
             blob = (win == ci) & (best > score_thresh) & leg
             if not blob.any():
                 continue
             key = c if single_leg else f'{si}_{c}'
-            mask = _mask_from_blob(blob, best, img_hw, cc_mode=cc_mode)
+            mask = _mask_from_blob(blob, best, cell_px, cc_mode=cc_mode)
             out[key] = (float(best[blob].max()), mask)
     return out
 
