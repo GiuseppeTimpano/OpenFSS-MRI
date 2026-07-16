@@ -323,10 +323,23 @@ def build_multiclass_bags(seg, supp_slices: list, thr_hi: float = 0.7, thr_lo: f
     return {c: torch.cat(v, dim=1) for c, v in bags.items()}
 
 
-def multiclass_score_maps(feat_query: torch.Tensor, bags: dict) -> dict:
+def multiclass_score_maps(feat_query: torch.Tensor, bags: dict, score_norm: str = 'none') -> dict:
     """score_c(x) = pos_c(x) - max over the rival bags (other types AND BG). The rival is
     an explicit balanced bag, not a saturated max over the whole body, so the contrast
-    actually discriminates. Returns {cls: [h,w]} for the muscle types only."""
+    actually discriminates. Returns {cls: [h,w]} for the muscle types only.
+
+    score_norm rescales each class's raw margin map independently before the cross-class
+    argmax in multiclass_boxes ever sees it (default 'none' = untouched, original behavior).
+    Rationale: a class whose texture is less distinctive everywhere (e.g. a small/low-
+    contrast muscle) can sit on a systematically lower absolute scale than its neighbors and
+    lose every single cell of the per-pixel winner-take-all even at its own true location --
+    not because the location is wrong, but because the *scale* is smaller. Normalizing each
+    class's map onto a comparable scale before the argmax lets a class's own local peak
+    compete on equal footing.
+    - 'zscore': (x - mean) / std over that class's map (this frame only).
+    - 'minmax': (x - min) / (max - min) over that class's map -> [0, 1].
+    - 'none': no-op, byte-identical to the pre-existing behavior.
+    """
     C, h, w = feat_query.shape
     Qn = F.normalize(feat_query.reshape(C, h * w), dim=0)
 
@@ -341,7 +354,16 @@ def multiclass_score_maps(feat_query: torch.Tensor, bags: dict) -> dict:
         if c == BG_KEY:
             continue
         rivals = torch.stack([p for k, p in pos.items() if k != c])
-        out[c] = (pos[c] - rivals.max(dim=0).values).cpu().numpy()
+        m = (pos[c] - rivals.max(dim=0).values).cpu().numpy()
+        if score_norm == 'zscore':
+            std = m.std()
+            m = (m - m.mean()) / std if std > 1e-8 else m - m.mean()
+        elif score_norm == 'minmax':
+            lo, hi = m.min(), m.max()
+            m = (m - lo) / (hi - lo) if hi - lo > 1e-8 else np.zeros_like(m)
+        elif score_norm != 'none':
+            raise ValueError(f'unknown score_norm: {score_norm!r}')
+        out[c] = m
     return out
 
 
@@ -539,13 +561,13 @@ def multiclass_boxes_for_frame(seg, bags: dict, frame_u8: np.ndarray,
                                score_thresh: float = 0.0, margin_px: float = 0.0,
                                single_leg: bool = False,
                                cc_mode: str = 'dilate_largest', neg_points: bool = False,
-                               max_neg_points: int = 3) -> tuple:
+                               max_neg_points: int = 3, score_norm: str = 'none') -> tuple:
     """One query frame -> all boxes at once. returns ({'<side>_<type>': (score, box)}
     or {'<type>': (score, box)} when single_leg, score_maps) -- the maps come back for
     the debug overlay. neg_points=True adds a third tuple element per key (see
-    multiclass_boxes)."""
+    multiclass_boxes). score_norm: see multiclass_score_maps."""
     feat = seg.embed_frame(frame_u8)
-    score_maps = multiclass_score_maps(feat, bags)
+    score_maps = multiclass_score_maps(feat, bags, score_norm=score_norm)
     body = body_mask2d(frame_u8, body_thresh, body_min_px)
     boxes = multiclass_boxes(score_maps, body, frame_u8.shape, left_is_low_x,
                              score_thresh, margin_px, single_leg=single_leg, cc_mode=cc_mode,

@@ -563,7 +563,8 @@ def cmd_mcvis(args) -> None:
             boxes, score_maps = multiclass_boxes_for_frame(
                 seg, bags, frame_u8, low_x, BODY_THRESH, BODY_MIN_PX,
                 SCORE_THRESH, MARGIN_PX, single_leg=args.single_leg, cc_mode=args.cc_mode,
-                neg_points=args.neg_points, max_neg_points=args.max_neg_points)
+                neg_points=args.neg_points, max_neg_points=args.max_neg_points,
+                score_norm=args.score_norm)
             gt2d = q_fg[z0 + frame_idx].astype(bool)
 
             win, best, names = _winner_map(score_maps, frame_u8.shape)
@@ -723,6 +724,12 @@ def main() -> None:
                         'neighboring muscle an elongated box also covers (e.g. soleus)')
     m.add_argument('--max_neg_points', type=int, default=3,
                    help='(--neg_points) cap on negative clicks per box')
+    m.add_argument('--score_norm', choices=['none', 'zscore', 'minmax'], default='none',
+                   help='rescale each class score map before the cross-class argmax: '
+                        'none = current production behavior, zscore/minmax = normalize '
+                        'each class onto a comparable scale first (fixes a class losing '
+                        'every cell just because its raw margin is systematically smaller, '
+                        'not because its location is wrong). See multiclass_score_maps.')
     m.add_argument('--embed_level', type=int, default=-1, choices=[-1, 0, 1, 2],
                    help='A/B resolution probe: backbone_fpn level for support matching. '
                         '-1=stride16/32x32 (default, production embed_frame), 1=stride8/64x64, '
