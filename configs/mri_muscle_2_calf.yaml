@@ -1,0 +1,6 @@
+# MRI_muscle_2 dataset (figshare single-leg calf) — zero-shot MedSAM2 eval config.
+
+data:
+  data_dir: data/datasets/MRI_muscle_2/processed_calf/WATER
+  n_folds: 5
+  label_names: [BG, CALF1, CALF2, CALF3, CALF4, CALF5, CALF6, CALF7, CALF8, CALF9]
