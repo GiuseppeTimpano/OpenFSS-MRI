@@ -24,6 +24,7 @@ import importlib.util
 import os
 import random
 import sys
+import types
 
 import numpy as np
 import SimpleITK as sitk
@@ -40,6 +41,40 @@ def _load_module_from_path(dotted_name: str, file_path: str):
     sys.modules[dotted_name] = mod
     spec.loader.exec_module(mod)
     return mod
+
+
+def _patched_run_memory_encoder(self, inference_state, frame_idx, batch_size,
+                                 high_res_masks, is_mask_from_pts):
+    """Version-drift shim: FS_MedSAM2's `_run_memory_encoder` was written against
+    an older SAM2 API, before `_encode_new_memory` gained the required
+    `object_score_logits` argument (added upstream alongside `no_obj_embed_spatial`).
+    The real vendored SAM2Base (third_party/MedSAM2) requires it. FS_MedSAM2 never
+    modeled "object absent" frames, so we pass an always-positive score here --
+    `is_obj_appearing = (object_score_logits > 0)` stays True, i.e. zero suppression,
+    reproducing FS_MedSAM2's original (pre-object_score_logits) behavior exactly.
+    Isolated monkeypatch applied only to our predictor instance -- no edit to the
+    FS_MedSAM2 submodule itself.
+    """
+    _, _, current_vision_feats, _, feat_sizes = self._get_image_feature(
+        inference_state, frame_idx, batch_size
+    )
+    object_score_logits = torch.full(
+        (batch_size, 1), 10.0, device=high_res_masks.device, dtype=torch.float32
+    )
+    maskmem_features, maskmem_pos_enc = self._encode_new_memory(
+        current_vision_feats=current_vision_feats,
+        feat_sizes=feat_sizes,
+        pred_masks_high_res=high_res_masks,
+        object_score_logits=object_score_logits,
+        is_mask_from_pts=is_mask_from_pts,
+    )
+    storage_device = inference_state["storage_device"]
+    maskmem_features = maskmem_features.to(torch.bfloat16)
+    maskmem_features = maskmem_features.to(storage_device, non_blocking=True)
+    maskmem_pos_enc = self._get_maskmem_pos_enc(
+        inference_state, {"maskmem_pos_enc": maskmem_pos_enc}
+    )
+    return maskmem_features, maskmem_pos_enc
 
 
 def _build_fsmedsam2_predictor(model_cfg: str, ckpt_path: str, device: str):
@@ -61,7 +96,9 @@ def _build_fsmedsam2_predictor(model_cfg: str, ckpt_path: str, device: str):
         'sam2.build_fsmedsam2',
         os.path.join(_FSMEDSAM2_ROOT, 'build_fsmedsam2.py'))
 
-    return build_mod.build_fsmedsam2_video_predictor(model_cfg, ckpt_path, device=device)
+    predictor = build_mod.build_fsmedsam2_video_predictor(model_cfg, ckpt_path, device=device)
+    predictor._run_memory_encoder = types.MethodType(_patched_run_memory_encoder, predictor)
+    return predictor
 
 
 def _read_nii(path: str) -> np.ndarray:
