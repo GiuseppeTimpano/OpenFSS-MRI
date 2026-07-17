@@ -29,6 +29,7 @@ import types
 import numpy as np
 import SimpleITK as sitk
 import torch
+from PIL import Image
 
 _REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
 _MEDSAM2_ROOT = os.path.join(_REPO_ROOT, 'third_party', 'MedSAM2')
@@ -111,6 +112,17 @@ def _key_slice(fg_mask: np.ndarray) -> int:
     return int(np.argmax(areas))
 
 
+def _resize_mask_nearest(mask: np.ndarray, out_hw: tuple) -> np.ndarray:
+    """`init_state_by_np_data` records video_height/width from the ALREADY-RESIZED
+    (image_size x image_size) input array, not the original slice shape -- so
+    propagate_in_video's output masks come back at image_size resolution, not the
+    original H,W. Resize back down (nearest, since it's a binary mask) before Dice."""
+    h, w = out_hw
+    img = Image.fromarray(mask.astype(np.uint8) * 255)
+    img = img.resize((w, h), resample=Image.NEAREST)
+    return np.array(img) > 0
+
+
 def _dice(pred: np.ndarray, gt: np.ndarray) -> float:
     inter = float((pred & gt).sum())
     denom = float(pred.sum() + gt.sum())
@@ -189,8 +201,8 @@ def probe(data_dir: str, label_val: int, label_name: str, medsam2_ckpt: str,
             if pred is None:
                 continue
             gt = q_fg_crop[q_j].astype(bool)
-            gt_resized = gt  # video_res_masks already at original H,W (see predictor)
-            dice = _dice(pred.squeeze().astype(bool), gt_resized)
+            pred_resized = _resize_mask_nearest(pred.squeeze().astype(bool), gt.shape)
+            dice = _dice(pred_resized, gt)
 
             out = (output_dict['cond_frame_outputs'].get(j) or
                    output_dict['non_cond_frame_outputs'].get(j))
