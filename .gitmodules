@@ -10,3 +10,6 @@
 [submodule "third_party/MedSAM3"]
 	path = third_party/MedSAM3
 	url = https://github.com/Joey-S-Liu/MedSAM3.git
+[submodule "third_party/FS_MedSAM2"]
+	path = third_party/FS_MedSAM2
+	url = https://github.com/DeepMed-Lab-ECNU/FS_MedSAM2.git
