@@ -1,0 +1,6 @@
+# CHAOS T2SPIR dataset (abdominal organs) — zero-shot MedSAM2 eval config.
+
+data:
+  data_dir: data/datasets/CHAOS/processed/T2
+  n_folds: 20
+  label_names: [BG, LIVER, RK, LK, SPLEEN]
