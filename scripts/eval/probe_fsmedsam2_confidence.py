@@ -78,6 +78,62 @@ def _patched_run_memory_encoder(self, inference_state, frame_idx, batch_size,
     return maskmem_features, maskmem_pos_enc
 
 
+def _patched_run_single_frame_inference(self, inference_state, output_dict, frame_idx,
+                                         batch_size, is_init_cond_frame, point_inputs,
+                                         mask_inputs, reverse, run_mem_encoder,
+                                         prev_sam_mask_logits=None):
+    """Version-drift shim: `track_step` (inherited from the real vendored SAM2Base)
+    already computes and stores `object_score_logits` in its `current_out`, but
+    FS_MedSAM2's own `_run_single_frame_inference` drops it when building
+    `compact_current_out` (never plumbed through in their older-API fork). This is
+    exactly the "free, already-computed, discarded" confidence signal this probe
+    is measuring -- we just stop throwing it away. Same body as the original
+    method, plus one extra key. Isolated monkeypatch, no edit to the submodule."""
+    from sam2.utils.misc import fill_holes_in_mask_scores as _fill_holes
+
+    _, _, current_vision_feats, current_vision_pos_embeds, feat_sizes = \
+        self._get_image_feature(inference_state, frame_idx, batch_size)
+
+    assert point_inputs is None or mask_inputs is None
+    current_out = self.track_step(
+        frame_idx=frame_idx,
+        is_init_cond_frame=is_init_cond_frame,
+        current_vision_feats=current_vision_feats,
+        current_vision_pos_embeds=current_vision_pos_embeds,
+        feat_sizes=feat_sizes,
+        point_inputs=point_inputs,
+        mask_inputs=mask_inputs,
+        output_dict=output_dict,
+        num_frames=inference_state["num_frames"],
+        track_in_reverse=reverse,
+        run_mem_encoder=run_mem_encoder,
+        prev_sam_mask_logits=prev_sam_mask_logits,
+    )
+
+    storage_device = inference_state["storage_device"]
+    maskmem_features = current_out["maskmem_features"]
+    if maskmem_features is not None:
+        maskmem_features = maskmem_features.to(torch.bfloat16)
+        maskmem_features = maskmem_features.to(storage_device, non_blocking=True)
+    pred_masks_gpu = current_out["pred_masks"]
+    if self.fill_hole_area > 0:
+        pred_masks_gpu = _fill_holes(pred_masks_gpu, self.fill_hole_area)
+    pred_masks = pred_masks_gpu.to(storage_device, non_blocking=True)
+    maskmem_pos_enc = self._get_maskmem_pos_enc(inference_state, current_out)
+    obj_ptr = current_out["obj_ptr"]
+    object_score_logits = current_out.get("object_score_logits")
+    if object_score_logits is not None:
+        object_score_logits = object_score_logits.to(storage_device, non_blocking=True)
+    compact_current_out = {
+        "maskmem_features": maskmem_features,
+        "maskmem_pos_enc": maskmem_pos_enc,
+        "pred_masks": pred_masks,
+        "obj_ptr": obj_ptr,
+        "object_score_logits": object_score_logits,
+    }
+    return compact_current_out, pred_masks_gpu
+
+
 def _build_fsmedsam2_predictor(model_cfg: str, ckpt_path: str, device: str):
     """Loads FS_MedSAM2's predictor class against the REAL `sam2` package
     (third_party/MedSAM2), without ever putting FS_MedSAM2/sam2 on sys.path."""
@@ -99,6 +155,8 @@ def _build_fsmedsam2_predictor(model_cfg: str, ckpt_path: str, device: str):
 
     predictor = build_mod.build_fsmedsam2_video_predictor(model_cfg, ckpt_path, device=device)
     predictor._run_memory_encoder = types.MethodType(_patched_run_memory_encoder, predictor)
+    predictor._run_single_frame_inference = types.MethodType(
+        _patched_run_single_frame_inference, predictor)
     return predictor
 
 
@@ -206,7 +264,8 @@ def probe(data_dir: str, label_val: int, label_name: str, medsam2_ckpt: str,
 
             out = (output_dict['cond_frame_outputs'].get(j) or
                    output_dict['non_cond_frame_outputs'].get(j))
-            score = float(out['object_score_logits'].reshape(-1)[0]) if out is not None else float('nan')
+            osl = out.get('object_score_logits') if out is not None else None
+            score = float(osl.reshape(-1)[0]) if osl is not None else float('nan')
 
             rows.append({
                 'query_scan': qsid, 'support_scan': supp_sid, 'label': label_name,
