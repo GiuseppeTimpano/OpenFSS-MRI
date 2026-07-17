@@ -35,6 +35,8 @@ CLAUDE.md
 HANDOFF.md
 graphify-out/
 
+lightning_logs/
+
 *.csv
 *.nii.gz
 
