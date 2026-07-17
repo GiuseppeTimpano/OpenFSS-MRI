@@ -477,7 +477,8 @@ def _box_from_blob(blob: np.ndarray, score: np.ndarray, img_hw: tuple,
 
 def _mask_from_blob(blob: np.ndarray, score: np.ndarray, cell_px: float,
                     dilate_iters: int = 1, cc_mode: str = 'dilate_largest',
-                    min_cc_px: int = 2, min_area_cells: float = 9.0) -> np.ndarray:
+                    min_cc_px: int = 2, min_frac: float = 0.3,
+                    min_abs_cells: float = 2.0) -> np.ndarray:
     """blob/score are already at FULL image resolution (winner-take-all decided on
     bilinear-upsampled score maps -- same math as debug_medsam2.py's winner-map
     visualization, which is why that panel already looks smooth). This just picks which
@@ -490,13 +491,15 @@ def _mask_from_blob(blob: np.ndarray, score: np.ndarray, cell_px: float,
     Earlier version did selection on the coarse grid then nearest-upsampled the binary
     result, which gave blocky/fragmented ("bbox-like") masks -- see git history.
 
-    Pixel-precise winner-take-all sometimes lets a thin/small structure (e.g. GR, SA, GL,
-    PER, TA) lose nearly every pixel to a larger neighboring class, leaving `sel` near-empty
-    -- SAM2 then has nothing to segment from (dice=0). min_area_cells is a floor: if `sel`
-    ends up smaller than that many coarse-grid cells' worth of pixels, fall back to the
-    filled bounding box of the whole blob (same guaranteed-min-area guarantee the box-prompt
-    path always has), so mask-prompt keeps its precision edge in the normal case without the
-    collapse-to-nothing failure mode."""
+    Pixel-precise winner-take-all sometimes lets `sel` (the chosen connected component)
+    end up a tiny fragment of `blob` (the full winning region) -- SAM2 then has little to
+    segment from (dice=0). A fixed pixel/cell floor here would misfire on anatomy that is
+    just small in absolute terms (e.g. a kidney cross-section) but whose `sel` already
+    covers all of `blob` cleanly -- that case needs no fallback. So the floor is relative:
+    fall back to the filled bounding box of the whole blob only when `sel` covers less than
+    `min_frac` of `blob`'s own area (real fragmentation), not based on absolute size. A
+    tiny `min_abs_cells` pixel floor still catches the degenerate case where `blob` itself
+    is just noise (1-2 px)."""
     from skimage.measure import label as cc_label
 
     dilate_px = max(1, round(dilate_iters * cell_px))
@@ -528,7 +531,8 @@ def _mask_from_blob(blob: np.ndarray, score: np.ndarray, cell_px: float,
     else:
         raise ValueError(f'unknown cc_mode: {cc_mode!r}')
 
-    min_area_px = min_area_cells * cell_px * cell_px
+    min_abs_px = min_abs_cells * cell_px * cell_px
+    min_area_px = max(min_frac * blob.sum(), min_abs_px)
     if sel.sum() < min_area_px:
         ys, xs = np.where(blob)
         y0, y1, x0, x1 = ys.min(), ys.max() + 1, xs.min(), xs.max() + 1
