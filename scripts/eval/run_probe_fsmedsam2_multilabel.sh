@@ -11,7 +11,7 @@ set -euo pipefail
 PYTHON=.venv/bin/python
 DATA_DIR="${DATA_DIR:-data/datasets/MRI_muscle_2/processed/WATER}"
 CKPT="${CKPT:-third_party/MedSAM2/checkpoints/MedSAM2_latest.pt}"
-SAM2_CFG="${SAM2_CFG:-sam2.1_hiera_t512}"
+SAM2_CFG="${SAM2_CFG:-configs/sam2.1_hiera_t512.yaml}"
 DEVICE="${DEVICE:-cuda}"
 OUT_DIR="${OUT_DIR:-results/fsmedsam2_probe/multilabel_mri_muscle_2}"
 SEED="${SEED:-42}"
