@@ -510,7 +510,8 @@ def cmd_mcvis(args) -> None:
     from models.medsam2_adapter import MedSAM2Segmenter, volume_to_uint8
     from models.support_prompt import (body_mask2d, build_multiclass_bags, key_slice,
                                        left_is_low_x, legs_are_separate, multiclass_boxes_for_frame,
-                                       multiclass_masks_for_frame, muscle_types, muscle_types_single,
+                                       multiclass_mask_anchors, multiclass_masks_for_frame,
+                                       muscle_types, muscle_types_single,
                                        side_masks, support_bag_slices, support_bag_slices_single)
     from models.medsam2_adapter import mask_to_box
     from eval_medsam2 import _read_nii, _load_raw
@@ -595,6 +596,22 @@ def cmd_mcvis(args) -> None:
                     score_norm=args.score_norm)
             gt2d = q_fg[z0 + frame_idx].astype(bool)
 
+            # mask_mode + n_anchors>1: search every query FG slice instead of trusting the
+            # single frozen key slice above; rescues the class when it lost to a rival there
+            # but survives elsewhere. n_anchors=1 (default) keeps the key-slice-only prompt,
+            # so viz panels (which are drawn on frame_u8 = key slice) stay unchanged.
+            mask_anchors: dict = {}
+            if mask_mode:
+                if args.n_anchors > 1:
+                    cand_frames = [(int(z) - z0, vol_u8[int(z) - z0]) for z in fg_idx]
+                    mask_anchors = multiclass_mask_anchors(
+                        seg, bags, cand_frames, label_name, low_x,
+                        n_anchors=args.n_anchors, min_gap=args.anchor_min_gap,
+                        single_leg=args.single_leg, cc_mode=args.cc_mode,
+                        score_norm=args.score_norm)
+                elif label_name in prompts:
+                    mask_anchors = {frame_idx: prompts[label_name][1]}
+
             win, best, names = _winner_map(score_maps, frame_u8.shape)
             score_up = _upsample(score_maps[mtype], frame_u8.shape)
             owned = float((win == names.index(mtype)).mean())   # frame share this type claims
@@ -619,7 +636,8 @@ def cmd_mcvis(args) -> None:
             t_win = f'winner  supp={supp_sid} z={supp_zs}  split={split}\n{legend}'
             t_sc = f'score[{mtype}] - max(rivals)   claims {owned:.1%} of frame'
 
-            if label_name not in prompts:      # every cell of this leg lost to a rival
+            lost = (not mask_anchors) if mask_mode else (label_name not in prompts)
+            if lost:      # every cell of this leg lost to a rival on every candidate slice
                 csv_rows.append({'class': label_name, 'label': label_val, 'scan': qsid,
                                  'dice': 0.0, 'iou': 0.0, 'boxiou': 0.0, 'split': split})
                 tag = 'NOMASK' if mask_mode else 'NOBOX'
@@ -630,10 +648,15 @@ def cmd_mcvis(args) -> None:
                 continue
 
             if mask_mode:
-                conf, prompt_mask = prompts[label_name]
+                # prompt_mask (cyan contour) is drawn on frame_u8 = key slice: only
+                # available when the key slice itself is one of the chosen anchors.
+                # conf falls back to nan when n_anchors rescued the class on a slice
+                # other than the key one (multiclass_mask_anchors doesn't carry scores out).
+                conf = prompts[label_name][0] if label_name in prompts else float('nan')
+                prompt_mask = mask_anchors.get(frame_idx)
                 npts = []
-                seg_crop = seg.segment_volume_mask(vol_u8, {frame_idx: prompt_mask})
-                box_for_iou = mask_to_box(prompt_mask)
+                seg_crop = seg.segment_volume_mask(vol_u8, mask_anchors)
+                box_for_iou = mask_to_box(prompt_mask) if prompt_mask is not None else None
             elif args.neg_points:
                 conf, box, npts = prompts[label_name]
                 seg_crop = seg.segment_volume(
@@ -661,7 +684,8 @@ def cmd_mcvis(args) -> None:
                 def m1(ax, f=frame_u8, g=gt2d, pr=pred2d, pm=prompt_mask):
                     ax.imshow(f, cmap='gray'); ax.contour(g, colors='yellow', linewidths=1.5)
                     ax.contour(pr, colors='red', linewidths=1.5)
-                    ax.contour(pm, colors='cyan', linewidths=2.0)
+                    if pm is not None:   # key slice not among the chosen anchors (rescued
+                        ax.contour(pm, colors='cyan', linewidths=2.0)   # elsewhere by n_anchors)
             else:
                 def m1(ax, f=frame_u8, g=gt2d, pr=pred2d, b=box, p=npts):
                     ax.imshow(f, cmap='gray'); ax.contour(g, colors='yellow', linewidths=1.5)
@@ -674,9 +698,11 @@ def cmd_mcvis(args) -> None:
                                f'{label_name}_{qsid}_dice{d:.3f}_boxiou{boxiou:.2f}.png')
             _render(out, [w, sc, m1], [t_win, t_sc,
                     f'{qsid} [{label_name}] side={side}  Dice(vol)={d:.3f} boxiou={boxiou:.2f}'])
+            anchors_note = (f' anchors_z={sorted(z0 + f for f in mask_anchors)}'
+                            if mask_mode and args.n_anchors > 1 else '')
             print(f'[{label_name}] {qsid}: support={supp_sid} Dice={d:.4f} '
                   f'boxiou={boxiou:.3f} conf={conf:.3f} claims={owned:.1%} '
-                  f'split={split} -> {os.path.basename(out)}')
+                  f'split={split}{anchors_note} -> {os.path.basename(out)}')
 
     if not csv_rows:
         print('No scans scored — nothing written.')
@@ -782,6 +808,14 @@ def main() -> None:
                         'as a mask prompt instead (models/support_prompt.py multiclass_masks_'
                         'for_frame, models/medsam2_adapter.py segment_volume_mask). refine_iters '
                         'and neg_points are box-only and ignored in mask mode.')
+    m.add_argument('--n_anchors', type=int, default=1,
+                   help='(prompt_mode=support_multiclass_mask only; box mode stays frozen-'
+                        'slice) search every query FG slice instead of the single key slice, '
+                        'prompt the N where the class survives the rival winner-take-all -- '
+                        'rescues the catastrophic-zero case (class lost on the key slice '
+                        'alone). 1 = previous single-key-slice behavior, same viz panels.')
+    m.add_argument('--anchor_min_gap', type=int, default=3,
+                   help='min z-distance between anchors (--n_anchors > 1)')
     m.add_argument('--embed_level', type=int, default=-1, choices=[-1, 0, 1, 2],
                    help='A/B resolution probe: backbone_fpn level for support matching. '
                         '-1=stride16/32x32 (default, production embed_frame), 1=stride8/64x64, '
