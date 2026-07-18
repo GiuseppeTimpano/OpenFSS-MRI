@@ -595,6 +595,51 @@ def multiclass_masks_for_frame(seg, bags: dict, frame_u8: np.ndarray,
     return masks, score_maps
 
 
+def multiclass_mask_anchors(seg, bags: dict, cand_frames: list, label_name: str,
+                            left_is_low_x_val: bool | None = None,
+                            n_anchors: int = 1, min_gap: int = 3,
+                            body_thresh: float = 10.0, body_min_px: int = 50,
+                            score_thresh: float = 0.0, single_leg: bool = False,
+                            cc_mode: str = 'dilate_largest',
+                            score_norm: str = 'none') -> dict:
+    """Mask-prompt sibling of support_anchors_dense_bodymasked_bbox, for ONE class.
+
+    Fixes two things the frozen-single-key-slice call in eval_medsam2.py cannot:
+
+    - Catastrophic zero. The winner-take-all in multiclass_masks is per cell, so on an
+      unlucky slice a rival type can take every cell of the true region and the class
+      simply disappears from the returned dict -- eval then scores the WHOLE volume as
+      empty (Dice 0), not just that slice. Measured on the mcvis_label runs: 22 scans at
+      Dice ~0 and 49 below 0.2 across the 6 datasets. Scoring several candidate slices and
+      keeping the ones where the class actually survives turns most of those into a normal
+      propagation instead of a zero.
+    - Single anchor. segment_volume_mask already conditions on every prompted frame, but
+      only one was ever passed. Prompting the N best surviving slices (spread along z by
+      the same greedy as pick_anchors) restarts propagation before the mask decays, the
+      same reason --n_anchors helps the box path (B4).
+
+    cand_frames: [(local_frame_idx, frame_u8)] candidates, already cropped/indexed like
+    vol_u8. n_anchors=1 with a single candidate reproduces the previous single-key-slice
+    call exactly (same lookup, no extra encoder passes).
+
+    returns: {local_frame_idx -> mask_HxW_bool}, ready for
+    MedSAM2Segmenter.segment_volume_mask. Empty dict = the class lost on every candidate
+    (caller falls back to an empty volume, as before).
+    """
+    cands = []
+    for fidx, frame_u8 in cand_frames:
+        masks_by_name, _ = multiclass_masks_for_frame(
+            seg, bags, frame_u8, left_is_low_x_val,
+            body_thresh=body_thresh, body_min_px=body_min_px,
+            score_thresh=score_thresh, single_leg=single_leg,
+            cc_mode=cc_mode, score_norm=score_norm)
+        if label_name in masks_by_name:
+            score, mask = masks_by_name[label_name]
+            cands.append((score, fidx, mask))
+
+    return {fidx: mask for _, fidx, mask in pick_anchors(cands, n_anchors, min_gap)}
+
+
 def _largest_cc(mask2d: np.ndarray) -> np.ndarray:
     """Largest connected component of mask2d. single_leg datasets: the raw query frame's
     FOV sometimes still shows BOTH legs even though only one is annotated -- without this,

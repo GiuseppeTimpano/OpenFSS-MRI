@@ -18,12 +18,14 @@ is the full propagation + aggregated-Dice wiring of the technique previously onl
 available as a single-frame diagnostic in debug_medsam2.py cmd_mcvis) |
 support_multiclass_mask (mask-prompt ablation of support_multiclass: same bag/
 winner-take-all scoring, but the raw similarity blob is fed to SAM2 as a mask prompt
-instead of being reduced to a box, see models/support_prompt.py:multiclass_masks_for_frame
-and models/medsam2_adapter.py:segment_volume_mask). --n_anchors > 1
-re-anchors that box on several slices, so propagation restarts before it decays
-(support_bbox only). --support_slices > 1 (B1) builds the Pos/Neg (or multiclass)
-bag from several slices of the same support volume instead of its key slice alone
--- still 1-shot, richer bag.
+instead of being reduced to a box, see models/support_prompt.py:multiclass_masks_for_frame,
+multiclass_mask_anchors and models/medsam2_adapter.py:segment_volume_mask). --n_anchors > 1
+re-anchors that box/mask on several slices, so propagation restarts before it decays
+(support_bbox: N best-scoring query slices; support_multiclass_mask: N query FG slices
+where the class survives the rival winner-take-all, which also rescues the catastrophic-
+zero case where the class loses on the single frozen key slice). --support_slices > 1
+(B1) builds the Pos/Neg (or multiclass) bag from several slices of the same support
+volume instead of its key slice alone -- still 1-shot, richer bag.
 
 Normalization is MedSAM2's (uint8+512+ImageNet), not the baseline's z-score --
 see models/medsam2_adapter.py.
@@ -43,7 +45,8 @@ from data.dataloader.dataset import get_fold_ids
 from eval_common import Scores, aggregate_and_print
 from models.medsam2_adapter import MedSAM2Segmenter, volume_to_uint8
 from models.support_prompt import (build_multiclass_bags, key_slice, left_is_low_x,
-                                   multiclass_boxes_for_frame, multiclass_masks_for_frame,
+                                   multiclass_boxes_for_frame, multiclass_mask_anchors,
+                                   multiclass_masks_for_frame,
                                    muscle_types, muscle_types_single, pick_support_slices,
                                    support_anchors_dense_bodymasked_bbox,
                                    support_bag_slices, support_bag_slices_single)
@@ -252,16 +255,23 @@ def evaluate(cfg: dict, checkpoint: str, model_cfg: str,
                     mc_bag_cache[supp_sid] = (bags, low_x)
                 bags, low_x = mc_bag_cache[supp_sid]
 
-                frame_idx = key_slice(q_fg) - z0   # local index into the cropped vol_u8
-                masks_by_name, _ = multiclass_masks_for_frame(
-                    seg, bags, vol_u8[frame_idx], low_x,
+                # n_anchors=1 (default): single candidate = key slice, same lookup as
+                # before -- byte-identical output, no extra encoder passes. n_anchors>1:
+                # search every FG slice of the query for ones where the class survives
+                # the winner-take-all, prompt the N best (see multiclass_mask_anchors).
+                if n_anchors <= 1:
+                    cand_frames = [(key_slice(q_fg) - z0, vol_u8[key_slice(q_fg) - z0])]
+                else:
+                    cand_frames = [(int(z) - z0, vol_u8[int(z) - z0]) for z in fg_idx]
+                mask_anchors = multiclass_mask_anchors(
+                    seg, bags, cand_frames, label_name, low_x,
+                    n_anchors=n_anchors, min_gap=anchor_min_gap,
                     single_leg=single_leg, cc_mode=cc_mode)
-                if label_name not in masks_by_name:
-                    print(f'  [NO MASK] {qsid}: {label_name} lost to a rival on the key slice')
+                if not mask_anchors:
+                    print(f'  [NO MASK] {qsid}: {label_name} lost to every rival candidate')
                     seg_crop = np.zeros_like(vol_u8, dtype=q_fg.dtype)
                 else:
-                    _, mask = masks_by_name[label_name]
-                    seg_crop = seg.segment_volume_mask(vol_u8, {frame_idx: mask})
+                    seg_crop = seg.segment_volume_mask(vol_u8, mask_anchors)
             else:
                 boxes = _build_boxes(q_fg, fg_idx, z0, prompt_mode, margin)
                 seg_crop = seg.segment_volume(vol_u8, boxes)        # [z1-z0+1,H,W]
@@ -358,7 +368,11 @@ if __name__ == '__main__':
                              'from similarity, no GT box read)')
     parser.add_argument('--n_anchors',       type=int, default=1,
                         help='(prompt_mode=support_bbox, query_slice=auto) prompt the box on '
-                             'the N best-scoring slices instead of 1; 1 = previous behavior')
+                             'the N best-scoring slices instead of 1; 1 = previous behavior. '
+                             '(prompt_mode=support_multiclass_mask) same idea for the mask '
+                             'prompt: search every query FG slice instead of the single key '
+                             'slice, prompt the N where the class survives the rival '
+                             'winner-take-all; 1 = previous single-key-slice behavior')
     parser.add_argument('--anchor_min_gap',  type=int, default=3,
                         help='min z-distance between anchors (--n_anchors > 1)')
     parser.add_argument('--support_slices',  type=int, default=1,
