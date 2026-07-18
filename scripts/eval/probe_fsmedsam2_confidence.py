@@ -233,8 +233,10 @@ def probe(data_dir: str, label_val: int, label_name: str, medsam2_ckpt: str,
         left_idx = n_query // 2
         right_idx = left_idx + 1
 
-        all_u8 = np.concatenate([q_u8[:left_idx], supp_slice_u8, q_u8[left_idx:]], axis=0)
-        images_np = resize_grayscale_to_rgb_and_resize(all_u8, predictor.image_size) / 255.0
+        n_total = n_query + 1
+        q_resized = resize_grayscale_to_rgb_and_resize(q_u8, predictor.image_size) / 255.0
+        supp_resized = resize_grayscale_to_rgb_and_resize(supp_slice_u8, predictor.image_size) / 255.0
+        images_np = np.concatenate([q_resized[:left_idx], supp_resized, q_resized[left_idx:]], axis=0)
 
         inference_state = predictor.init_state_by_np_data(images_np=images_np)
         predictor.reset_state(inference_state)
@@ -251,7 +253,7 @@ def probe(data_dir: str, label_val: int, label_name: str, medsam2_ckpt: str,
 
         output_dict = inference_state['output_dict']
 
-        for j in range(all_u8.shape[0]):
+        for j in range(n_total):
             if j == left_idx:
                 continue  # the support frame itself, not a query prediction
             q_j = j if j < left_idx else j - 1  # index back into q_fg_crop / q_u8
