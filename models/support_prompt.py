@@ -506,7 +506,8 @@ def _box_from_blob(blob: np.ndarray, score: np.ndarray, img_hw: tuple,
 def _mask_from_blob(blob: np.ndarray, score: np.ndarray, cell_px: float,
                     dilate_iters: int = 1, cc_mode: str = 'dilate_largest',
                     min_cc_px: int = 2, min_frac: float = 0.3,
-                    min_abs_cells: float = 2.0) -> np.ndarray:
+                    min_abs_cells: float = 2.0,
+                    coherence_frac: float | None = None) -> np.ndarray:
     """blob/score are already at FULL image resolution (winner-take-all decided on
     bilinear-upsampled score maps -- same math as debug_medsam2.py's winner-map
     visualization, which is why that panel already looks smooth). This just picks which
@@ -527,7 +528,16 @@ def _mask_from_blob(blob: np.ndarray, score: np.ndarray, cell_px: float,
     fall back to the filled bounding box of the whole blob only when `sel` covers less than
     `min_frac` of `blob`'s own area (real fragmentation), not based on absolute size. A
     tiny `min_abs_cells` pixel floor still catches the degenerate case where `blob` itself
-    is just noise (1-2 px)."""
+    is just noise (1-2 px).
+
+    coherence_frac (None = old behaviour, exact): when the fallback fires, `blob` itself can
+    be scattered noise spread over a big chunk of the frame (weak/noisy class, score_thresh
+    ~0 lets almost any positive-margin pixel in) -- filling its raw bbox then balloons the
+    prompt across anatomy that isn't the target class at all. When set, the fallback first
+    drops `blob` pixels farther than `coherence_frac * diag(blob's own bbox)` from `blob`'s
+    own centroid (self-referential -- no cross-frame info needed here), then bboxes what's
+    left. Same fraction for every class/dataset -- not a per-muscle tuning knob, just "ignore
+    outlier pixels far from this blob's own center of mass" before trusting its extent."""
     from skimage.measure import label as cc_label
 
     dilate_px = max(1, round(dilate_iters * cell_px))
@@ -562,7 +572,16 @@ def _mask_from_blob(blob: np.ndarray, score: np.ndarray, cell_px: float,
     min_abs_px = min_abs_cells * cell_px * cell_px
     min_area_px = max(min_frac * blob.sum(), min_abs_px)
     if sel.sum() < min_area_px:
-        ys, xs = np.where(blob)
+        fallback_blob = blob
+        if coherence_frac is not None:
+            ys, xs = np.where(blob)
+            cy, cx = ys.mean(), xs.mean()
+            diag = float(np.hypot(ys.max() - ys.min() + 1, xs.max() - xs.min() + 1))
+            near = np.hypot(ys - cy, xs - cx) <= coherence_frac * diag
+            if near.any():
+                fallback_blob = np.zeros_like(blob)
+                fallback_blob[ys[near], xs[near]] = True
+        ys, xs = np.where(fallback_blob)
         y0, y1, x0, x1 = ys.min(), ys.max() + 1, xs.min(), xs.max() + 1
         sel = np.zeros_like(blob)
         sel[y0:y1, x0:x1] = True
@@ -572,7 +591,8 @@ def _mask_from_blob(blob: np.ndarray, score: np.ndarray, cell_px: float,
 
 def multiclass_masks(score_maps: dict, query_body2d: np.ndarray, img_hw: tuple,
                      left_is_low_x: bool | None = None, score_thresh: float = 0.0,
-                     single_leg: bool = False, cc_mode: str = 'dilate_largest') -> dict:
+                     single_leg: bool = False, cc_mode: str = 'dilate_largest',
+                     coherence_frac: float | None = None) -> dict:
     """Mask-prompt sibling of multiclass_boxes: same winner-take-all competition, but
     decided on bilinear-upsampled full-res score maps (matching debug_medsam2.py's
     winner-map visualization) and returned as a full-res boolean mask (pseudo-label)
@@ -602,7 +622,8 @@ def multiclass_masks(score_maps: dict, query_body2d: np.ndarray, img_hw: tuple,
             if not blob.any():
                 continue
             key = c if single_leg else f'{si}_{c}'
-            mask = _mask_from_blob(blob, best, cell_px, cc_mode=cc_mode)
+            mask = _mask_from_blob(blob, best, cell_px, cc_mode=cc_mode,
+                                   coherence_frac=coherence_frac)
             out[key] = (float(best[blob].max()), mask)
     return out
 
@@ -611,7 +632,8 @@ def multiclass_masks_for_frame(seg, bags: dict, frame_u8: np.ndarray,
                                left_is_low_x: bool | None = None,
                                body_thresh: float = 10.0, body_min_px: int = 50,
                                score_thresh: float = 0.0, single_leg: bool = False,
-                               cc_mode: str = 'dilate_largest') -> tuple:
+                               cc_mode: str = 'dilate_largest',
+                               coherence_frac: float | None = None) -> tuple:
     """Mask-prompt sibling of multiclass_boxes_for_frame. One query frame -> all masks
     at once. Returns ({'<side>_<type>': (score, mask)} or {'<type>': (score, mask)}
     when single_leg, score_maps)."""
@@ -619,7 +641,8 @@ def multiclass_masks_for_frame(seg, bags: dict, frame_u8: np.ndarray,
     score_maps = multiclass_score_maps(feat, bags)
     body = body_mask2d(frame_u8, body_thresh, body_min_px)
     masks = multiclass_masks(score_maps, body, frame_u8.shape, left_is_low_x,
-                             score_thresh, single_leg=single_leg, cc_mode=cc_mode)
+                             score_thresh, single_leg=single_leg, cc_mode=cc_mode,
+                             coherence_frac=coherence_frac)
     return masks, score_maps
 
 
@@ -628,7 +651,9 @@ def multiclass_mask_anchors(seg, bags: dict, cand_frames: list, label_name: str,
                             n_anchors: int = 1, min_gap: int = 3,
                             body_thresh: float = 10.0, body_min_px: int = 50,
                             score_thresh: float = 0.0, single_leg: bool = False,
-                            cc_mode: str = 'dilate_largest') -> dict:
+                            cc_mode: str = 'dilate_largest',
+                            coherence_frac: float | None = None,
+                            key_fidx: int | None = None) -> dict:
     """Mask-prompt sibling of support_anchors_dense_bodymasked_bbox, for ONE class.
 
     Fixes two things the frozen-single-key-slice call in eval_medsam2.py cannot:
@@ -649,6 +674,26 @@ def multiclass_mask_anchors(seg, bags: dict, cand_frames: list, label_name: str,
     vol_u8. n_anchors=1 with a single candidate reproduces the previous single-key-slice
     call exactly (same lookup, no extra encoder passes).
 
+    coherence_frac (None = old behaviour, exact): pick_anchors alone ranks candidate slices
+    purely by peak winner-take-all score, with zero check that the winning blob sits in the
+    same place as on other slices. A slice where a stray high-margin cluster wins in the
+    WRONG spot (rival muscle's territory, a bone/fascia edge -- common for a small/weak-
+    texture class near score_thresh~0) can outrank the slice where the class won correctly
+    but with a weaker margin, and gets accepted as an anchor. segment_volume_mask then
+    conditions SAM2's propagation on that wrong blob together with the correct ones, which
+    merges or drags the whole-volume prediction toward the wrong location -- worse than
+    plain single-anchor loss because it actively corrupts otherwise-good slices, not just
+    misses one. When set, candidates are filtered by centroid distance to a reference point
+    BEFORE pick_anchors runs: the key slice's own blob centroid if the class survives there
+    (key_fidx), else the component-wise median centroid across all candidates (robust to a
+    minority of outliers). Distance threshold is `coherence_frac * diag(frame)` -- one
+    fraction, same for every class/dataset (no per-muscle tuning): slices near each other in
+    z show a muscle in roughly the same place, so a candidate whose blob teleported away
+    from where the class otherwise sits is discarded before it can become an anchor.
+    Also forwarded into multiclass_masks_for_frame -> _mask_from_blob, so its scattered-blob
+    fallback (see _mask_from_blob docstring) gets the same self-referential fix while
+    building these very candidates.
+
     returns: {local_frame_idx -> mask_HxW_bool}, ready for
     MedSAM2Segmenter.segment_volume_mask. Empty dict = the class lost on every candidate
     (caller falls back to an empty volume, as before).
@@ -659,10 +704,26 @@ def multiclass_mask_anchors(seg, bags: dict, cand_frames: list, label_name: str,
             seg, bags, frame_u8, left_is_low_x_val,
             body_thresh=body_thresh, body_min_px=body_min_px,
             score_thresh=score_thresh, single_leg=single_leg,
-            cc_mode=cc_mode)
+            cc_mode=cc_mode, coherence_frac=coherence_frac)
         if label_name in masks_by_name:
             score, mask = masks_by_name[label_name]
             cands.append((score, fidx, mask))
+
+    if coherence_frac is not None and len(cands) > 1:
+        centroids = {}
+        for _, fidx, mask in cands:
+            ys, xs = np.where(mask)
+            centroids[fidx] = (ys.mean(), xs.mean())
+        if key_fidx is not None and key_fidx in centroids:
+            ref = centroids[key_fidx]
+        else:
+            all_c = np.array(list(centroids.values()))
+            ref = (float(np.median(all_c[:, 0])), float(np.median(all_c[:, 1])))
+        H, W = cand_frames[0][1].shape
+        diag = float(np.hypot(H, W))
+        cands = [c for c in cands
+                if np.hypot(centroids[c[1]][0] - ref[0],
+                            centroids[c[1]][1] - ref[1]) <= coherence_frac * diag]
 
     return {fidx: mask for _, fidx, mask in pick_anchors(cands, n_anchors, min_gap)}
 

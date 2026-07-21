@@ -34,7 +34,14 @@ single-leg scan gives entirely to one leg (~1.6x less effective per-leg resoluti
 on MRI_muscle vs MRI_muscle_2), which starves small/thin muscles (SA, GR)
 disproportionately -- the winner-take-all itself was already 4-way, not 8-way
 (support_bag_slices already pools L+R into one bag per type), so this is a
-resolution fix, not a competition fix.
+resolution fix, not a competition fix. --anchor_coherence FRAC (support_multiclass_mask
+only, requires --n_anchors > 1 to matter) filters n_anchors candidate slices by centroid
+distance to a reference (key slice if the class survives there, else the median centroid
+across candidates) before ranking them by score, and clips the scattered-blob mask
+fallback the same way (see models/support_prompt.py:multiclass_mask_anchors /
+_mask_from_blob docstrings) -- guards against a spatially wrong but high-scoring blob on
+some other slice (common for small/weak-texture classes like GR, SA) becoming an anchor
+and corrupting the whole-volume SAM2 propagation. None (default) = unchanged behaviour.
 
 Normalization is MedSAM2's (uint8+512+ImageNet), not the baseline's z-score --
 see models/medsam2_adapter.py.
@@ -150,7 +157,8 @@ def evaluate(cfg: dict, checkpoint: str, model_cfg: str,
              anchor_min_gap: int = 3, support_slices: int = 1,
              support_min_gap: int = 3, single_leg: bool = False,
              cc_mode: str = 'dilate_largest', neg_points: bool = False,
-             max_neg_points: int = 3, split_legs: bool = False) -> dict:
+             max_neg_points: int = 3, split_legs: bool = False,
+             anchor_coherence: float | None = None) -> dict:
     data_cfg    = cfg['data']
     data_dir    = data_cfg['data_dir']
     n_folds     = data_cfg['n_folds']
@@ -349,8 +357,8 @@ def evaluate(cfg: dict, checkpoint: str, model_cfg: str,
                         seg_crop = np.zeros_like(vol_u8, dtype=q_fg.dtype)
                     else:
                         bags_leg, vol_u8_leg, (y0, y1, x0, x1), mtype = leg
+                        zc = key_slice(q_fg) - z0
                         if n_anchors <= 1:
-                            zc = key_slice(q_fg) - z0
                             cand_frames = [(zc, vol_u8_leg[zc])]
                         else:
                             cand_frames = [(int(z) - z0, vol_u8_leg[int(z) - z0])
@@ -358,7 +366,8 @@ def evaluate(cfg: dict, checkpoint: str, model_cfg: str,
                         mask_anchors = multiclass_mask_anchors(
                             seg, bags_leg, cand_frames, mtype, None,
                             n_anchors=n_anchors, min_gap=anchor_min_gap,
-                            single_leg=True, cc_mode=cc_mode)
+                            single_leg=True, cc_mode=cc_mode,
+                            coherence_frac=anchor_coherence, key_fidx=zc)
                         if not mask_anchors:
                             print(f'  [NO MASK] {qsid}: {label_name} lost to every rival '
                                   f'candidate (split_legs)')
@@ -383,14 +392,16 @@ def evaluate(cfg: dict, checkpoint: str, model_cfg: str,
                     # before -- byte-identical output, no extra encoder passes. n_anchors>1:
                     # search every FG slice of the query for ones where the class survives
                     # the winner-take-all, prompt the N best (see multiclass_mask_anchors).
+                    zc = key_slice(q_fg) - z0
                     if n_anchors <= 1:
-                        cand_frames = [(key_slice(q_fg) - z0, vol_u8[key_slice(q_fg) - z0])]
+                        cand_frames = [(zc, vol_u8[zc])]
                     else:
                         cand_frames = [(int(z) - z0, vol_u8[int(z) - z0]) for z in fg_idx]
                     mask_anchors = multiclass_mask_anchors(
                         seg, bags, cand_frames, label_name, low_x,
                         n_anchors=n_anchors, min_gap=anchor_min_gap,
-                        single_leg=single_leg, cc_mode=cc_mode)
+                        single_leg=single_leg, cc_mode=cc_mode,
+                        coherence_frac=anchor_coherence, key_fidx=zc)
                     if not mask_anchors:
                         print(f'  [NO MASK] {qsid}: {label_name} lost to every rival candidate')
                         seg_crop = np.zeros_like(vol_u8, dtype=q_fg.dtype)
@@ -530,6 +541,16 @@ if __name__ == '__main__':
                              'less effective per-leg pixels than a true single-leg scan) that '
                              'starves small/thin muscles (SA, GR). See '
                              'models/support_prompt.py:leg_crop_boxes')
+    parser.add_argument('--anchor_coherence', type=float, default=None,
+                        help='(prompt_mode=support_multiclass_mask, --n_anchors > 1) reject '
+                             'candidate anchor slices whose winning blob sits farther than '
+                             'FRAC * frame_diagonal from a reference centroid (key slice if '
+                             'the class survives there, else the median centroid across '
+                             'candidates), and clip the scattered-blob mask fallback the same '
+                             'way. Guards against a spatially wrong but high-scoring blob on '
+                             'another slice corrupting the whole-volume SAM2 propagation -- '
+                             'see models/support_prompt.py:multiclass_mask_anchors docstring. '
+                             'None (default) = off, unchanged behavior. Try e.g. 0.35')
     parser.add_argument('--save_dir',        type=str, default=None,
                         help='where to write scores.csv/summary.csv and best/worst volumes')
     parser.add_argument('--save_topk',       type=int, default=1,
@@ -565,4 +586,5 @@ if __name__ == '__main__':
         neg_points      = args.neg_points,
         max_neg_points  = args.max_neg_points,
         split_legs      = args.split_legs,
+        anchor_coherence = args.anchor_coherence,
     )

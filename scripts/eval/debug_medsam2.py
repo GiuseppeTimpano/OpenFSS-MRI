@@ -638,7 +638,8 @@ def cmd_mcvis(args) -> None:
                     mask_anchors = multiclass_mask_anchors(
                         seg, bags_v, cand_frames, pkey, low_x_v,
                         n_anchors=args.n_anchors, min_gap=args.anchor_min_gap,
-                        single_leg=single_leg_v, cc_mode=args.cc_mode)
+                        single_leg=single_leg_v, cc_mode=args.cc_mode,
+                        coherence_frac=args.anchor_coherence, key_fidx=frame_idx)
                 elif pkey in prompts:
                     mask_anchors = {frame_idx: prompts[pkey][1]}
 
@@ -855,6 +856,15 @@ def main() -> None:
                         'alone). 1 = previous single-key-slice behavior, same viz panels.')
     m.add_argument('--anchor_min_gap', type=int, default=3,
                    help='min z-distance between anchors (--n_anchors > 1)')
+    m.add_argument('--anchor_coherence', type=float, default=None,
+                   help='(--n_anchors > 1) reject candidate anchor slices whose winning '
+                        'blob sits farther than FRAC * frame_diagonal from a reference '
+                        'centroid (key slice if the class survives there, else the median '
+                        'centroid across candidates), and clip the scattered-blob mask '
+                        'fallback the same way -- guards against a spatially wrong but '
+                        'high-scoring blob on another slice corrupting the whole-volume '
+                        'SAM2 propagation. See models/support_prompt.py:multiclass_mask_'
+                        'anchors docstring. None (default) = off. Try e.g. 0.35')
     m.add_argument('--embed_level', type=int, default=-1, choices=[-1, 0, 1, 2],
                    help='A/B resolution probe: backbone_fpn level for support matching. '
                         '-1=stride16/32x32 (default, production embed_frame), 1=stride8/64x64, '
