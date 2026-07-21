@@ -25,7 +25,11 @@ re-anchors that box/mask on several slices, so propagation restarts before it de
 where the class survives the rival winner-take-all, which also rescues the catastrophic-
 zero case where the class loses on the single frozen key slice). --support_slices > 1
 (B1) builds the Pos/Neg (or multiclass) bag from several slices of the same support
-volume instead of its key slice alone -- still 1-shot, richer bag.
+volume instead of its key slice alone -- still 1-shot, richer bag. --score_norm
+rescales each class's raw margin map onto a comparable scale before the cross-class
+argmax, so a class with weaker/less-distinctive texture (small/thin muscles) isn't
+structurally outcompeted at its own true location just because its scale is smaller
+(see models/support_prompt.py:multiclass_score_maps).
 
 Normalization is MedSAM2's (uint8+512+ImageNet), not the baseline's z-score --
 see models/medsam2_adapter.py.
@@ -90,7 +94,7 @@ def evaluate(cfg: dict, checkpoint: str, model_cfg: str,
              anchor_min_gap: int = 3, support_slices: int = 1,
              support_min_gap: int = 3, single_leg: bool = False,
              cc_mode: str = 'dilate_largest', neg_points: bool = False,
-             max_neg_points: int = 3) -> dict:
+             max_neg_points: int = 3, score_norm: str = 'none') -> dict:
     data_cfg    = cfg['data']
     data_dir    = data_cfg['data_dir']
     n_folds     = data_cfg['n_folds']
@@ -218,7 +222,8 @@ def evaluate(cfg: dict, checkpoint: str, model_cfg: str,
                 boxes_by_name, _ = multiclass_boxes_for_frame(
                     seg, bags, vol_u8[frame_idx], low_x,
                     single_leg=single_leg, cc_mode=cc_mode,
-                    neg_points=neg_points, max_neg_points=max_neg_points)
+                    neg_points=neg_points, max_neg_points=max_neg_points,
+                    score_norm=score_norm)
                 if label_name not in boxes_by_name:
                     print(f'  [NO BOX] {qsid}: {label_name} lost to a rival on the key slice')
                     seg_crop = np.zeros_like(vol_u8, dtype=q_fg.dtype)
@@ -266,7 +271,8 @@ def evaluate(cfg: dict, checkpoint: str, model_cfg: str,
                 mask_anchors = multiclass_mask_anchors(
                     seg, bags, cand_frames, label_name, low_x,
                     n_anchors=n_anchors, min_gap=anchor_min_gap,
-                    single_leg=single_leg, cc_mode=cc_mode)
+                    single_leg=single_leg, cc_mode=cc_mode,
+                    score_norm=score_norm)
                 if not mask_anchors:
                     print(f'  [NO MASK] {qsid}: {label_name} lost to every rival candidate')
                     seg_crop = np.zeros_like(vol_u8, dtype=q_fg.dtype)
@@ -397,6 +403,16 @@ if __name__ == '__main__':
                              '(e.g. soleus). Off by default (box-only, previous behavior)')
     parser.add_argument('--max_neg_points',  type=int, default=3,
                         help='(--neg_points) cap on negative clicks per box')
+    parser.add_argument('--score_norm',      type=str, default='none',
+                        choices=['none', 'zscore', 'minmax'],
+                        help='(prompt_mode=support_multiclass, support_multiclass_mask) '
+                             'per-class rescale of the raw margin map before the cross-class '
+                             'argmax: a class whose texture is less distinctive everywhere '
+                             '(e.g. a small/thin muscle) can sit on a systematically lower '
+                             'absolute scale and lose the winner-take-all at its own true '
+                             'location -- not because the location is wrong, but because the '
+                             'scale is smaller. none = previous behavior (byte-identical). '
+                             'See models/support_prompt.py:multiclass_score_maps')
     parser.add_argument('--save_dir',        type=str, default=None,
                         help='where to write scores.csv/summary.csv and best/worst volumes')
     parser.add_argument('--save_topk',       type=int, default=1,
@@ -431,4 +447,5 @@ if __name__ == '__main__':
         cc_mode         = args.cc_mode,
         neg_points      = args.neg_points,
         max_neg_points  = args.max_neg_points,
+        score_norm      = args.score_norm,
     )
