@@ -514,7 +514,7 @@ def cmd_mcvis(args) -> None:
                                        muscle_types, muscle_types_single,
                                        side_masks, support_bag_slices, support_bag_slices_single)
     from models.medsam2_adapter import mask_to_box
-    from eval_medsam2 import _read_nii, _load_raw
+    from eval_medsam2 import _leg_crop_bag, _read_nii, _load_raw
 
     device = args.device or ('cuda' if torch.cuda.is_available() else 'cpu')
     with open(args.config) as f:
@@ -538,6 +538,7 @@ def cmd_mcvis(args) -> None:
         print(f'[embed_level={_lvl}] support matching uses backbone_fpn[{_lvl}] '
               f'({"128x128" if _lvl == 0 else "64x64" if _lvl == 1 else "32x32"})')
     bag_cache: dict = {}          # support sid -> (bags, left_is_low_x, slice zs)
+    split_cache: dict = {}        # --split_legs: (supp_sid, side) -> (bags, left_is_low_x) | None
 
     csv_rows: list[dict] = []
 
@@ -579,22 +580,52 @@ def cmd_mcvis(args) -> None:
 
             z0, z1 = int(fg_idx.min()), int(fg_idx.max())
             vol_u8 = volume_to_uint8(q_img)[z0:z1 + 1]
+
+            # --split_legs: crop query+support to one leg, reuse the single_leg=True
+            # pipeline unmodified on the crop (see eval_medsam2.py:_leg_crop_bag /
+            # models/support_prompt.py:leg_crop_boxes). Viz panels below are drawn on
+            # the CROPPED frame in that case, not the full bilateral canvas.
+            split_active = args.split_legs and not args.single_leg and side is not None
+            crop_box = None
+            if split_active:
+                leg = _leg_crop_bag(seg, args.target_data_dir, supp_sid, vol_u8, types,
+                                    label_name, args.support_slices, args.support_min_gap,
+                                    split_cache)
+                if leg is None:
+                    print(f'[{label_name}] {qsid}: could not isolate the {side} leg '
+                          f'(split_legs)')
+                    continue
+                bags_v, vol_u8_v, crop_box, _mtype_v = leg
+                low_x_v, single_leg_v = None, True
+            else:
+                bags_v, vol_u8_v, low_x_v, single_leg_v = bags, vol_u8, low_x, args.single_leg
+
             frame_idx = key_slice(q_fg) - z0             # frozen slice, as in bag_key
-            frame_u8 = vol_u8[frame_idx]
+            frame_u8 = vol_u8_v[frame_idx]
+            gt2d_full = q_fg[z0 + frame_idx].astype(bool)
+            if split_active:
+                y0, y1, x0, x1 = crop_box
+                gt2d = gt2d_full[y0:y1, x0:x1]
+            else:
+                gt2d = gt2d_full
+
+            # prompts/score_maps are keyed by bare type name (mtype) in single_leg/
+            # split_legs mode, by '<side>_<type>' (label_name) otherwise -- pkey picks
+            # the right one for dict lookups; mtype (score_maps, legend) is unaffected,
+            # multiclass_score_maps only ever sees bare types (support_bag_slices pools
+            # L+R into one bag per type regardless of split_legs).
+            pkey = mtype if (args.single_leg or split_active) else label_name
 
             mask_mode = args.prompt_mode == 'support_multiclass_mask'
             if mask_mode:
                 prompts, score_maps = multiclass_masks_for_frame(
-                    seg, bags, frame_u8, low_x, BODY_THRESH, BODY_MIN_PX,
-                    SCORE_THRESH, single_leg=args.single_leg, cc_mode=args.cc_mode,
-                    score_norm=args.score_norm)
+                    seg, bags_v, frame_u8, low_x_v, BODY_THRESH, BODY_MIN_PX,
+                    SCORE_THRESH, single_leg=single_leg_v, cc_mode=args.cc_mode)
             else:
                 prompts, score_maps = multiclass_boxes_for_frame(
-                    seg, bags, frame_u8, low_x, BODY_THRESH, BODY_MIN_PX,
-                    SCORE_THRESH, MARGIN_PX, single_leg=args.single_leg, cc_mode=args.cc_mode,
-                    neg_points=args.neg_points, max_neg_points=args.max_neg_points,
-                    score_norm=args.score_norm)
-            gt2d = q_fg[z0 + frame_idx].astype(bool)
+                    seg, bags_v, frame_u8, low_x_v, BODY_THRESH, BODY_MIN_PX,
+                    SCORE_THRESH, MARGIN_PX, single_leg=single_leg_v, cc_mode=args.cc_mode,
+                    neg_points=args.neg_points, max_neg_points=args.max_neg_points)
 
             # mask_mode + n_anchors>1: search every query FG slice instead of trusting the
             # single frozen key slice above; rescues the class when it lost to a rival there
@@ -603,27 +634,28 @@ def cmd_mcvis(args) -> None:
             mask_anchors: dict = {}
             if mask_mode:
                 if args.n_anchors > 1:
-                    cand_frames = [(int(z) - z0, vol_u8[int(z) - z0]) for z in fg_idx]
+                    cand_frames = [(int(z) - z0, vol_u8_v[int(z) - z0]) for z in fg_idx]
                     mask_anchors = multiclass_mask_anchors(
-                        seg, bags, cand_frames, label_name, low_x,
+                        seg, bags_v, cand_frames, pkey, low_x_v,
                         n_anchors=args.n_anchors, min_gap=args.anchor_min_gap,
-                        single_leg=args.single_leg, cc_mode=args.cc_mode,
-                        score_norm=args.score_norm)
-                elif label_name in prompts:
-                    mask_anchors = {frame_idx: prompts[label_name][1]}
+                        single_leg=single_leg_v, cc_mode=args.cc_mode)
+                elif pkey in prompts:
+                    mask_anchors = {frame_idx: prompts[pkey][1]}
 
             win, best, names = _winner_map(score_maps, frame_u8.shape)
             score_up = _upsample(score_maps[mtype], frame_u8.shape)
             owned = float((win == names.index(mtype)).mean())   # frame share this type claims
 
             body2d = body_mask2d(frame_u8, BODY_THRESH, BODY_MIN_PX)
-            if args.single_leg:
+            if split_active:
+                leg2d, split = body2d, f'split:{side}'   # already cropped to one leg
+            elif args.single_leg:
                 leg2d, split = body2d, 'n/a'    # no side to split -- whole body is the group
             else:
                 leg2d = side_masks(body2d, low_x)[side]
                 split = 'cc' if legs_are_separate(body2d) else 'MIDLINE'
 
-            def w(ax, f=frame_u8, wn=win, nm=names, pr=prompts, t=label_name, g=gt2d, lg=leg2d):
+            def w(ax, f=frame_u8, wn=win, nm=names, pr=prompts, t=pkey, g=gt2d, lg=leg2d):
                 (_draw_winner_mask if mask_mode else _draw_winner)(ax, f, wn, nm, pr, t, lg)
                 ax.contour(g, colors='yellow', linewidths=1.5)
 
@@ -636,7 +668,7 @@ def cmd_mcvis(args) -> None:
             t_win = f'winner  supp={supp_sid} z={supp_zs}  split={split}\n{legend}'
             t_sc = f'score[{mtype}] - max(rivals)   claims {owned:.1%} of frame'
 
-            lost = (not mask_anchors) if mask_mode else (label_name not in prompts)
+            lost = (not mask_anchors) if mask_mode else (pkey not in prompts)
             if lost:      # every cell of this leg lost to a rival on every candidate slice
                 csv_rows.append({'class': label_name, 'label': label_val, 'scan': qsid,
                                  'dice': 0.0, 'iou': 0.0, 'boxiou': 0.0, 'split': split})
@@ -652,33 +684,39 @@ def cmd_mcvis(args) -> None:
                 # available when the key slice itself is one of the chosen anchors.
                 # conf falls back to nan when n_anchors rescued the class on a slice
                 # other than the key one (multiclass_mask_anchors doesn't carry scores out).
-                conf = prompts[label_name][0] if label_name in prompts else float('nan')
+                conf = prompts[pkey][0] if pkey in prompts else float('nan')
                 prompt_mask = mask_anchors.get(frame_idx)
                 npts = []
-                seg_crop = seg.segment_volume_mask(vol_u8, mask_anchors)
+                seg_crop_v = seg.segment_volume_mask(vol_u8_v, mask_anchors)
                 box_for_iou = mask_to_box(prompt_mask) if prompt_mask is not None else None
             elif args.neg_points:
-                conf, box, npts = prompts[label_name]
-                seg_crop = seg.segment_volume(
-                    vol_u8, {frame_idx: np.asarray(box, np.float32)},
+                conf, box, npts = prompts[pkey]
+                seg_crop_v = seg.segment_volume(
+                    vol_u8_v, {frame_idx: np.asarray(box, np.float32)},
                     refine_iters=args.refine_iters,
                     neg_points={frame_idx: npts} if npts else None)
                 box_for_iou = tuple(box)
             else:
-                conf, box = prompts[label_name]
+                conf, box = prompts[pkey]
                 npts = []
-                seg_crop = seg.segment_volume(
-                    vol_u8, {frame_idx: np.asarray(box, np.float32)},
+                seg_crop_v = seg.segment_volume(
+                    vol_u8_v, {frame_idx: np.asarray(box, np.float32)},
                     refine_iters=args.refine_iters, neg_points=None)
                 box_for_iou = tuple(box)
+
             pred_full = np.zeros_like(q_fg)
+            if split_active:
+                seg_crop = np.zeros_like(vol_u8, dtype=seg_crop_v.dtype)
+                seg_crop[:, y0:y1, x0:x1] = seg_crop_v
+            else:
+                seg_crop = seg_crop_v
             pred_full[z0:z1 + 1] = seg_crop
             pb, gb = pred_full[fg_idx].astype(bool), q_fg[fg_idx].astype(bool)
             d, i = _dice(pb, gb), _iou(pb, gb)
             boxiou = _box_iou(box_for_iou, _gt_bbox(gt2d)) if box_for_iou is not None else 0.0
             csv_rows.append({'class': label_name, 'label': label_val, 'scan': qsid,
                              'dice': d, 'iou': i, 'boxiou': boxiou, 'split': split})
-            pred2d = seg_crop[frame_idx].astype(bool)
+            pred2d = seg_crop_v[frame_idx].astype(bool)   # cropped coords, matches frame_u8
 
             if mask_mode:
                 def m1(ax, f=frame_u8, g=gt2d, pr=pred2d, pm=prompt_mask):
@@ -785,6 +823,13 @@ def main() -> None:
     m.add_argument('--single_leg', action='store_true',
                    help='dataset has one leg per volume (no L/R): label_names are bare '
                         'type names, no side split of the body mask')
+    m.add_argument('--split_legs', action='store_true',
+                   help='(bilateral datasets only, ignored with --single_leg) crop query + '
+                        'support to one leg and run the single-leg pipeline on each side '
+                        'independently instead of competing both legs in the same fixed '
+                        '512x512 SAM2 grid -- fixes a resolution deficit that starves small/'
+                        'thin muscles (SA, GR). Viz panels are drawn on the cropped frame. '
+                        'See models/support_prompt.py:leg_crop_boxes')
     m.add_argument('--cc_mode', choices=['dilate_largest', 'union', 'seed_only'],
                    default='dilate_largest',
                    help='_box_from_blob CC selection: dilate_largest = current fix, '
@@ -795,12 +840,6 @@ def main() -> None:
                         'neighboring muscle an elongated box also covers (e.g. soleus)')
     m.add_argument('--max_neg_points', type=int, default=3,
                    help='(--neg_points) cap on negative clicks per box')
-    m.add_argument('--score_norm', choices=['none', 'zscore', 'minmax'], default='none',
-                   help='rescale each class score map before the cross-class argmax: '
-                        'none = current production behavior, zscore/minmax = normalize '
-                        'each class onto a comparable scale first (fixes a class losing '
-                        'every cell just because its raw margin is systematically smaller, '
-                        'not because its location is wrong). See multiclass_score_maps.')
     m.add_argument('--prompt_mode', choices=['support_multiclass', 'support_multiclass_mask'],
                    default='support_multiclass',
                    help='support_multiclass = box from the winner-take-all blob (default, '

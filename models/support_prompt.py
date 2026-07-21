@@ -323,23 +323,10 @@ def build_multiclass_bags(seg, supp_slices: list, thr_hi: float = 0.7, thr_lo: f
     return {c: torch.cat(v, dim=1) for c, v in bags.items()}
 
 
-def multiclass_score_maps(feat_query: torch.Tensor, bags: dict, score_norm: str = 'none') -> dict:
+def multiclass_score_maps(feat_query: torch.Tensor, bags: dict) -> dict:
     """score_c(x) = pos_c(x) - max over the rival bags (other types AND BG). The rival is
     an explicit balanced bag, not a saturated max over the whole body, so the contrast
-    actually discriminates. Returns {cls: [h,w]} for the muscle types only.
-
-    score_norm rescales each class's raw margin map independently before the cross-class
-    argmax in multiclass_boxes ever sees it (default 'none' = untouched, original behavior).
-    Rationale: a class whose texture is less distinctive everywhere (e.g. a small/low-
-    contrast muscle) can sit on a systematically lower absolute scale than its neighbors and
-    lose every single cell of the per-pixel winner-take-all even at its own true location --
-    not because the location is wrong, but because the *scale* is smaller. Normalizing each
-    class's map onto a comparable scale before the argmax lets a class's own local peak
-    compete on equal footing.
-    - 'zscore': (x - mean) / std over that class's map (this frame only).
-    - 'minmax': (x - min) / (max - min) over that class's map -> [0, 1].
-    - 'none': no-op, byte-identical to the pre-existing behavior.
-    """
+    actually discriminates. Returns {cls: [h,w]} for the muscle types only."""
     C, h, w = feat_query.shape
     Qn = F.normalize(feat_query.reshape(C, h * w), dim=0)
 
@@ -354,16 +341,7 @@ def multiclass_score_maps(feat_query: torch.Tensor, bags: dict, score_norm: str 
         if c == BG_KEY:
             continue
         rivals = torch.stack([p for k, p in pos.items() if k != c])
-        m = (pos[c] - rivals.max(dim=0).values).cpu().numpy()
-        if score_norm == 'zscore':
-            std = m.std()
-            m = (m - m.mean()) / std if std > 1e-8 else m - m.mean()
-        elif score_norm == 'minmax':
-            lo, hi = m.min(), m.max()
-            m = (m - lo) / (hi - lo) if hi - lo > 1e-8 else np.zeros_like(m)
-        elif score_norm != 'none':
-            raise ValueError(f'unknown score_norm: {score_norm!r}')
-        out[c] = m
+        out[c] = (pos[c] - rivals.max(dim=0).values).cpu().numpy()
     return out
 
 
@@ -414,6 +392,56 @@ def side_masks(body2d: np.ndarray, left_is_low_x: bool,
     lo_m, hi_m = legs if legs is not None else _split_at_midline(body2d)
     l, r = (lo_m, hi_m) if left_is_low_x else (hi_m, lo_m)
     return {'L': l, 'R': r}
+
+
+def leg_crop_boxes(vol_u8: np.ndarray, left_is_low_x: bool, margin_frac: float = 0.15,
+                   min_leg_ratio: float = 0.2) -> dict:
+    """{'L': (y0,y1,x0,x1), 'R': (y0,y1,x0,x1)} pixel windows, one per leg, valid across
+    the WHOLE z-range of vol_u8 (union of each frame's side_masks bbox + margin) -- SAM2
+    propagation needs a fixed crop window across frames, can't shift per-slice. Side
+    missing from every frame (e.g. a single-leg volume slipped in) is simply absent from
+    the returned dict.
+
+    Restores per-leg resolution before SAM2's fixed 512x512 resize (medsam2_adapter.py
+    IMG_SIZE): a bilateral scan crams both legs into the same coarse embedding grid a
+    single-leg scan gives entirely to one leg -- on MRI_muscle (bilateral, 560x560) vs
+    MRI_muscle_2 (single-leg, 282x339) that works out to roughly 1.6x less effective
+    per-leg resolution, which starves already-small/thin muscles (SA, GR) disproportio-
+    nately (mean Dice ~0.72 single-leg vs 0.28-0.50 bilateral for the same types, same
+    4-way winner-take-all -- support_bag_slices already pools L+R into one bag per type,
+    so the competition itself was never 8-way). Used by eval_medsam2.py/debug_medsam2.py
+    --split_legs: crop query+support to one leg, run the existing single_leg=True
+    pipeline (unmodified) on each side independently, paste the result back.
+    """
+    H, W = vol_u8.shape[1], vol_u8.shape[2]
+    acc: dict = {'L': None, 'R': None}
+    for z in range(vol_u8.shape[0]):
+        body = body_mask2d(vol_u8[z])
+        if not body.any():
+            continue
+        for side, smask in side_masks(body, left_is_low_x, min_leg_ratio).items():
+            if not smask.any():
+                continue
+            ys, xs = np.where(smask)
+            y0, y1, x0, x1 = int(ys.min()), int(ys.max()), int(xs.min()), int(xs.max())
+            if acc[side] is None:
+                acc[side] = [y0, y1, x0, x1]
+            else:
+                acc[side][0] = min(acc[side][0], y0)
+                acc[side][1] = max(acc[side][1], y1)
+                acc[side][2] = min(acc[side][2], x0)
+                acc[side][3] = max(acc[side][3], x1)
+
+    out = {}
+    for side, b in acc.items():
+        if b is None:
+            continue
+        y0, y1, x0, x1 = b
+        mh = int(round((y1 - y0) * margin_frac))
+        mw = int(round((x1 - x0) * margin_frac))
+        out[side] = (max(0, y0 - mh), min(H, y1 + mh + 1),
+                     max(0, x0 - mw), min(W, x1 + mw + 1))
+    return out
 
 
 def _box_from_blob(blob: np.ndarray, score: np.ndarray, img_hw: tuple,
@@ -583,12 +611,12 @@ def multiclass_masks_for_frame(seg, bags: dict, frame_u8: np.ndarray,
                                left_is_low_x: bool | None = None,
                                body_thresh: float = 10.0, body_min_px: int = 50,
                                score_thresh: float = 0.0, single_leg: bool = False,
-                               cc_mode: str = 'dilate_largest', score_norm: str = 'none') -> tuple:
+                               cc_mode: str = 'dilate_largest') -> tuple:
     """Mask-prompt sibling of multiclass_boxes_for_frame. One query frame -> all masks
     at once. Returns ({'<side>_<type>': (score, mask)} or {'<type>': (score, mask)}
-    when single_leg, score_maps). score_norm: see multiclass_score_maps."""
+    when single_leg, score_maps)."""
     feat = seg.embed_frame(frame_u8)
-    score_maps = multiclass_score_maps(feat, bags, score_norm=score_norm)
+    score_maps = multiclass_score_maps(feat, bags)
     body = body_mask2d(frame_u8, body_thresh, body_min_px)
     masks = multiclass_masks(score_maps, body, frame_u8.shape, left_is_low_x,
                              score_thresh, single_leg=single_leg, cc_mode=cc_mode)
@@ -600,8 +628,7 @@ def multiclass_mask_anchors(seg, bags: dict, cand_frames: list, label_name: str,
                             n_anchors: int = 1, min_gap: int = 3,
                             body_thresh: float = 10.0, body_min_px: int = 50,
                             score_thresh: float = 0.0, single_leg: bool = False,
-                            cc_mode: str = 'dilate_largest',
-                            score_norm: str = 'none') -> dict:
+                            cc_mode: str = 'dilate_largest') -> dict:
     """Mask-prompt sibling of support_anchors_dense_bodymasked_bbox, for ONE class.
 
     Fixes two things the frozen-single-key-slice call in eval_medsam2.py cannot:
@@ -632,7 +659,7 @@ def multiclass_mask_anchors(seg, bags: dict, cand_frames: list, label_name: str,
             seg, bags, frame_u8, left_is_low_x_val,
             body_thresh=body_thresh, body_min_px=body_min_px,
             score_thresh=score_thresh, single_leg=single_leg,
-            cc_mode=cc_mode, score_norm=score_norm)
+            cc_mode=cc_mode)
         if label_name in masks_by_name:
             score, mask = masks_by_name[label_name]
             cands.append((score, fidx, mask))
@@ -726,13 +753,13 @@ def multiclass_boxes_for_frame(seg, bags: dict, frame_u8: np.ndarray,
                                score_thresh: float = 0.0, margin_px: float = 0.0,
                                single_leg: bool = False,
                                cc_mode: str = 'dilate_largest', neg_points: bool = False,
-                               max_neg_points: int = 3, score_norm: str = 'none') -> tuple:
+                               max_neg_points: int = 3) -> tuple:
     """One query frame -> all boxes at once. returns ({'<side>_<type>': (score, box)}
     or {'<type>': (score, box)} when single_leg, score_maps) -- the maps come back for
     the debug overlay. neg_points=True adds a third tuple element per key (see
-    multiclass_boxes). score_norm: see multiclass_score_maps."""
+    multiclass_boxes)."""
     feat = seg.embed_frame(frame_u8)
-    score_maps = multiclass_score_maps(feat, bags, score_norm=score_norm)
+    score_maps = multiclass_score_maps(feat, bags)
     body = body_mask2d(frame_u8, body_thresh, body_min_px)
     boxes = multiclass_boxes(score_maps, body, frame_u8.shape, left_is_low_x,
                              score_thresh, margin_px, single_leg=single_leg, cc_mode=cc_mode,

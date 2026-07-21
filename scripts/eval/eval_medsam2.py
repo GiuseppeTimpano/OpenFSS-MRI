@@ -25,11 +25,16 @@ re-anchors that box/mask on several slices, so propagation restarts before it de
 where the class survives the rival winner-take-all, which also rescues the catastrophic-
 zero case where the class loses on the single frozen key slice). --support_slices > 1
 (B1) builds the Pos/Neg (or multiclass) bag from several slices of the same support
-volume instead of its key slice alone -- still 1-shot, richer bag. --score_norm
-rescales each class's raw margin map onto a comparable scale before the cross-class
-argmax, so a class with weaker/less-distinctive texture (small/thin muscles) isn't
-structurally outcompeted at its own true location just because its scale is smaller
-(see models/support_prompt.py:multiclass_score_maps).
+volume instead of its key slice alone -- still 1-shot, richer bag. --split_legs
+(support_multiclass, support_multiclass_mask; bilateral datasets only) crops query
++ support to one leg (models/support_prompt.py:leg_crop_boxes) and reuses the
+existing single_leg=True pipeline unmodified on each side independently: a
+bilateral scan crams both legs into the same fixed 512x512 SAM2 embedding grid a
+single-leg scan gives entirely to one leg (~1.6x less effective per-leg resolution
+on MRI_muscle vs MRI_muscle_2), which starves small/thin muscles (SA, GR)
+disproportionately -- the winner-take-all itself was already 4-way, not 8-way
+(support_bag_slices already pools L+R into one bag per type), so this is a
+resolution fix, not a competition fix.
 
 Normalization is MedSAM2's (uint8+512+ImageNet), not the baseline's z-score --
 see models/medsam2_adapter.py.
@@ -48,9 +53,9 @@ import yaml
 from data.dataloader.dataset import get_fold_ids
 from eval_common import Scores, aggregate_and_print
 from models.medsam2_adapter import MedSAM2Segmenter, volume_to_uint8
-from models.support_prompt import (build_multiclass_bags, key_slice, left_is_low_x,
-                                   multiclass_boxes_for_frame, multiclass_mask_anchors,
-                                   multiclass_masks_for_frame,
+from models.support_prompt import (build_multiclass_bags, key_slice, leg_crop_boxes,
+                                   left_is_low_x, multiclass_boxes_for_frame,
+                                   multiclass_mask_anchors, multiclass_masks_for_frame,
                                    muscle_types, muscle_types_single, pick_support_slices,
                                    support_anchors_dense_bodymasked_bbox,
                                    support_bag_slices, support_bag_slices_single)
@@ -85,6 +90,57 @@ def _build_boxes(fg_mask: np.ndarray, fg_idx: np.ndarray, z0: int,
     return {int(z) - z0: _bbox(fg_mask[z], margin, H, W) for z in fg_idx}
 
 
+def _leg_crop_bag(seg, query_data_dir: str, supp_sid: str, vol_u8: np.ndarray,
+                  types: dict, label_name: str, support_slices: int, support_min_gap: int,
+                  split_cache: dict):
+    """--split_legs orchestration shared by support_multiclass / support_multiclass_mask.
+    Crops query + support to ONE leg (side read off label_name's 'L_'/'R_' prefix) and
+    hands back everything needed to call the existing single_leg=True pipeline
+    unmodified on the crop -- see models/support_prompt.py:leg_crop_boxes for why
+    (per-leg resolution, not the winner-take-all competition, is what the bilateral
+    path was losing to single-leg).
+
+    split_cache: {(supp_sid, side) -> (bags, left_is_low_x) | None}, shared across
+    classes/scans within one evaluate() call so the same support crop's bags aren't
+    rebuilt (re-embedded) for every query scan that happens to draw the same support.
+
+    Returns (bags_leg, vol_u8_leg, (y0, y1, x0, x1), mtype), or None when either the
+    support or this query volume has no detectable leg on that side (crop degenerates
+    -- caller falls back to an empty prediction, same as the existing NO BOX/NO MASK
+    lost-to-a-rival case).
+    """
+    side, mtype = label_name.split('_', 1)
+
+    if (supp_sid, side) not in split_cache:
+        supp_img, supp_lbl = _load_raw(query_data_dir, supp_sid)
+        supp_vol_u8 = volume_to_uint8(supp_img)
+        supp_low_x = left_is_low_x(supp_lbl, types)
+        supp_box = leg_crop_boxes(supp_vol_u8, supp_low_x).get(side)
+        if supp_box is None:
+            split_cache[(supp_sid, side)] = None
+        else:
+            sy0, sy1, sx0, sx1 = supp_box
+            supp_vol_leg = supp_vol_u8[:, sy0:sy1, sx0:sx1]
+            supp_lbl_leg = supp_lbl[:, sy0:sy1, sx0:sx1]
+            types_leg = {t: v[side] for t, v in types.items()}
+            supp_slices, _ = support_bag_slices_single(
+                supp_vol_leg, supp_lbl_leg, types_leg, support_slices, support_min_gap)
+            bags_leg = build_multiclass_bags(seg, supp_slices)
+            split_cache[(supp_sid, side)] = (bags_leg, supp_low_x)
+
+    cached = split_cache[(supp_sid, side)]
+    if cached is None:
+        return None
+    bags_leg, low_x = cached
+
+    q_box = leg_crop_boxes(vol_u8, low_x).get(side)
+    if q_box is None:
+        return None
+    y0, y1, x0, x1 = q_box
+    vol_u8_leg = vol_u8[:, y0:y1, x0:x1]
+    return bags_leg, vol_u8_leg, (y0, y1, x0, x1), mtype
+
+
 def evaluate(cfg: dict, checkpoint: str, model_cfg: str,
              target_data_dir: str | None, fold: int | None,
              eval_labels: list[int] | None, prompt_mode: str, margin: int,
@@ -94,7 +150,7 @@ def evaluate(cfg: dict, checkpoint: str, model_cfg: str,
              anchor_min_gap: int = 3, support_slices: int = 1,
              support_min_gap: int = 3, single_leg: bool = False,
              cc_mode: str = 'dilate_largest', neg_points: bool = False,
-             max_neg_points: int = 3, score_norm: str = 'none') -> dict:
+             max_neg_points: int = 3, split_legs: bool = False) -> dict:
     data_cfg    = cfg['data']
     data_dir    = data_cfg['data_dir']
     n_folds     = data_cfg['n_folds']
@@ -109,6 +165,8 @@ def evaluate(cfg: dict, checkpoint: str, model_cfg: str,
         # already covers every type -- only rebuilt when a class's random pairing draws a
         # support scan not seen yet for ANY class.
         mc_bag_cache: dict = {}
+        # --split_legs: {(supp_sid, side) -> (bags, left_is_low_x) | None}, see _leg_crop_bag.
+        split_cache: dict = {}
 
     query_data_dir = target_data_dir or data_dir
     if target_data_dir:
@@ -204,40 +262,72 @@ def evaluate(cfg: dict, checkpoint: str, model_cfg: str,
                     continue
                 supp_sid = rng.choice(pool)
 
-                if supp_sid not in mc_bag_cache:
-                    supp_img, supp_lbl = _load_raw(query_data_dir, supp_sid)
-                    supp_vol_u8 = volume_to_uint8(supp_img)
-                    bag_fn = support_bag_slices_single if single_leg else support_bag_slices
-                    supp_slices, _ = bag_fn(supp_vol_u8, supp_lbl, types,
-                                            support_slices, support_min_gap)
-                    low_x = None if single_leg else left_is_low_x(supp_lbl, types)
-                    bags = build_multiclass_bags(seg, supp_slices)
-                    mc_bag_cache[supp_sid] = (bags, low_x)
-                bags, low_x = mc_bag_cache[supp_sid]
-
-                # frozen key-slice seed (operator-in-the-loop proxy, same as debug_medsam2.py
-                # cmd_mcvis) -- multiclass_boxes_for_frame scores one frame at a time, so
-                # there is no query_slice=auto sweep here yet.
-                frame_idx = key_slice(q_fg) - z0   # local index into the cropped vol_u8
-                boxes_by_name, _ = multiclass_boxes_for_frame(
-                    seg, bags, vol_u8[frame_idx], low_x,
-                    single_leg=single_leg, cc_mode=cc_mode,
-                    neg_points=neg_points, max_neg_points=max_neg_points,
-                    score_norm=score_norm)
-                if label_name not in boxes_by_name:
-                    print(f'  [NO BOX] {qsid}: {label_name} lost to a rival on the key slice')
-                    seg_crop = np.zeros_like(vol_u8, dtype=q_fg.dtype)
-                else:
-                    npts = None
-                    if neg_points:
-                        _, box, pts = boxes_by_name[label_name]
-                        if pts:
-                            npts = {frame_idx: pts}
+                if split_legs and not single_leg and '_' in label_name:
+                    leg = _leg_crop_bag(seg, query_data_dir, supp_sid, vol_u8, types,
+                                        label_name, support_slices, support_min_gap,
+                                        split_cache)
+                    if leg is None:
+                        print(f'  [NO LEG] {qsid}: could not isolate the '
+                              f'{label_name.split("_", 1)[0]} leg')
+                        seg_crop = np.zeros_like(vol_u8, dtype=q_fg.dtype)
                     else:
-                        _, box = boxes_by_name[label_name]
-                    seg_crop = seg.segment_volume(
-                        vol_u8, {frame_idx: np.asarray(box, dtype=np.float32)},
-                        refine_iters=refine_iters, neg_points=npts)
+                        bags_leg, vol_u8_leg, (y0, y1, x0, x1), mtype = leg
+                        frame_idx = key_slice(q_fg) - z0
+                        boxes_by_name, _ = multiclass_boxes_for_frame(
+                            seg, bags_leg, vol_u8_leg[frame_idx], None,
+                            single_leg=True, cc_mode=cc_mode,
+                            neg_points=neg_points, max_neg_points=max_neg_points)
+                        if mtype not in boxes_by_name:
+                            print(f'  [NO BOX] {qsid}: {label_name} lost to a rival on '
+                                  f'the key slice (split_legs)')
+                            seg_crop = np.zeros_like(vol_u8, dtype=q_fg.dtype)
+                        else:
+                            npts = None
+                            if neg_points:
+                                _, box, pts = boxes_by_name[mtype]
+                                if pts:
+                                    npts = {frame_idx: pts}
+                            else:
+                                _, box = boxes_by_name[mtype]
+                            seg_crop_leg = seg.segment_volume(
+                                vol_u8_leg, {frame_idx: np.asarray(box, dtype=np.float32)},
+                                refine_iters=refine_iters, neg_points=npts)
+                            seg_crop = np.zeros_like(vol_u8, dtype=q_fg.dtype)
+                            seg_crop[:, y0:y1, x0:x1] = seg_crop_leg
+                else:
+                    if supp_sid not in mc_bag_cache:
+                        supp_img, supp_lbl = _load_raw(query_data_dir, supp_sid)
+                        supp_vol_u8 = volume_to_uint8(supp_img)
+                        bag_fn = support_bag_slices_single if single_leg else support_bag_slices
+                        supp_slices, _ = bag_fn(supp_vol_u8, supp_lbl, types,
+                                                support_slices, support_min_gap)
+                        low_x = None if single_leg else left_is_low_x(supp_lbl, types)
+                        bags = build_multiclass_bags(seg, supp_slices)
+                        mc_bag_cache[supp_sid] = (bags, low_x)
+                    bags, low_x = mc_bag_cache[supp_sid]
+
+                    # frozen key-slice seed (operator-in-the-loop proxy, same as
+                    # debug_medsam2.py cmd_mcvis) -- multiclass_boxes_for_frame scores one
+                    # frame at a time, so there is no query_slice=auto sweep here yet.
+                    frame_idx = key_slice(q_fg) - z0   # local index into the cropped vol_u8
+                    boxes_by_name, _ = multiclass_boxes_for_frame(
+                        seg, bags, vol_u8[frame_idx], low_x,
+                        single_leg=single_leg, cc_mode=cc_mode,
+                        neg_points=neg_points, max_neg_points=max_neg_points)
+                    if label_name not in boxes_by_name:
+                        print(f'  [NO BOX] {qsid}: {label_name} lost to a rival on the key slice')
+                        seg_crop = np.zeros_like(vol_u8, dtype=q_fg.dtype)
+                    else:
+                        npts = None
+                        if neg_points:
+                            _, box, pts = boxes_by_name[label_name]
+                            if pts:
+                                npts = {frame_idx: pts}
+                        else:
+                            _, box = boxes_by_name[label_name]
+                        seg_crop = seg.segment_volume(
+                            vol_u8, {frame_idx: np.asarray(box, dtype=np.float32)},
+                            refine_iters=refine_iters, neg_points=npts)
             elif prompt_mode == 'support_multiclass_mask':
                 # Mask-prompt sibling of support_multiclass: same support bag / winner-take-all
                 # scoring, but the raw similarity blob is fed to SAM2 as a mask prompt instead
@@ -249,35 +339,63 @@ def evaluate(cfg: dict, checkpoint: str, model_cfg: str,
                     continue
                 supp_sid = rng.choice(pool)
 
-                if supp_sid not in mc_bag_cache:
-                    supp_img, supp_lbl = _load_raw(query_data_dir, supp_sid)
-                    supp_vol_u8 = volume_to_uint8(supp_img)
-                    bag_fn = support_bag_slices_single if single_leg else support_bag_slices
-                    supp_slices, _ = bag_fn(supp_vol_u8, supp_lbl, types,
-                                            support_slices, support_min_gap)
-                    low_x = None if single_leg else left_is_low_x(supp_lbl, types)
-                    bags = build_multiclass_bags(seg, supp_slices)
-                    mc_bag_cache[supp_sid] = (bags, low_x)
-                bags, low_x = mc_bag_cache[supp_sid]
+                if split_legs and not single_leg and '_' in label_name:
+                    leg = _leg_crop_bag(seg, query_data_dir, supp_sid, vol_u8, types,
+                                        label_name, support_slices, support_min_gap,
+                                        split_cache)
+                    if leg is None:
+                        print(f'  [NO LEG] {qsid}: could not isolate the '
+                              f'{label_name.split("_", 1)[0]} leg')
+                        seg_crop = np.zeros_like(vol_u8, dtype=q_fg.dtype)
+                    else:
+                        bags_leg, vol_u8_leg, (y0, y1, x0, x1), mtype = leg
+                        if n_anchors <= 1:
+                            zc = key_slice(q_fg) - z0
+                            cand_frames = [(zc, vol_u8_leg[zc])]
+                        else:
+                            cand_frames = [(int(z) - z0, vol_u8_leg[int(z) - z0])
+                                           for z in fg_idx]
+                        mask_anchors = multiclass_mask_anchors(
+                            seg, bags_leg, cand_frames, mtype, None,
+                            n_anchors=n_anchors, min_gap=anchor_min_gap,
+                            single_leg=True, cc_mode=cc_mode)
+                        if not mask_anchors:
+                            print(f'  [NO MASK] {qsid}: {label_name} lost to every rival '
+                                  f'candidate (split_legs)')
+                            seg_crop = np.zeros_like(vol_u8, dtype=q_fg.dtype)
+                        else:
+                            seg_crop_leg = seg.segment_volume_mask(vol_u8_leg, mask_anchors)
+                            seg_crop = np.zeros_like(vol_u8, dtype=q_fg.dtype)
+                            seg_crop[:, y0:y1, x0:x1] = seg_crop_leg
+                else:
+                    if supp_sid not in mc_bag_cache:
+                        supp_img, supp_lbl = _load_raw(query_data_dir, supp_sid)
+                        supp_vol_u8 = volume_to_uint8(supp_img)
+                        bag_fn = support_bag_slices_single if single_leg else support_bag_slices
+                        supp_slices, _ = bag_fn(supp_vol_u8, supp_lbl, types,
+                                                support_slices, support_min_gap)
+                        low_x = None if single_leg else left_is_low_x(supp_lbl, types)
+                        bags = build_multiclass_bags(seg, supp_slices)
+                        mc_bag_cache[supp_sid] = (bags, low_x)
+                    bags, low_x = mc_bag_cache[supp_sid]
 
-                # n_anchors=1 (default): single candidate = key slice, same lookup as
-                # before -- byte-identical output, no extra encoder passes. n_anchors>1:
-                # search every FG slice of the query for ones where the class survives
-                # the winner-take-all, prompt the N best (see multiclass_mask_anchors).
-                if n_anchors <= 1:
-                    cand_frames = [(key_slice(q_fg) - z0, vol_u8[key_slice(q_fg) - z0])]
-                else:
-                    cand_frames = [(int(z) - z0, vol_u8[int(z) - z0]) for z in fg_idx]
-                mask_anchors = multiclass_mask_anchors(
-                    seg, bags, cand_frames, label_name, low_x,
-                    n_anchors=n_anchors, min_gap=anchor_min_gap,
-                    single_leg=single_leg, cc_mode=cc_mode,
-                    score_norm=score_norm)
-                if not mask_anchors:
-                    print(f'  [NO MASK] {qsid}: {label_name} lost to every rival candidate')
-                    seg_crop = np.zeros_like(vol_u8, dtype=q_fg.dtype)
-                else:
-                    seg_crop = seg.segment_volume_mask(vol_u8, mask_anchors)
+                    # n_anchors=1 (default): single candidate = key slice, same lookup as
+                    # before -- byte-identical output, no extra encoder passes. n_anchors>1:
+                    # search every FG slice of the query for ones where the class survives
+                    # the winner-take-all, prompt the N best (see multiclass_mask_anchors).
+                    if n_anchors <= 1:
+                        cand_frames = [(key_slice(q_fg) - z0, vol_u8[key_slice(q_fg) - z0])]
+                    else:
+                        cand_frames = [(int(z) - z0, vol_u8[int(z) - z0]) for z in fg_idx]
+                    mask_anchors = multiclass_mask_anchors(
+                        seg, bags, cand_frames, label_name, low_x,
+                        n_anchors=n_anchors, min_gap=anchor_min_gap,
+                        single_leg=single_leg, cc_mode=cc_mode)
+                    if not mask_anchors:
+                        print(f'  [NO MASK] {qsid}: {label_name} lost to every rival candidate')
+                        seg_crop = np.zeros_like(vol_u8, dtype=q_fg.dtype)
+                    else:
+                        seg_crop = seg.segment_volume_mask(vol_u8, mask_anchors)
             else:
                 boxes = _build_boxes(q_fg, fg_idx, z0, prompt_mode, margin)
                 seg_crop = seg.segment_volume(vol_u8, boxes)        # [z1-z0+1,H,W]
@@ -403,16 +521,15 @@ if __name__ == '__main__':
                              '(e.g. soleus). Off by default (box-only, previous behavior)')
     parser.add_argument('--max_neg_points',  type=int, default=3,
                         help='(--neg_points) cap on negative clicks per box')
-    parser.add_argument('--score_norm',      type=str, default='none',
-                        choices=['none', 'zscore', 'minmax'],
-                        help='(prompt_mode=support_multiclass, support_multiclass_mask) '
-                             'per-class rescale of the raw margin map before the cross-class '
-                             'argmax: a class whose texture is less distinctive everywhere '
-                             '(e.g. a small/thin muscle) can sit on a systematically lower '
-                             'absolute scale and lose the winner-take-all at its own true '
-                             'location -- not because the location is wrong, but because the '
-                             'scale is smaller. none = previous behavior (byte-identical). '
-                             'See models/support_prompt.py:multiclass_score_maps')
+    parser.add_argument('--split_legs',      action='store_true',
+                        help='(prompt_mode=support_multiclass, support_multiclass_mask; '
+                             'bilateral datasets only, ignored with --single_leg) crop query '
+                             '+ support to one leg and run the single-leg pipeline on each '
+                             'side independently instead of competing both legs in the same '
+                             'fixed 512x512 SAM2 grid -- fixes a resolution deficit (~1.6x '
+                             'less effective per-leg pixels than a true single-leg scan) that '
+                             'starves small/thin muscles (SA, GR). See '
+                             'models/support_prompt.py:leg_crop_boxes')
     parser.add_argument('--save_dir',        type=str, default=None,
                         help='where to write scores.csv/summary.csv and best/worst volumes')
     parser.add_argument('--save_topk',       type=int, default=1,
@@ -447,5 +564,5 @@ if __name__ == '__main__':
         cc_mode         = args.cc_mode,
         neg_points      = args.neg_points,
         max_neg_points  = args.max_neg_points,
-        score_norm      = args.score_norm,
+        split_legs      = args.split_legs,
     )
