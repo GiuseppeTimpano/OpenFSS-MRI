@@ -85,6 +85,30 @@ class MedSAM2Segmenter:
         return out["backbone_fpn"][-1][0]
 
     @torch.inference_mode()
+    def embed_frames_batched(self, frames_u8: list, chunk_size: int = 8) -> list:
+        """frames_u8: list of [H,W] uint8 -> list of [C,h,w] SAM2 image-encoder features,
+        same output as calling embed_frame() once per frame (same preprocessing, same
+        autocast, same FPN level) but batching chunk_size frames per encoder forward pass
+        instead of one forward pass per frame. chunk_size bounds VRAM, not accuracy --
+        lower it on smaller GPUs, raise it where memory allows.
+
+        This is the fix for the encoder-per-slice bottleneck in score_query_frames:
+        real deployment scores every slice of the query volume (no GT to shortlist
+        candidates), so this loop is the dominant cost."""
+        autocast = (torch.autocast(self.device_type, dtype=torch.bfloat16)
+                    if self.device_type == "cuda"
+                    else torch.autocast(self.device_type, enabled=False))
+        feats = []
+        for start in range(0, len(frames_u8), chunk_size):
+            chunk = np.stack(frames_u8[start:start + chunk_size], axis=0)  # [b,H,W]
+            img = self._preprocess(chunk)  # [b,3,IMG_SIZE,IMG_SIZE]
+            with autocast:
+                out = self.predictor.forward_image(img)
+            fpn = out["backbone_fpn"][-1]  # [b,C,h,w]
+            feats.extend(fpn[i] for i in range(fpn.shape[0]))
+        return feats
+
+    @torch.inference_mode()
     def embed_frame_ml(self, frame_u8: np.ndarray, level: int = -1) -> torch.Tensor:
         """A/B resolution probe -- multi-LEVEL sibling of embed_frame (which is left untouched
         and stays the production path). Returns a chosen backbone_fpn level instead of the

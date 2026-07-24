@@ -172,20 +172,26 @@ def build_support_bag(seg, supp_slices: list, thr_hi: float = 0.7, thr_lo: float
 def score_query_frames(seg, supp_slices: list, query_frames: list,
                         thr_hi: float = 0.7, thr_lo: float = 0.3,
                         body_thresh: float = 10.0, body_min_px: int = 50,
-                        score_thresh: float = 0.0, margin_px: float = 0.0) -> list:
-    """seg: MedSAM2Segmenter (only seg.embed_frame is used).
+                        score_thresh: float = 0.0, margin_px: float = 0.0,
+                        embed_chunk_size: int = 8) -> list:
+    """seg: MedSAM2Segmenter (uses seg.embed_frames_batched).
     supp_slices: [(frame_u8, mask2d)] support slices + their GT masks.
     query_frames: list[(frame_idx, frame_u8)] candidates.
 
     One box per candidate frame, from that frame's similarity blob. No query GT read.
+    Encoder passes are batched (embed_chunk_size frames per forward call) instead of
+    one call per frame -- real deployment scores every slice of the query volume, so
+    this loop is the dominant cost.
     returns: [(score, frame_idx, box_xyxy)] in query_frames order.
     """
     Pos_n, Neg_n = build_support_bag(seg, supp_slices, thr_hi, thr_lo,
                                      body_thresh, body_min_px)
 
+    frame_u8s = [frame_u8 for _, frame_u8 in query_frames]
+    feats = seg.embed_frames_batched(frame_u8s, chunk_size=embed_chunk_size)
+
     cands = []
-    for fidx, frame_u8 in query_frames:
-        feat = seg.embed_frame(frame_u8)
+    for (fidx, frame_u8), feat in zip(query_frames, feats):
         pos_map, neg_map = dense_similarity_maps(feat, Pos_n, Neg_n)
         q_body = body_mask2d(frame_u8, body_thresh, body_min_px)
         box = bbox_from_similarity_blob(pos_map, neg_map, q_body, frame_u8.shape,
